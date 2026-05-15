@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""llm-mode — switch LLM service profiles on a host, keep a Caddy default in sync.
+
+Reads ``config/modes.yaml`` for mode definitions and ``config/models.yaml`` for
+the model→(port, service) map. Adding a new model is a single edit in
+``models.yaml`` (port + service fields); modes reference models by name, so
+no port or unit lists are duplicated.
+
+Commands:
+  <mode> (any key in modes.yaml)  Switch profile (start the mode's services,
+                                  stop the rest, update Caddy default)
+  status                          Show service health + current default upstream
+  set-default <model|port>        Change the Caddy default upstream
+  reload-proxy                    caddy reload only
+
+Environment:
+  LLM_MODE_HOST         Target host where the LLM services run (default:
+                        localhost — runs commands locally without SSH). Set
+                        to a remote hostname to drive a different machine.
+  LLM_MODE_UPSTREAM_IP  IP that the Caddy default upstream uses (default:
+                        127.0.0.1). Should match how Caddy reaches the host.
+  LLM_MODE_CONFIG_DIR   Override config dir (default: <repo>/config).
+  CADDY_CONFIG          Path to the Caddy config file containing the default
+                        reverse_proxy block (default: /etc/caddy/llm-relay.conf).
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+import yaml
+
+
+# -- config -----------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parent
+CONFIG_DIR = Path(os.environ.get("LLM_MODE_CONFIG_DIR", REPO_ROOT / "config"))
+TARGET_HOST = os.environ.get("LLM_MODE_HOST", "localhost")
+CADDY_CONFIG = Path(os.environ.get("CADDY_CONFIG", "/etc/caddy/llm-relay.conf"))
+UPSTREAM_IP = os.environ.get("LLM_MODE_UPSTREAM_IP", "127.0.0.1")
+HEALTH_ENDPOINT = "/v1/models"
+
+RUNS_LOCALLY = TARGET_HOST in ("localhost", socket.gethostname())
+
+
+# -- logging ---------------------------------------------------------------
+
+def _log(level: str, msg: str) -> None:
+    ts = _dt.datetime.now().strftime("%H:%M:%S")
+    stream = sys.stderr if level in ("WARN", "ERROR") else sys.stdout
+    print(f"[{level}]  {ts} {msg}", file=stream)
+
+
+def info(msg: str) -> None:
+    _log("INFO", msg)
+
+
+def warn(msg: str) -> None:
+    _log("WARN", msg)
+
+
+def error(msg: str) -> None:
+    _log("ERROR", msg)
+
+
+# -- config loading --------------------------------------------------------
+
+def _load_yaml(path: Path) -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def load_model_map() -> dict[str, dict]:
+    """Return {model_name: {port, service, ...}} for local-host models only."""
+    raw = _load_yaml(CONFIG_DIR / "models.yaml").get("models") or {}
+    out: dict[str, dict] = {}
+    for name, cfg in raw.items():
+        if name == "aliases":
+            continue
+        if not cfg.get("port") or not cfg.get("service"):
+            continue  # cloud or unmanaged
+        out[name] = {
+            "port": int(cfg["port"]),
+            "service": str(cfg["service"]),
+            "context": cfg.get("context_window"),
+        }
+    return out
+
+
+def load_modes() -> dict[str, dict]:
+    """Return {mode_name: {models: [...], default: model_name}}."""
+    return _load_yaml(CONFIG_DIR / "modes.yaml").get("modes") or {}
+
+
+# -- shell helpers ---------------------------------------------------------
+
+def run_on_target(cmd: str, check: bool = False) -> subprocess.CompletedProcess:
+    """Run a shell command on the LLM host (locally or via SSH)."""
+    if RUNS_LOCALLY:
+        argv = ["bash", "-lc", cmd]
+    else:
+        argv = ["ssh", "-o", "BatchMode=yes", TARGET_HOST, cmd]
+    return subprocess.run(argv, capture_output=True, text=True, check=check)
+
+
+def service_active(svc: str) -> bool:
+    cp = run_on_target(f"systemctl is-active {svc}")
+    return cp.stdout.strip() == "active"
+
+
+def start_service(svc: str) -> bool:
+    if service_active(svc):
+        info(f"{svc} already active")
+        return True
+    info(f"Starting {svc}")
+    cp = run_on_target(f"sudo systemctl start {svc}")
+    if cp.returncode != 0:
+        warn(f"Failed to start {svc}: {cp.stderr.strip() or cp.stdout.strip()}")
+        return False
+    return True
+
+
+def stop_service(svc: str) -> bool:
+    if not service_active(svc):
+        info(f"{svc} already stopped")
+        return True
+    info(f"Stopping {svc}")
+    cp = run_on_target(f"sudo systemctl stop {svc}")
+    if cp.returncode != 0:
+        warn(f"Failed to stop {svc}: {cp.stderr.strip() or cp.stdout.strip()}")
+        return False
+    return True
+
+
+# -- caddy default management ----------------------------------------------
+
+_HANDLE_RE = re.compile(r"^[ \t]*handle\s*\{")
+_REVPROXY_RE = re.compile(r"reverse_proxy\s+\S*?:(\d+)")
+
+
+def _read_caddy() -> list[str]:
+    if not CADDY_CONFIG.exists():
+        raise FileNotFoundError(f"Caddy config not found: {CADDY_CONFIG}")
+    return CADDY_CONFIG.read_text().splitlines(keepends=True)
+
+
+def get_current_default_port() -> int | None:
+    lines = _read_caddy()
+    in_default = False
+    for line in lines:
+        if _HANDLE_RE.match(line):
+            in_default = True
+            continue
+        if in_default:
+            m = _REVPROXY_RE.search(line)
+            if m:
+                return int(m.group(1))
+            in_default = False
+    return None
+
+
+def set_default_port(new_port: int) -> bool:
+    old_port = get_current_default_port()
+    if old_port is None:
+        error("Could not find default reverse_proxy in Caddy config")
+        return False
+    if old_port == new_port:
+        info(f"Default already set to port {new_port}")
+        return True
+    info(f"Switching default upstream: {old_port} -> {new_port}")
+
+    backup = CADDY_CONFIG.with_suffix(CADDY_CONFIG.suffix + f".bak.{_dt.datetime.now():%Y%m%d%H%M%S}")
+    shutil.copy2(CADDY_CONFIG, backup)
+    info(f"Backup: {backup}")
+
+    out: list[str] = []
+    in_default = False
+    swapped = False
+    for line in _read_caddy():
+        if _HANDLE_RE.match(line):
+            in_default = True
+            out.append(line)
+            continue
+        if in_default and "reverse_proxy" in line:
+            line = re.sub(rf"{re.escape(UPSTREAM_IP)}:{old_port}", f"{UPSTREAM_IP}:{new_port}", line)
+            in_default = False
+            swapped = True
+        out.append(line)
+    CADDY_CONFIG.write_text("".join(out))
+
+    if not swapped or get_current_default_port() != new_port:
+        error("Caddy edit failed; restoring backup")
+        shutil.copy2(backup, CADDY_CONFIG)
+        return False
+
+    if shutil.which("caddy"):
+        info("Reloading Caddy")
+        cp = subprocess.run(["caddy", "reload", "--config", "/etc/caddy/Caddyfile"], capture_output=True, text=True)
+        if cp.returncode != 0:
+            warn(f"Caddy reload non-zero: {cp.stderr.strip()}")
+    else:
+        warn("caddy not in PATH; reload skipped")
+
+    info(f"Default upstream now: port {new_port}")
+    return True
+
+
+# -- status ----------------------------------------------------------------
+
+def health_check(port: int, svc: str) -> str:
+    if not service_active(svc):
+        return "stopped"
+    cp = run_on_target(f"curl -s --max-time 3 http://localhost:{port}{HEALTH_ENDPOINT}")
+    if '"id"' in cp.stdout:
+        return f"healthy (port {port})"
+    return f"active, probe pending (port {port})"
+
+
+def print_status() -> None:
+    models = load_model_map()
+    info("=== LLM Service Status ===")
+    for name, m in sorted(models.items(), key=lambda kv: kv[1]["port"]):
+        line = health_check(m["port"], m["service"])
+        print(f"  {m['service']:<40s} {line}")
+    print()
+    info("=== Default Upstream ===")
+    port = get_current_default_port()
+    if port is None:
+        print("  Could not determine default upstream")
+        return
+    match = next((m for m in models.values() if m["port"] == port), None)
+    if match:
+        # service name is unique per port
+        svc = next(name for name, mm in models.items() if mm["port"] == port)
+        print(f"  Default route -> {match['service']} (model={svc}, port {port})")
+    else:
+        print(f"  Default route -> unknown service on port {port}")
+
+
+# -- mode execution --------------------------------------------------------
+
+def apply_mode(mode_name: str) -> int:
+    modes = load_modes()
+    models = load_model_map()
+    if mode_name not in modes:
+        error(f"Unknown mode: {mode_name} (have: {', '.join(modes.keys())})")
+        return 1
+    mode = modes[mode_name]
+    want_models = mode.get("models") or []
+    default_model = mode.get("default")
+    if default_model not in models:
+        error(f"Mode '{mode_name}' default {default_model!r} is not a managed local model")
+        return 1
+    missing = [m for m in want_models if m not in models]
+    if missing:
+        error(f"Mode '{mode_name}' references unknown models: {', '.join(missing)}")
+        return 1
+
+    info(f"=== Mode: {mode_name} ===")
+    failures: list[str] = []
+
+    # Start wanted, stop the rest
+    wanted_services = {models[m]["service"] for m in want_models}
+    for m in want_models:
+        if not start_service(models[m]["service"]):
+            failures.append(models[m]["service"])
+    for name, m in models.items():
+        if m["service"] in wanted_services:
+            continue
+        if not stop_service(m["service"]):
+            failures.append(m["service"])
+
+    if not set_default_port(models[default_model]["port"]):
+        failures.append("caddy-default")
+
+    print()
+    info("=== Verification ===")
+    print_status()
+
+    if failures:
+        warn(f"Mode {mode_name} applied with warnings: {', '.join(failures)}")
+        return 1
+    info(f"Mode {mode_name} applied cleanly")
+    return 0
+
+
+# -- CLI -------------------------------------------------------------------
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="llm-mode", description=__doc__.split("\n")[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    for mode in load_modes().keys():
+        sub.add_parser(mode, help=f"Apply mode '{mode}'")
+    sub.add_parser("status", help="Show service health + current default")
+    sd = sub.add_parser("set-default", help="Change the Caddy default upstream")
+    sd.add_argument("target", help="Either a model name (from models.yaml) or a port number")
+    sub.add_parser("reload-proxy", help="caddy reload without changing routes")
+    sub.add_parser("modes", help="List configured modes")
+    sub.add_parser("models", help="List managed local models (name, port, service)")
+
+    args = parser.parse_args()
+
+    if args.cmd in load_modes():
+        return apply_mode(args.cmd)
+
+    if args.cmd == "status":
+        print_status()
+        return 0
+
+    if args.cmd == "modes":
+        for name, m in load_modes().items():
+            print(f"  {name:<14s} default={m.get('default')} models={', '.join(m.get('models', []))}")
+        return 0
+
+    if args.cmd == "models":
+        for name, m in sorted(load_model_map().items(), key=lambda kv: kv[1]["port"]):
+            print(f"  {name:<16s} port={m['port']:<5d} service={m['service']}")
+        return 0
+
+    if args.cmd == "set-default":
+        models = load_model_map()
+        target = args.target
+        if target.isdigit():
+            port = int(target)
+            if not any(m["port"] == port for m in models.values()):
+                error(f"Port {port} not in models.yaml")
+                return 1
+            return 0 if set_default_port(port) else 1
+        if target not in models:
+            error(f"Unknown model: {target}")
+            return 1
+        return 0 if set_default_port(models[target]["port"]) else 1
+
+    if args.cmd == "reload-proxy":
+        if not shutil.which("caddy"):
+            error("caddy not found in PATH")
+            return 1
+        info("Reloading Caddy")
+        cp = subprocess.run(["caddy", "reload", "--config", "/etc/caddy/Caddyfile"], capture_output=True, text=True)
+        if cp.returncode != 0:
+            error(f"caddy reload failed: {cp.stderr.strip()}")
+            return 1
+        info("Done")
+        return 0
+
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

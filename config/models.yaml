@@ -1,0 +1,102 @@
+# LLM Relay models (TEMPLATE — committed defaults)
+#
+# Each model declares which provider+port serves it. Discovery polls each
+# (provider, port) combination independently — when llm-mode switches modes,
+# llm-relay sees the change on the next poll without restart.
+#
+# This file is a generic example. To override with your own model registry,
+# set LLM_RELAY_CONFIG_DIR to a private config dir.
+
+models:
+  qwen3.5-9b:
+    provider: local-llm
+    class: local-9b
+    port: 8080
+    service: example-llm-9b.service   # systemd unit on the provider host (used by llm-mode)
+    context_window: 32768
+    capabilities: [tool_use, structured_output]
+    tags: [local, fast]
+    preference: 0.7
+
+  qwen3.5-35b:
+    provider: local-llm
+    class: local-35b
+    port: 8081
+    service: example-llm-35b.service
+    context_window: 262144
+    capabilities: [tool_use, structured_output, long_context]
+    tags: [local, medium-speed]
+    preference: 0.9
+
+  qwen3.5-9b-64k:
+    provider: local-llm
+    class: local-9b-long
+    port: 8085
+    service: example-llm-9b-64k.service
+    context_window: 65536
+    capabilities: [tool_use, structured_output]
+    tags: [local, subagent, long-context]
+    preference: 0.75
+
+  trinity-mini:
+    provider: local-llm
+    class: local-trinity
+    port: 8082
+    service: example-llm-trinity.service
+    context_window: 16384
+    capabilities: [tool_use]
+    tags: [local, on-demand]
+    preference: 0.6
+
+  deepseek-r1-70b:
+    provider: local-llm
+    class: local-70b
+    port: 8083
+    service: example-llm-70b.service
+    context_window: 98304
+    capabilities: [tool_use, structured_output, reasoning]
+    tags: [local, slow, high-quality, reasoning]
+    preference: 0.95
+
+  llama-3.3-70b:
+    provider: local-llm
+    class: local-70b
+    port: 8084
+    service: example-llm-llama70b.service
+    context_window: 98304
+    capabilities: [tool_use, structured_output]
+    tags: [local, slow, high-quality]
+    preference: 0.9
+
+  # Cloud (disabled unless privacy: cloud_ok)
+  claude-3-5-sonnet:
+    provider: anthropic
+    class: cloud-anthropic
+    context_window: 200000
+    capabilities: [tool_use, reasoning, long_context]
+    tags: [cloud, high-quality]
+    preference: 0.95
+    privacy: cloud_ok
+
+  claude-3-5-haiku:
+    provider: anthropic
+    class: cloud-anthropic
+    context_window: 200000
+    capabilities: [tool_use]
+    tags: [cloud, fast]
+    preference: 0.7
+    privacy: cloud_ok
+
+  # Aliases — ordered priority lists. The selector resolves to the first
+  # ranked-and-available candidate at request time.
+  aliases:
+    main:           [qwen3.5-35b, deepseek-r1-70b, llama-3.3-70b, qwen3.5-9b]
+    subagent:       [qwen3.5-9b, qwen3.5-35b]
+    subagent-64k:   [qwen3.5-9b-64k, qwen3.5-35b, qwen3.5-9b]
+    fast:           [qwen3.5-9b]
+    high-quality:   [qwen3.5-35b, deepseek-r1-70b, llama-3.3-70b]
+    long-context:   [qwen3.5-35b, qwen3.5-9b-64k]
+    reasoning:      [deepseek-r1-70b, qwen3.5-35b]
+    code_fast:      [qwen3.5-9b, qwen3.5-35b]
+    code_medium:    [qwen3.5-35b, qwen3.5-9b]
+    code_heavy:     [deepseek-r1-70b, llama-3.3-70b, qwen3.5-35b]

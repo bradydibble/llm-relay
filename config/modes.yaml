@@ -1,0 +1,25 @@
+# llm-mode mode definitions (TEMPLATE — committed defaults)
+#
+# Each mode declares which MODELS should be running. llm-mode resolves model
+# names to ports/services via config/models.yaml (`port` + `service` fields).
+# Adding a new model to a mode is a one-line edit here — port and service
+# unit are inferred.
+#
+# Override with your own mode set by pointing LLM_MODE_CONFIG_DIR at a
+# private config dir.
+
+modes:
+  multi:
+    description: "9B + 35B + Trinity (default: 35B)"
+    models: [qwen3.5-9b, qwen3.5-35b, trinity-mini]
+    default: qwen3.5-35b
+
+  large-context:
+    description: "9B + 35B (default: 35B)"
+    models: [qwen3.5-9b, qwen3.5-35b]
+    default: qwen3.5-35b
+
+  big:
+    description: "9B + 70B (default: 70B)"
+    models: [qwen3.5-9b, llama-3.3-70b]
+    default: llama-3.3-70b

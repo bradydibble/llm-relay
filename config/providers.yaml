@@ -1,0 +1,29 @@
+# LLM Relay providers (TEMPLATE — committed defaults)
+#
+# This file is a generic example. To override with your own setup, point
+# llm-relay at a private config dir:
+#
+#     export LLM_RELAY_CONFIG_DIR=/path/to/your/private/llm-relay/config
+#
+# Each provider is a host. Per-model ports/paths live in models.yaml.
+
+providers:
+  local-llm:
+    type: openai
+    base_url: http://127.0.0.1
+    enabled: true
+    health_endpoint: /v1/models
+    poll_interval: 15s
+    health_check_timeout: 5s
+    circuit_breaker:
+      failure_threshold: 3
+      recovery_timeout: 30s
+
+  anthropic:
+    type: anthropic
+    base_url: https://api.anthropic.com
+    enabled: false
+    auth_source: vault
+    model_overrides:
+      - claude-3-5-sonnet-20241022
+      - claude-3-5-haiku-20241022

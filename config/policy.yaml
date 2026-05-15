@@ -1,0 +1,59 @@
+# LLM Relay routing policy (TEMPLATE — committed defaults)
+#
+# How to rank, filter, and fall back across models. Override with your own
+# policy by setting LLM_RELAY_CONFIG_DIR.
+
+policy:
+  # Ranking weights for model selection (unordered candidates only).
+  ranking:
+    quality: 0.4
+    latency: 0.3
+    cost: 0.1
+    availability: 0.2
+
+  # Hard constraints.
+  constraints:
+    privacy:
+      default: local_only
+      cloud_allowed_tags: []
+
+  # Fallback graph: ordered lists of models to try.
+  fallback:
+    graph:
+      high-quality:
+        - qwen3.5-35b
+        - llama-3.3-70b
+        - claude-3-5-sonnet
+      fast:
+        - qwen3.5-9b
+        - claude-3-5-haiku
+      long-context:
+        - qwen3.5-35b
+        - claude-3-5-sonnet
+
+    retry_on:
+      - "502"
+      - "503"
+      - "504"
+      - "connection_error"
+
+  # Explicit model behavior.
+  explicit:
+    strict: true
+
+  # Mode change hints for unavailable models.
+  mode_hints:
+    - when_requesting: llama-3.3-70b
+      unavailable_action: suggest_mode_change
+      recommended_mode: big
+      message: "llama-3.3-70b is unavailable locally. Consider switching to 'big' mode."
+
+    - when_requesting: qwen3.5-35b
+      unavailable_action: suggest_mode_change
+      recommended_mode: large-context
+      message: "qwen3.5-35b is unavailable locally. Consider switching to 'large-context' mode."
+
+    - when_requesting: high-quality
+      unavailable_action: use_alternative
+      alternative: qwen3.5-35b
+      message: "No high-quality models available. Using best available local model."
