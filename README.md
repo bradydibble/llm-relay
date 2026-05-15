@@ -2,10 +2,13 @@
 
 Lightweight routing control plane for homelab + cloud LLM backends.
 
-> **Heads up:** I wrote this for my own homelab. It is published in case the
-> design is useful, not as a polished general-purpose product. Configs in
-> `config/` are generic placeholders — real values (hostnames, IPs, systemd
-> service names, model registry) belong in a private override directory.
+> **Heads up:** I wrote this for my own homelab as I was getting tired of
+> manually switching out the models used across my agents. I am switching
+> models constantly for tweaking and benchmarking, and it started to become
+> a problem. Exising tools like llm router were just too heavy for my needs.
+> It is published in case the design is useful, not as a polished general-purpose
+> product. Configs in `config/` are generic placeholders. real values (hostnames,
+> IPs, systemd service names, model registry) belong in a private override directory.
 > See [Configuration overrides](#configuration-overrides) below.
 
 ## What it does
@@ -20,7 +23,7 @@ It is **not** a full platform. It's a router with explicit, rule-based routing.
 
 ## How it relates to `llm-mode`
 
-`llm-mode` ships in this repo as a sibling script (`./llm-mode`).
+`llm-mode` ships in this repo as a sibling script (`./llm-mode`) to swap model configs.
 
 - `llm-mode` = **capacity manager**. It starts/stops systemd-managed LLM
   services on a target host and keeps a Caddy default upstream in sync.
