@@ -45,6 +45,10 @@ CONFIG_DIR = Path(os.environ.get("LLM_MODE_CONFIG_DIR", REPO_ROOT / "config"))
 TARGET_HOST = os.environ.get("LLM_MODE_HOST", "localhost")
 CADDY_CONFIG = Path(os.environ.get("CADDY_CONFIG", "/etc/caddy/llm-relay.conf"))
 UPSTREAM_IP = os.environ.get("LLM_MODE_UPSTREAM_IP", "127.0.0.1")
+# Port that llm-relay listens on. When the Caddy default upstream points here,
+# request routing is managed by llm-relay aliases rather than by a direct
+# llm-mode model selection, so `status` reports it specially.
+LLM_RELAY_PORT = int(os.environ.get("LLM_RELAY_PORT", "8090"))
 HEALTH_ENDPOINT = "/v1/models"
 
 RUNS_LOCALLY = TARGET_HOST in ("localhost", socket.gethostname())
@@ -240,8 +244,10 @@ def print_status() -> None:
         # service name is unique per port
         svc = next(name for name, mm in models.items() if mm["port"] == port)
         print(f"  Default route -> {match['service']} (model={svc}, port {port})")
+    elif port == LLM_RELAY_PORT:
+        print(f"  Default route -> llm-relay (port {port}) — routing managed by llm-relay aliases")
     else:
-        print(f"  Default route -> unknown service on port {port}")
+        print(f"  Default route -> port {port} (not a managed llm-mode model)")
 
 
 # -- mode execution --------------------------------------------------------

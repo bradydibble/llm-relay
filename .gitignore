@@ -32,5 +32,15 @@ env/
 .claude/
 .pi/
 
+# Agent guidance for this repo. Lives only on Brady's machine — it references
+# the private override dir + real hostnames as anti-leak guardrails for any
+# AI tool working in this repo. Never committed.
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+GOOSE.md
+.cursorrules
+.aider.conf.yml
+
 # OS
 .DS_Store
