@@ -7,10 +7,14 @@ the model→(port, service) map. Adding a new model is a single edit in
 no port or unit lists are duplicated.
 
 Commands:
-  <mode> (any key in modes.yaml)  Switch profile (start the mode's services,
-                                  stop the rest, update Caddy default)
+  <mode> (any key in modes.yaml)  Switch profile: start the mode's services,
+                                  stop the rest. If Caddy's default already
+                                  points at llm-relay, leave it alone (the
+                                  relay handles routing); otherwise update
+                                  the Caddy default to the mode's primary.
   status                          Show service health + current default upstream
-  set-default <model|port>        Change the Caddy default upstream
+  set-default <model|port>        Change the Caddy default upstream (manual
+                                  direct-to-model bypass — skips llm-relay)
   reload-proxy                    caddy reload only
 
 Environment:
@@ -22,6 +26,9 @@ Environment:
   LLM_MODE_CONFIG_DIR   Override config dir (default: <repo>/config).
   CADDY_CONFIG          Path to the Caddy config file containing the default
                         reverse_proxy block (default: /etc/caddy/llm-relay.conf).
+  LLM_RELAY_PORT        Port llm-relay listens on (default: 8090). When the
+                        Caddy default already points here, mode switches skip
+                        the Caddy edit — the relay handles routing.
 """
 from __future__ import annotations
 
@@ -283,7 +290,19 @@ def apply_mode(mode_name: str) -> int:
         if not stop_service(m["service"]):
             failures.append(m["service"])
 
-    if not set_default_port(models[default_model]["port"]):
+    # If Caddy's default upstream is already llm-relay, leave it alone:
+    # llm-relay does its own routing based on which model services are up,
+    # so flipping Caddy to a model port would bypass that layer entirely.
+    # `set-default <port>` is still available for manual direct-to-model
+    # debugging.
+    current_default = get_current_default_port()
+    target_port = models[default_model]["port"]
+    if current_default == LLM_RELAY_PORT:
+        info(
+            f"Caddy default -> llm-relay (:{LLM_RELAY_PORT}); routing managed "
+            f"by llm-relay aliases — Caddy not modified."
+        )
+    elif not set_default_port(target_port):
         failures.append("caddy-default")
 
     print()
