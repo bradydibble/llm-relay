@@ -8,6 +8,7 @@ import httpx
 
 from ..config.loader import ConfigLoader
 from ..config.types import ModelStatus, Privacy
+from ..discovery.endpoint import _shared_upstream_bearer
 from ..discovery.manager import DiscoveryManager
 from .selector import ModelSelector, RoutingContext
 
@@ -122,11 +123,18 @@ class RequestRouter:
     ) -> httpx.Response:
         body = dict(request_data)
         body["model"] = model_name
+        merged_headers = {"Content-Type": "application/json", **(headers or {})}
+        # Authenticate to api-key'd upstreams using the shared homelab bearer
+        # (see endpoint.py for env-var resolution). Caller-provided
+        # Authorization wins so a future per-request auth path can override.
+        bearer = _shared_upstream_bearer()
+        if bearer and "Authorization" not in merged_headers:
+            merged_headers["Authorization"] = f"Bearer {bearer}"
         async with httpx.AsyncClient(timeout=300.0) as client:
             return await client.post(
                 f"{backend_url}/chat/completions",
                 json=body,
-                headers={"Content-Type": "application/json", **(headers or {})},
+                headers=merged_headers,
             )
 
     async def stream_request(
@@ -151,6 +159,10 @@ class RequestRouter:
         # llama-server's non-standard `timings` field. Preserve any user override.
         existing_opts = body.get("stream_options") if isinstance(body.get("stream_options"), dict) else {}
         body["stream_options"] = {"include_usage": True, **existing_opts}
+        merged_headers = {"Content-Type": "application/json", **(headers or {})}
+        bearer = _shared_upstream_bearer()
+        if bearer and "Authorization" not in merged_headers:
+            merged_headers["Authorization"] = f"Bearer {bearer}"
         # Reads are unbounded — SSE may stall between tokens on slow models.
         timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
         client = httpx.AsyncClient(timeout=timeout)
@@ -159,7 +171,7 @@ class RequestRouter:
                 "POST",
                 f"{backend_url}/chat/completions",
                 json=body,
-                headers={"Content-Type": "application/json", **(headers or {})},
+                headers=merged_headers,
             )
             resp = await client.send(req, stream=True)
         except BaseException:

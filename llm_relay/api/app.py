@@ -27,6 +27,53 @@ def _resolve_config_dir(config_dir: str | Path | None) -> Path:
     return Path(__file__).resolve().parents[2] / "config"
 
 
+def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for name, m in cfg.models.models.items():
+        status = disc.get_model_state(name)
+        out[name] = {
+            "provider": m.provider,
+            "class": m.class_name,
+            "status": status.value,
+            "context_window": m.context_window,
+            "capabilities": m.capabilities,
+            "tags": m.tags,
+            "privacy": m.privacy.value,
+            "port": m.port,
+            "path": m.path,
+        }
+    out["aliases"] = dict(cfg.models.aliases)
+    # Enriched per-alias metadata so clients can show context_window etc. for
+    # aliases (which are otherwise just names). `current` is a display
+    # approximation: the first member that discovery reports as available /
+    # degraded, falling back to the first declared member. The selector applies
+    # additional filters (privacy, min_context, require_tools) at request time,
+    # so the actually-routed model may differ.
+    alias_info: dict[str, Any] = {}
+    for alias, members in cfg.models.aliases.items():
+        members_list = list(members)
+        current: str | None = None
+        for member in members_list:
+            if member not in cfg.models.models:
+                continue
+            if disc.get_model_state(member).value in ("available", "degraded"):
+                current = member
+                break
+        if current is None:
+            for member in members_list:
+                if member in cfg.models.models:
+                    current = member
+                    break
+        cw = cfg.models.models[current].context_window if current else None
+        alias_info[alias] = {
+            "members": members_list,
+            "current": current,
+            "context_window": cw,
+        }
+    out["alias_info"] = alias_info
+    return out
+
+
 def create_app(config_dir: str | Path | None = None) -> FastAPI:
     cfg_path = _resolve_config_dir(config_dir)
     config = ConfigLoader(config_dir=cfg_path)
@@ -89,24 +136,9 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
     app.state.router = router
 
     async def _available(request: Request) -> dict[str, Any]:
-        cfg = request.app.state.config
-        disc = request.app.state.discovery
-        out: dict[str, Any] = {}
-        for name, m in cfg.models.models.items():
-            status = disc.get_model_state(name)
-            out[name] = {
-                "provider": m.provider,
-                "class": m.class_name,
-                "status": status.value,
-                "context_window": m.context_window,
-                "capabilities": m.capabilities,
-                "tags": m.tags,
-                "privacy": m.privacy.value,
-                "port": m.port,
-                "path": m.path,
-            }
-        out["aliases"] = dict(cfg.models.aliases)
-        return out
+        return _build_available_payload(
+            request.app.state.config, request.app.state.discovery
+        )
 
     @app.get("/health")
     async def health(request: Request) -> dict[str, Any]:

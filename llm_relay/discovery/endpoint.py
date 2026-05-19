@@ -1,12 +1,25 @@
 """OpenAI-compatible endpoint client with health checking."""
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 
 import httpx
 
 from ..config.types import CircuitBreaker, EndpointState
+
+
+def _shared_upstream_bearer() -> str | None:
+    """Single Authorization bearer for all upstream probes.
+
+    Homelab convention: every upstream LLM service (vllm `--api-key`,
+    llama-server `--api-key`) shares one key. Relay reads that key from the
+    env so discovery probes authenticate. Set via the systemd unit using
+    LLM_RELAY_UPSTREAM_API_KEY (preferred) or LLM_API_KEY (fallback) — both
+    refer to the same /home/admin/.config/llm-relay-api-key file content.
+    """
+    return os.environ.get("LLM_RELAY_UPSTREAM_API_KEY") or os.environ.get("LLM_API_KEY")
 
 
 @dataclass
@@ -39,10 +52,14 @@ class EndpointClient:
         if self.state.circuit_open:
             return []
         try:
+            headers = {"Accept": "application/json"}
+            bearer = _shared_upstream_bearer()
+            if bearer:
+                headers["Authorization"] = f"Bearer {bearer}"
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 resp = await client.get(
                     f"{self.base_url}{self.health_endpoint}",
-                    headers={"Accept": "application/json"},
+                    headers=headers,
                 )
                 resp.raise_for_status()
                 data = resp.json()
