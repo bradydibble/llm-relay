@@ -18,6 +18,11 @@ from ..routing.router import RequestRouter
 from .instrumentation import emit_chat_completion, reassemble_sse
 
 
+def _resolve_base_url() -> str:
+    """Externally-reachable root URL for A2A agent-card and MCP config."""
+    return os.environ.get("LLM_RELAY_BASE_URL", "http://127.0.0.1:8090").rstrip("/")
+
+
 def _resolve_config_dir(config_dir: str | Path | None) -> Path:
     if config_dir:
         return Path(config_dir)
@@ -81,54 +86,81 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
     discovery = DiscoveryManager()
     router = RequestRouter(config, discovery)
 
+    from contextlib import AsyncExitStack
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Register one polling client per (provider, port, path) combo.
-        for provider_name, provider in config.providers.items():
-            if not provider.enabled:
-                continue
-            models_for_provider = {
-                name: m for name, m in config.models.models.items() if m.provider == provider_name
-            }
-            if not models_for_provider:
-                await discovery.register_backend(
-                    key=provider_name,
-                    provider_name=provider_name,
-                    base_url=provider.base_url.rstrip("/"),
-                    models_hint=[],
-                    health_endpoint=provider.health_endpoint,
-                    poll_interval=provider.poll_interval,
-                    circuit_breaker=provider.circuit_breaker,
-                    timeout=provider.health_check_timeout,
-                )
-                continue
-            groups: dict[tuple[int | None, str], list[str]] = {}
-            for name, m in models_for_provider.items():
-                groups.setdefault((m.port, m.path or ""), []).append(name)
-            for (port, path), names in groups.items():
-                base = provider.base_url.rstrip("/")
-                if port:
-                    base = f"{base}:{port}"
-                if path:
-                    base = f"{base}/{path.lstrip('/')}"
-                key_parts = [provider_name]
-                if port:
-                    key_parts.append(str(port))
-                if path:
-                    key_parts.append(path.strip("/"))
-                key = ":".join(key_parts)
-                await discovery.register_backend(
-                    key=key,
-                    provider_name=provider_name,
-                    base_url=base,
-                    models_hint=names,
-                    health_endpoint=provider.health_endpoint,
-                    poll_interval=provider.poll_interval,
-                    circuit_breaker=provider.circuit_breaker,
-                    timeout=provider.health_check_timeout,
-                )
-        yield
+        async with AsyncExitStack() as stack:
+            # Start the MCP session manager (no-op if MCP not installed)
+            if _mcp_session_mgr is not None:
+                await stack.enter_async_context(_mcp_session_mgr.run())
+            # Register one polling client per (provider, port, path) combo.
+            for provider_name, provider in config.providers.items():
+                if not provider.enabled:
+                    continue
+                models_for_provider = {
+                    name: m for name, m in config.models.models.items() if m.provider == provider_name
+                }
+                if not models_for_provider:
+                    await discovery.register_backend(
+                        key=provider_name,
+                        provider_name=provider_name,
+                        base_url=provider.base_url.rstrip("/"),
+                        models_hint=[],
+                        health_endpoint=provider.health_endpoint,
+                        poll_interval=provider.poll_interval,
+                        circuit_breaker=provider.circuit_breaker,
+                        timeout=provider.health_check_timeout,
+                    )
+                    continue
+                groups: dict[tuple[int | None, str], list[str]] = {}
+                for name, m in models_for_provider.items():
+                    groups.setdefault((m.port, m.path or ""), []).append(name)
+                for (port, path), names in groups.items():
+                    base = provider.base_url.rstrip("/")
+                    if port:
+                        base = f"{base}:{port}"
+                    if path:
+                        base = f"{base}/{path.lstrip('/')}"
+                    key_parts = [provider_name]
+                    if port:
+                        key_parts.append(str(port))
+                    if path:
+                        key_parts.append(path.strip("/"))
+                    key = ":".join(key_parts)
+                    await discovery.register_backend(
+                        key=key,
+                        provider_name=provider_name,
+                        base_url=base,
+                        models_hint=names,
+                        health_endpoint=provider.health_endpoint,
+                        poll_interval=provider.poll_interval,
+                        circuit_breaker=provider.circuit_breaker,
+                        timeout=provider.health_check_timeout,
+                    )
+            yield
         await discovery.shutdown()
+
+    # --- MCP sub-app (optional dep) -----------------------------------
+    _mcp_app = None
+    _mcp_session_mgr = None
+    try:
+        from ..mcp import build_mcp_server
+        _mcp_app, _mcp_session_mgr = build_mcp_server(base_url=_resolve_base_url())
+    except ImportError:
+        pass
+
+    # --- A2A routes (optional dep) -------------------------------------
+    _a2a_card_routes: list = []
+    _a2a_jsonrpc_routes: list = []
+    _a2a_rest_routes: list = []
+    try:
+        from ..a2a import build_a2a_routes
+        _a2a_card_routes, _a2a_jsonrpc_routes, _a2a_rest_routes = build_a2a_routes(
+            base_url=_resolve_base_url(),
+        )
+    except ImportError:
+        pass
 
     app = FastAPI(title="llm-relay", version="1.0.0", lifespan=lifespan)
     app.state.config = config
@@ -179,6 +211,87 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
             seen.add(alias)
             data.append({"id": alias, "object": "model", "owned_by": "llm-relay-alias"})
         return {"object": "list", "data": data}
+
+    @app.get("/status")
+    async def relay_status(request: Request) -> dict[str, Any]:
+        cfg = request.app.state.config
+        disc = request.app.state.discovery
+
+        def _actually_available(model_name: str) -> bool:
+            """True only if the model's backend is healthy AND reports a matching
+            model id.  For models that share a port (port-mutex pairs), this
+            distinguishes which one is actually loaded."""
+            key = disc.model_to_client.get(model_name)
+            if not key:
+                return False
+            client = disc.clients.get(key)
+            if not client:
+                return False
+            from ..config.types import EndpointStatus
+            if client.state.status not in (EndpointStatus.healthy, EndpointStatus.degraded):
+                return False
+            # Fast path: exact match in reported models
+            if model_name in client.state.models:
+                return True
+            # Fuzzy path: model name appears as prefix in a reported id
+            # (e.g. config "qwen3.6-35b-a3b" vs reported "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf")
+            mn = model_name.lower()
+            return any(mn in r.lower() for r in client.state.models)
+
+        # Available local models (privacy=local_only + backend actually reports them)
+        available_local: set[str] = {
+            name
+            for name, m in cfg.models.models.items()
+            if m.privacy.value == "local_only"
+            and _actually_available(name)
+        }
+
+        # Models that appear in any mode definition (llm-mode managed)
+        mode_managed: set[str] = set()
+        for mode_cfg in cfg.modes.values():
+            mode_managed.update(mode_cfg.models)
+
+        # Only compare managed models for mode inference
+        active_managed = available_local & mode_managed
+
+        # Match against mode definitions: all mode models available + no extra managed
+        # models active that aren't part of this mode
+        matched_modes: list[str] = []
+        for mode_name, mode_cfg in cfg.modes.items():
+            mode_set = set(mode_cfg.models)
+            if mode_set == active_managed:
+                matched_modes.append(mode_name)
+        if not matched_modes:
+            matched_modes = ["custom"]
+
+        # Key alias resolutions — first available member wins
+        alias_info: dict[str, str | None] = {}
+        for alias, members in cfg.models.aliases.items():
+            resolved: str | None = None
+            for member in members:
+                if member not in cfg.models.models:
+                    continue
+                if disc.get_model_state(member).value in ("available", "degraded"):
+                    resolved = member
+                    break
+            alias_info[alias] = resolved
+
+        # Backend status
+        backends: dict[str, Any] = {
+            key: {
+                "status": c.state.status.value,
+                "models": c.state.models,
+                "last_poll": c.state.last_poll,
+            }
+            for key, c in disc.clients.items()
+        }
+
+        return {
+            "mode": matched_modes,
+            "available_local_models": sorted(available_local),
+            "aliases": alias_info,
+            "backends": backends,
+        }
 
     @app.get("/routing-table")
     async def routing_table(request: Request) -> dict[str, list[str]]:
@@ -314,6 +427,17 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
             status_code=upstream.status_code, streamed=False,
         )
         return JSONResponse(status_code=upstream.status_code, content=content, headers=relay_headers)
+
+    # Mount MCP at /mcp
+    if _mcp_app is not None:
+        app.mount("/mcp", _mcp_app)
+
+    # Mount A2A routes (agent card at /.well-known/agent-card.json,
+    # JSON-RPC at /a2a/jsonrpc, REST at /a2a/rest)
+    if _a2a_card_routes:
+        app.routes.extend(_a2a_card_routes)
+        app.routes.extend(_a2a_jsonrpc_routes)
+        app.routes.extend(_a2a_rest_routes)
 
     return app
 

@@ -34,12 +34,14 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import json
 import os
 import re
 import shutil
 import socket
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 import yaml
@@ -234,6 +236,32 @@ def health_check(port: int, svc: str) -> str:
     return f"active, probe pending (port {port})"
 
 
+def _print_relay_status() -> None:
+    """Query /status on the local relay and print a concise routing summary."""
+    url = f"http://127.0.0.1:{LLM_RELAY_PORT}/status"
+    try:
+        with urllib.request.urlopen(url, timeout=3) as resp:  # noqa: S310
+            data = json.loads(resp.read())
+    except Exception as exc:
+        print(f"  (relay status unavailable: {exc})")
+        return
+
+    mode = ", ".join(data.get("mode", ["custom"]))
+    aliases = data.get("aliases", {})
+    main_model = aliases.get("main") or "—"
+    local_models = data.get("available_local_models", [])
+
+    print(f"  Relay mode:    {mode}")
+    print(f"  main alias  \u2192 {main_model}")
+    if local_models:
+        print(f"  Local models: {', '.join(local_models)}")
+    # Secondary aliases worth showing
+    for alias in ("daily", "fast", "high-quality", "reasoning"):
+        resolved = aliases.get(alias)
+        if resolved and resolved != main_model:
+            print(f"  {alias:<14}\u2192 {resolved}")
+
+
 def print_status() -> None:
     models = load_model_map()
     info("=== LLM Service Status ===")
@@ -253,6 +281,7 @@ def print_status() -> None:
         print(f"  Default route -> {match['service']} (model={svc}, port {port})")
     elif port == LLM_RELAY_PORT:
         print(f"  Default route -> llm-relay (port {port}) — routing managed by llm-relay aliases")
+        _print_relay_status()
     else:
         print(f"  Default route -> port {port} (not a managed llm-mode model)")
 

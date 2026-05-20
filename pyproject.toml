@@ -32,6 +32,16 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+mcp = [
+    "mcp>=1.10",
+]
+a2a = [
+    "a2a-sdk>=1.0",
+]
+all = [
+    "mcp>=1.10",
+    "a2a-sdk>=1.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/bradydibble/llm-relay"
