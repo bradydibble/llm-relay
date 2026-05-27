@@ -254,3 +254,39 @@ async def test_route_and_forward_503_via_api_on_saturation(tmp_path, monkeypatch
     assert int(resp.headers["Retry-After"]) >= 1
     body = resp.json()
     assert body["detail"]["error"] == "backend saturated"
+
+
+async def test_route_and_forward_streaming_passes_through_response(tmp_path, monkeypatch):
+    """Streaming path returns a 3-tuple (resp, iterator, route_result) from the first
+    available candidate without retrying across backends.
+
+    Verifies the app.py 3-tuple unpack and that result.selected_model reflects
+    the actual candidate that was used.
+    """
+    app = _make_app_with_both_healthy(tmp_path)
+    router = app.state.router
+
+    sse_bytes = b"data: {}\n\ndata: [DONE]\n\n"
+
+    async def _fake_body_iter():
+        yield sse_bytes
+
+    async def _fake_stream(backend_url, model_name, *args, **kwargs):
+        return httpx.Response(200, content=b""), _fake_body_iter()
+
+    monkeypatch.setattr(router, "stream_request", _fake_stream)
+
+    upstream, body_iter, result = await router.route_and_forward(
+        request_data={"model": "main", "messages": [], "stream": True},
+        stream=True,
+    )
+
+    assert upstream.status_code == 200
+    # Collect all bytes from the iterator
+    chunks = []
+    async for chunk in body_iter:
+        chunks.append(chunk)
+    assert b"DONE" in b"".join(chunks)
+    # Should have picked model-a (first in alias order) since both healthy
+    assert result.selected_model == "model-a"
+    assert result.success is True
