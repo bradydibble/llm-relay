@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from ..config.types import CircuitBreaker, EndpointState, EndpointStatus, ModelStatus
+from ..config.types import CircuitBreaker, EndpointState, EndpointStatus, ModelStatus, SaturationError
 from .endpoint import EndpointClient
 
 
@@ -28,6 +29,7 @@ class DiscoveryManager:
         poll_interval: int = 15,
         circuit_breaker: CircuitBreaker | None = None,
         timeout: float = 5.0,
+        max_concurrent: int | None = None,
     ) -> None:
         state = EndpointState(provider=provider_name)
         client = EndpointClient(
@@ -37,11 +39,35 @@ class DiscoveryManager:
             timeout=timeout,
             state=state,
             circuit_breaker=circuit_breaker or CircuitBreaker(),
+            max_concurrent=max_concurrent,
         )
         self.clients[key] = client
         for m in models_hint:
             self.model_to_client[m] = key
         self._tasks.append(asyncio.create_task(self._poll_loop(client, poll_interval)))
+
+    @contextlib.asynccontextmanager
+    async def acquire_slot(self, key: str, wait_timeout: float):
+        """Acquire an in-flight slot for backend `key`, releasing on exit.
+
+        If the backend was registered without max_concurrent (or doesn't exist),
+        this is a no-op. Raises SaturationError if no slot becomes available
+        within wait_timeout, carrying a retry_after_seconds hint.
+        """
+        client = self.clients.get(key)
+        if client is None or client.inflight_sem is None:
+            yield
+            return
+
+        try:
+            await asyncio.wait_for(client.inflight_sem.acquire(), timeout=wait_timeout)
+        except asyncio.TimeoutError as e:
+            raise SaturationError(backend_key=key, retry_after_seconds=wait_timeout) from e
+
+        try:
+            yield
+        finally:
+            client.inflight_sem.release()
 
     async def _poll_loop(self, client: EndpointClient, interval: int) -> None:
         while True:
