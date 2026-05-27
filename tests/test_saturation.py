@@ -189,34 +189,26 @@ def _make_minimal_config(tmp_path: Path) -> Path:
 
 
 async def test_chat_completions_returns_503_retry_after_on_saturation(tmp_path, monkeypatch):
-    """When forward_request raises SaturationError, /v1/chat/completions returns
-    503 with a Retry-After header hinting the retry window."""
+    """When the router raises SaturationError, /v1/chat/completions returns
+    503 with a Retry-After header hinting the retry window.
+
+    Patches route_and_forward (the new entry point the API handler calls) to
+    raise SaturationError directly, exercising the API's exception handling.
+    """
     import httpx
     from httpx import ASGITransport
 
     from llm_relay.api.app import create_app
-    from llm_relay.routing.router import RouteResult
 
     cfg_dir = _make_minimal_config(tmp_path)
     app = create_app(config_dir=cfg_dir)
 
-    # Patch route_request to return a successful RouteResult pointing at our fake
-    # backend, and patch forward_request to raise SaturationError synchronously.
-    async def _fake_route(request_data, headers=None):
-        return RouteResult(
-            success=True,
-            selected_model="test-model",
-            backend_url="http://127.0.0.1/v1",
-            provider_name="local-llm",
-            backend_key="local-llm",
-            slot_wait_timeout=5.0,
-        )
-
-    async def _fake_forward(*args, **kwargs):
+    # Patch route_and_forward — the method the API handler now calls — to raise
+    # SaturationError, bypassing discovery/selection entirely.
+    async def _fake_route_and_forward(request_data, headers=None, stream=False):
         raise SaturationError(backend_key="local-llm", retry_after_seconds=5.0)
 
-    monkeypatch.setattr(app.state.router, "route_request", _fake_route)
-    monkeypatch.setattr(app.state.router, "forward_request", _fake_forward)
+    monkeypatch.setattr(app.state.router, "route_and_forward", _fake_route_and_forward)
 
     async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(

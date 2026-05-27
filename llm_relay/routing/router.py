@@ -5,12 +5,13 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
 import httpx
+from fastapi import HTTPException
 
 from ..config.loader import ConfigLoader
 from ..config.types import ModelStatus, Privacy, SaturationError
 from ..discovery.endpoint import _shared_upstream_bearer
 from ..discovery.manager import DiscoveryManager
-from .selector import ModelSelector, RoutingContext
+from .selector import ChainCandidate, ModelSelector, RoutingContext
 
 
 def _compose_backend_key(provider_name: str, port: int | None, path: str) -> str:
@@ -237,3 +238,158 @@ class RequestRouter:
                 await _release_slot()
 
         return resp, _iter()
+
+    async def route_and_forward(
+        self,
+        request_data: dict[str, Any],
+        headers: dict[str, str] | None = None,
+        stream: bool = False,
+    ):
+        """Resolve the fallback chain and forward, retrying on retry_on errors.
+
+        Non-streaming returns ``(httpx.Response, RouteResult)``.
+        Streaming returns ``(httpx.Response, AsyncIterator[bytes], RouteResult)``
+        — but streaming does NOT retry across candidates (see note below).
+
+        Behavior
+        --------
+        - Walks the candidate chain in priority order.
+        - Non-streaming: on a retry_on HTTP status (default 502/503/504) or a
+          retry_on network exception (ConnectError, ReadTimeout,
+          RemoteProtocolError), tries the next candidate.
+        - Streaming: routes once with the existing ``stream_request`` path —
+          no cross-backend retry.  Streaming retry is deferred: the slot
+          lifecycle in ``stream_request`` ties the semaphore release to the
+          iterator's ``finally`` block; aborting a streamed response without
+          draining the iterator would leak the slot.  The 5/27 production 502
+          was non-streaming, so this gap is acceptable for now.
+        - ``SaturationError`` propagates IMMEDIATELY — slot saturation is
+          backpressure, not a broken backend.  The caller should back off via
+          ``Retry-After``, not amplify load by trying other backends.
+        - Non-retryable upstream statuses (e.g. 400, 401) propagate as-is.
+        - If the chain is exhausted, the last observed error or response is
+          surfaced.
+        """
+        headers = headers or {}
+        privacy_str = headers.get("X-Llm-Relay-Privacy", "local_only")
+        privacy = Privacy(privacy_str if privacy_str in ("local_only", "cloud_ok") else "local_only")
+
+        weights: dict[str, float] = {}
+        weights_str = headers.get("X-Llm-Relay-Weights", "")
+        if weights_str:
+            for pair in weights_str.split(","):
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    try:
+                        weights[k.strip()] = float(v.strip())
+                    except ValueError:
+                        pass
+
+        ctx = RoutingContext(
+            requested_model=request_data.get("model", "") or "",
+            privacy=privacy,
+            weights=weights,
+            require_tools=headers.get("X-Llm-Relay-Require-Tools", "false").lower() == "true",
+            min_context=int(headers.get("X-Llm-Relay-Min-Context", "0") or 0) or None,
+        )
+
+        candidates = self.selector.select_chain(ctx)
+        if not candidates:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "No model matches constraints",
+                    "decision": {
+                        "requested": ctx.requested_model,
+                        "candidates": ctx.candidates,
+                        "filtered": ctx.filtered,
+                    },
+                },
+            )
+
+        # "connection_error" in retry_on means network exceptions; HTTP codes
+        # are matched as strings against str(resp.status_code).
+        retry_codes: set[str] = {
+            code for code in self.config.policy.fallback.retry_on
+            if code != "connection_error"
+        }
+        retry_exceptions = (
+            httpx.ConnectError,
+            httpx.ReadTimeout,
+            httpx.RemoteProtocolError,
+        )
+
+        # Streaming: route once, no retry (slot lifecycle prevents safe retry).
+        if stream:
+            candidate = candidates[0]
+            route_result = _candidate_to_route_result(candidate, ctx)
+            upstream, body_iter = await self.stream_request(
+                candidate.backend_url, candidate.model, request_data,
+                headers=headers,
+                backend_key=candidate.backend_key,
+                slot_wait_timeout=candidate.slot_wait_timeout,
+            )
+            return upstream, body_iter, route_result
+
+        # Non-streaming: walk the chain, retry on retry_on errors.
+        last_response: httpx.Response | None = None
+        last_error: Exception | None = None
+
+        for candidate in candidates:
+            route_result = _candidate_to_route_result(candidate, ctx)
+            try:
+                resp = await self.forward_request(
+                    candidate.backend_url, candidate.model, request_data,
+                    headers=headers,
+                    backend_key=candidate.backend_key,
+                    slot_wait_timeout=candidate.slot_wait_timeout,
+                )
+                if str(resp.status_code) in retry_codes:
+                    last_response = resp
+                    continue
+                return resp, route_result
+            except SaturationError:
+                # Slot saturation is backpressure, not backend failure.
+                # Propagate immediately so the caller emits Retry-After.
+                raise
+            except retry_exceptions as exc:
+                last_error = exc
+                continue
+
+        # Chain exhausted — surface the last observed error/response.
+        if last_response is not None:
+            # Build a RouteResult reflecting the last-tried candidate.
+            final_result = _candidate_to_route_result(candidates[-1], ctx)
+            return last_response, final_result
+        if last_error is not None:
+            raise last_error
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "No model matches constraints",
+                "decision": {
+                    "requested": ctx.requested_model,
+                    "candidates": ctx.candidates,
+                    "filtered": ctx.filtered,
+                },
+            },
+        )
+
+
+def _candidate_to_route_result(candidate: ChainCandidate, ctx: RoutingContext) -> RouteResult:
+    """Build a ``RouteResult`` from a ``ChainCandidate`` for telemetry/response headers."""
+    return RouteResult(
+        success=True,
+        selected_model=candidate.model,
+        backend_url=candidate.backend_url,
+        provider_name=candidate.provider_name,
+        backend_key=candidate.backend_key,
+        slot_wait_timeout=candidate.slot_wait_timeout,
+        decision={
+            "requested": ctx.requested_model,
+            "selected": candidate.model,
+            "candidates": ctx.candidates,
+            "ranked": ctx.ranked[:5],
+            "privacy": ctx.privacy.value,
+        },
+    )

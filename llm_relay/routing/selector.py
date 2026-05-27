@@ -13,6 +13,22 @@ def _is_available(status: ModelStatus) -> bool:
 
 
 @dataclass
+class ChainCandidate:
+    """A fully-resolved candidate ready for forwarding.
+
+    Carries all metadata that ``forward_request`` / ``stream_request`` need so
+    the retry loop in ``route_and_forward`` can build a ``RouteResult`` for each
+    hop without touching the config again.
+    """
+
+    model: str
+    backend_url: str
+    backend_key: str
+    slot_wait_timeout: float
+    provider_name: str
+
+
+@dataclass
 class RoutingContext:
     requested_model: str
     privacy: Privacy = Privacy.local_only
@@ -38,24 +54,81 @@ class ModelSelector:
             return list(self.config.models.aliases[name])
         return [name]
 
-    def select_best(self, ctx: RoutingContext) -> str | None:
+    def _prepare_ranked(self, ctx: RoutingContext) -> list[str]:
+        """Build and store the full ranked candidate list on *ctx*.
+
+        Populates ``ctx.candidates``, ``ctx.filtered``, and ``ctx.ranked``.
+        Returns ``ctx.ranked``.  Called by both ``select_best`` and
+        ``select_chain`` so they share exactly the same filter/rank logic.
+        """
         candidates, ordered = self._build_candidates(ctx)
         ctx.candidates = candidates
         filtered = self._apply_constraints(ctx, candidates)
         ctx.filtered = filtered
         if not filtered:
-            return None
+            ctx.ranked = []
+            return []
         if ordered:
-            # Caller specified priority — honor it; only availability decides.
             ranked = list(filtered)
         else:
             ranked = self._rank(ctx, filtered)
         ctx.ranked = ranked
+        return ranked
+
+    def select_best(self, ctx: RoutingContext) -> str | None:
+        ranked = self._prepare_ranked(ctx)
         # Walk in priority order and return the first that is currently up.
         for name in ranked:
             if _is_available(self.discovery.get_model_state(name)):
                 return name
         return None
+
+    def select_chain(self, ctx: RoutingContext) -> list[ChainCandidate]:
+        """Return every viable candidate in priority order as ``ChainCandidate`` objects.
+
+        Unlike ``select_best`` (which returns only the first available), this
+        returns all candidates that have a resolvable backend_url and a config
+        entry — the retry loop in ``route_and_forward`` then decides which ones
+        to try based on upstream responses.
+
+        Only candidates that are currently available (or degraded) AND whose
+        backend URL can be resolved are included; broken/unconfigured entries
+        are silently skipped to keep the chain clean.
+        """
+        ranked = self._prepare_ranked(ctx)
+        out: list[ChainCandidate] = []
+        for name in ranked:
+            if not _is_available(self.discovery.get_model_state(name)):
+                continue
+            cfg = self.config.models.models.get(name)
+            if not cfg:
+                continue
+            provider = self.config.providers.get(cfg.provider)
+            if not provider:
+                continue
+            # Build backend URL (mirrors RequestRouter._backend_url logic).
+            url = provider.base_url.rstrip("/")
+            if cfg.port:
+                url = f"{url}:{cfg.port}"
+            if cfg.path:
+                url = f"{url}/{cfg.path.lstrip('/')}"
+            backend_url = f"{url}/v1"
+            # Build backend key (mirrors _compose_backend_key in router.py).
+            key_parts = [cfg.provider]
+            if cfg.port:
+                key_parts.append(str(cfg.port))
+            if cfg.path:
+                key_parts.append(cfg.path.strip("/"))
+            backend_key = ":".join(key_parts)
+            slot_wait_timeout = provider.slot_wait_timeout if hasattr(provider, "slot_wait_timeout") else 30.0
+            out.append(ChainCandidate(
+                model=name,
+                backend_url=backend_url,
+                backend_key=backend_key,
+                slot_wait_timeout=slot_wait_timeout,
+                provider_name=cfg.provider,
+            ))
+        return out
 
     def _build_candidates(self, ctx: RoutingContext) -> tuple[list[str], bool]:
         """Return (candidates, ordered). When ordered=True, list order is the priority."""
