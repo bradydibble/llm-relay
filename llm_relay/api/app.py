@@ -112,6 +112,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                         poll_interval=provider.poll_interval,
                         circuit_breaker=provider.circuit_breaker,
                         timeout=provider.health_check_timeout,
+                        max_concurrent=provider.max_concurrent,
                     )
                     continue
                 groups: dict[tuple[int | None, str], list[str]] = {}
@@ -138,6 +139,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                         poll_interval=provider.poll_interval,
                         circuit_breaker=provider.circuit_breaker,
                         timeout=provider.health_check_timeout,
+                        max_concurrent=provider.max_concurrent,
                     )
             yield
         await discovery.shutdown()

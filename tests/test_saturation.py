@@ -231,3 +231,46 @@ async def test_chat_completions_returns_503_retry_after_on_saturation(tmp_path, 
     body = resp.json()
     assert body["detail"]["error"] == "backend saturated"
     assert body["detail"]["backend"] == "local-llm"
+
+
+async def test_register_backend_propagates_max_concurrent_from_provider_config():
+    """ProviderConfig.max_concurrent must reach EndpointClient.inflight_sem via register_backend.
+
+    Regression for the Task 5 wiring gap where register_backend ignored
+    provider.max_concurrent and silently disabled saturation handling.
+    """
+    disc = DiscoveryManager()
+    await disc.register_backend(
+        key="test-backend",
+        provider_name="test",
+        base_url="http://nope",
+        models_hint=["dummy-model"],
+        poll_interval=999999,  # avoid actually polling
+        max_concurrent=4,
+    )
+    try:
+        client = disc.clients["test-backend"]
+        assert client.max_concurrent == 4
+        assert client.inflight_sem is not None
+        # Semaphore has the right capacity
+        assert client.inflight_sem._value == 4
+    finally:
+        await disc.shutdown()
+
+
+async def test_register_backend_without_max_concurrent_yields_no_semaphore():
+    """When max_concurrent is omitted, inflight_sem stays None (unbounded)."""
+    disc = DiscoveryManager()
+    await disc.register_backend(
+        key="unbounded",
+        provider_name="test",
+        base_url="http://nope",
+        models_hint=["dummy-model"],
+        poll_interval=999999,
+    )
+    try:
+        client = disc.clients["unbounded"]
+        assert client.max_concurrent is None
+        assert client.inflight_sem is None
+    finally:
+        await disc.shutdown()
