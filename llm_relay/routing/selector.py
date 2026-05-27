@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from ..config.loader import ConfigLoader
 from ..config.types import ModelStatus, Privacy
 from ..discovery.manager import DiscoveryManager
+from .keys import compose_backend_key, compose_backend_url
 
 
 def _is_available(status: ModelStatus) -> bool:
@@ -106,21 +107,9 @@ class ModelSelector:
             provider = self.config.providers.get(cfg.provider)
             if not provider:
                 continue
-            # Build backend URL (mirrors RequestRouter._backend_url logic).
-            url = provider.base_url.rstrip("/")
-            if cfg.port:
-                url = f"{url}:{cfg.port}"
-            if cfg.path:
-                url = f"{url}/{cfg.path.lstrip('/')}"
-            backend_url = f"{url}/v1"
-            # Build backend key (mirrors _compose_backend_key in router.py).
-            key_parts = [cfg.provider]
-            if cfg.port:
-                key_parts.append(str(cfg.port))
-            if cfg.path:
-                key_parts.append(cfg.path.strip("/"))
-            backend_key = ":".join(key_parts)
-            slot_wait_timeout = provider.slot_wait_timeout if hasattr(provider, "slot_wait_timeout") else 30.0
+            backend_url = compose_backend_url(provider.base_url, cfg.port, cfg.path)
+            backend_key = compose_backend_key(cfg.provider, cfg.port, cfg.path or "")
+            slot_wait_timeout = provider.slot_wait_timeout
             out.append(ChainCandidate(
                 model=name,
                 backend_url=backend_url,

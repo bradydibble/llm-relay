@@ -11,22 +11,8 @@ from ..config.loader import ConfigLoader
 from ..config.types import ModelStatus, Privacy, SaturationError
 from ..discovery.endpoint import _shared_upstream_bearer
 from ..discovery.manager import DiscoveryManager
+from .keys import compose_backend_key, compose_backend_url
 from .selector import ChainCandidate, ModelSelector, RoutingContext
-
-
-def _compose_backend_key(provider_name: str, port: int | None, path: str) -> str:
-    """Build the discovery-client key for a (provider, port, path) triple.
-
-    Matches the key format used by ``create_app`` when calling
-    ``register_backend``.  No models → just provider_name; port/path
-    components are appended with ':' as separator.
-    """
-    parts = [provider_name]
-    if port:
-        parts.append(str(port))
-    if path:
-        parts.append(path.strip("/"))
-    return ":".join(parts)
 
 
 @dataclass
@@ -54,12 +40,7 @@ class RequestRouter:
         provider = self.config.providers.get(cfg.provider)
         if not provider:
             return None
-        url = provider.base_url.rstrip("/")
-        if cfg.port:
-            url = f"{url}:{cfg.port}"
-        if cfg.path:
-            url = f"{url}/{cfg.path.lstrip('/')}"
-        return f"{url}/v1"
+        return compose_backend_url(provider.base_url, cfg.port, cfg.path)
 
     async def route_request(
         self,
@@ -109,7 +90,7 @@ class RequestRouter:
             url = self._backend_url(candidate)
             if not url:
                 continue
-            backend_key = _compose_backend_key(cfg.provider, cfg.port, cfg.path or "")
+            backend_key = compose_backend_key(cfg.provider, cfg.port, cfg.path or "")
             provider_cfg = self.config.providers.get(cfg.provider)
             slot_wait_timeout = provider_cfg.slot_wait_timeout if provider_cfg else 30.0
             return RouteResult(
@@ -333,6 +314,7 @@ class RequestRouter:
 
         # Non-streaming: walk the chain, retry on retry_on errors.
         last_response: httpx.Response | None = None
+        last_response_candidate: ChainCandidate | None = None
         last_error: Exception | None = None
 
         for candidate in candidates:
@@ -346,6 +328,7 @@ class RequestRouter:
                 )
                 if str(resp.status_code) in retry_codes:
                     last_response = resp
+                    last_response_candidate = candidate
                     continue
                 return resp, route_result
             except SaturationError:
@@ -357,9 +340,10 @@ class RequestRouter:
                 continue
 
         # Chain exhausted — surface the last observed error/response.
+        # Use last_response_candidate (the one that produced last_response),
+        # NOT candidates[-1] (the last *attempted* — which may have network-errored).
         if last_response is not None:
-            # Build a RouteResult reflecting the last-tried candidate.
-            final_result = _candidate_to_route_result(candidates[-1], ctx)
+            final_result = _candidate_to_route_result(last_response_candidate, ctx)  # type: ignore[arg-type]
             return last_response, final_result
         if last_error is not None:
             raise last_error

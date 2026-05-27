@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, call
-
 import httpx
 import pytest
 import yaml
@@ -290,3 +288,41 @@ async def test_route_and_forward_streaming_passes_through_response(tmp_path, mon
     # Should have picked model-a (first in alias order) since both healthy
     assert result.selected_model == "model-a"
     assert result.success is True
+
+
+async def test_route_and_forward_exhausted_chain_reports_correct_candidate(tmp_path, monkeypatch):
+    """When chain exhausts via 502-then-network-error, the returned RouteResult
+    must describe the candidate that produced the response (not the last attempted).
+
+    Regression for the telemetry mismatch where candidates[-1] was used instead
+    of the candidate that actually returned the held-onto response.
+    """
+    app = _make_app_with_both_healthy(tmp_path)
+    router = app.state.router
+
+    call_count = 0
+
+    async def _fake_forward(backend_url, model_name, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # Candidate 0 (model-a) returns 502 — retryable, becomes last_response.
+            return httpx.Response(502, content=b"bad gateway")
+        # Candidate 1 (model-b) raises a network exception — sets last_error,
+        # but leaves last_response pointing at the model-a 502 response.
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr(router, "forward_request", _fake_forward)
+
+    resp, result = await router.route_and_forward(
+        request_data={"model": "main", "messages": []},
+        stream=False,
+    )
+
+    assert call_count == 2
+    assert resp.status_code == 502
+    # The reported candidate must be model-a (which served the 502 response),
+    # NOT model-b (the last attempted, which network-errored).
+    assert result.selected_model == "model-a", (
+        f"expected model-a (which served the 502 response), got {result.selected_model}"
+    )
