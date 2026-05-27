@@ -46,6 +46,7 @@ class ProviderConfig:
     health_check_timeout: int = 5
     circuit_breaker: CircuitBreaker = field(default_factory=CircuitBreaker)
     model_overrides: list[str] = field(default_factory=list)
+    max_concurrent: int | None = None
 
 
 @dataclass

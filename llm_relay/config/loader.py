@@ -77,6 +77,7 @@ class ConfigLoader:
                     recovery_timeout=_parse_duration(cb.get("recovery_timeout", 30)),
                 ),
                 model_overrides=cfg.get("model_overrides", []) or [],
+                max_concurrent=cfg.get("max_concurrent"),
             )
 
     def _load_models(self) -> None:
