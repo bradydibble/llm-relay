@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..config.loader import ConfigLoader
+from ..config.types import SaturationError
 from ..discovery.manager import DiscoveryManager
 from ..routing.router import RequestRouter
 from .instrumentation import emit_chat_completion, reassemble_sse
@@ -344,7 +345,22 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
         if body.get("stream") is True:
             try:
                 upstream, body_iter = await request.app.state.router.stream_request(
-                    result.backend_url, result.selected_model, body
+                    result.backend_url, result.selected_model, body,
+                    backend_key=result.backend_key,
+                    slot_wait_timeout=result.slot_wait_timeout,
+                )
+            except SaturationError as e:
+                emit_chat_completion(
+                    request_body=body, response_body=None, response_text=None, usage=None,
+                    model_resolved=result.selected_model, provider_name=result.provider_name,
+                    user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
+                    status_code=503, streamed=True, error=str(e),
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": "backend saturated", "backend": e.backend_key,
+                            "retry_after_seconds": e.retry_after_seconds},
+                    headers={"Retry-After": str(max(1, int(e.retry_after_seconds)))},
                 )
             except httpx.RequestError as e:
                 emit_chat_completion(
@@ -389,7 +405,22 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
 
         try:
             upstream = await request.app.state.router.forward_request(
-                result.backend_url, result.selected_model, body
+                result.backend_url, result.selected_model, body,
+                backend_key=result.backend_key,
+                slot_wait_timeout=result.slot_wait_timeout,
+            )
+        except SaturationError as e:
+            emit_chat_completion(
+                request_body=body, response_body=None, response_text=None, usage=None,
+                model_resolved=result.selected_model, provider_name=result.provider_name,
+                user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
+                status_code=503, streamed=False, error=str(e),
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "backend saturated", "backend": e.backend_key,
+                        "retry_after_seconds": e.retry_after_seconds},
+                headers={"Retry-After": str(max(1, int(e.retry_after_seconds)))},
             )
         except httpx.RequestError as e:
             emit_chat_completion(

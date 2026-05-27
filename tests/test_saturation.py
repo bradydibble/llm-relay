@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
+import yaml
 
-from llm_relay.config.types import CircuitBreaker, EndpointState, SaturationError
+from llm_relay.config.types import CircuitBreaker, EndpointState, ModelStatus, SaturationError
 from llm_relay.discovery.endpoint import EndpointClient
 from llm_relay.discovery.manager import DiscoveryManager
 
@@ -153,3 +155,79 @@ async def test_acquire_slot_does_not_leak_permit_on_timeout():
     # Cleanup.
     holder_release.set()
     await t
+
+
+# ---------------------------------------------------------------------------
+# API-layer: 503 + Retry-After on SaturationError
+# ---------------------------------------------------------------------------
+
+def _make_minimal_config(tmp_path: Path) -> Path:
+    """Write a minimal providers.yaml + models.yaml so create_app can load."""
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    (cfg_dir / "providers.yaml").write_text(yaml.safe_dump({
+        "providers": {
+            "local-llm": {
+                "type": "openai",
+                "base_url": "http://127.0.0.1",
+                "enabled": True,
+                "max_concurrent": 1,
+                "slot_wait_timeout": 5.0,
+            }
+        }
+    }))
+    (cfg_dir / "models.yaml").write_text(yaml.safe_dump({
+        "models": {
+            "test-model": {
+                "provider": "local-llm",
+                "class": "unknown",
+                "privacy": "local_only",
+            }
+        }
+    }))
+    return cfg_dir
+
+
+async def test_chat_completions_returns_503_retry_after_on_saturation(tmp_path, monkeypatch):
+    """When forward_request raises SaturationError, /v1/chat/completions returns
+    503 with a Retry-After header hinting the retry window."""
+    import httpx
+    from httpx import ASGITransport
+
+    from llm_relay.api.app import create_app
+    from llm_relay.routing.router import RouteResult
+
+    cfg_dir = _make_minimal_config(tmp_path)
+    app = create_app(config_dir=cfg_dir)
+
+    # Patch route_request to return a successful RouteResult pointing at our fake
+    # backend, and patch forward_request to raise SaturationError synchronously.
+    async def _fake_route(request_data, headers=None):
+        return RouteResult(
+            success=True,
+            selected_model="test-model",
+            backend_url="http://127.0.0.1/v1",
+            provider_name="local-llm",
+            backend_key="local-llm",
+            slot_wait_timeout=5.0,
+        )
+
+    async def _fake_forward(*args, **kwargs):
+        raise SaturationError(backend_key="local-llm", retry_after_seconds=5.0)
+
+    monkeypatch.setattr(app.state.router, "route_request", _fake_route)
+    monkeypatch.setattr(app.state.router, "forward_request", _fake_forward)
+
+    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"model": "test-model", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert resp.status_code == 503
+    assert "Retry-After" in resp.headers
+    retry_after = int(resp.headers["Retry-After"])
+    assert retry_after >= 1
+    body = resp.json()
+    assert body["detail"]["error"] == "backend saturated"
+    assert body["detail"]["backend"] == "local-llm"

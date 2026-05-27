@@ -47,6 +47,7 @@ class ProviderConfig:
     circuit_breaker: CircuitBreaker = field(default_factory=CircuitBreaker)
     model_overrides: list[str] = field(default_factory=list)
     max_concurrent: int | None = None
+    slot_wait_timeout: float = 30.0
 
 
 @dataclass
