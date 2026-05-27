@@ -17,6 +17,7 @@ def _stub_payloads() -> dict[str, Any]:
                 "capabilities": ["tool_use", "structured_output"],
                 "tags": ["local"],
                 "privacy": "local_only",
+                "preference": 1.0,
             },
             "qwen3.5-9b": {
                 "provider": "local-llm",
@@ -25,6 +26,16 @@ def _stub_payloads() -> dict[str, Any]:
                 "capabilities": ["tool_use"],
                 "tags": ["local"],
                 "privacy": "local_only",
+                "preference": 0.5,
+            },
+            "cloud-test": {
+                "provider": "cloud-provider",
+                "status": "available",
+                "context_window": 200000,
+                "capabilities": ["tool_use", "structured_output"],
+                "tags": ["cloud"],
+                "privacy": "cloud_ok",
+                "preference": 0.8,
             },
             "aliases": {"main": ["qwen3.6-35b-a3b", "qwen3.5-9b"]},
             "alias_info": {
@@ -106,3 +117,73 @@ async def test_describe_alias_unknown_alias_returns_error_and_lists_available(mo
     assert result["alias"] == "nonexistent-alias"
     assert "error" in result and "nonexistent-alias" in result["error"]
     assert "main" in result["available_aliases"]
+
+
+async def test_select_for_capability_filters_by_min_context_window(monkeypatch):
+    """min_context_window=100000 excludes qwen3.5-9b (64K) but keeps qwen3.6-35b-a3b (128K)."""
+    from llm_relay.mcp import server as mcp_mod
+
+    payloads = _stub_payloads()
+
+    async def fake_get(path: str):
+        return payloads[path]
+
+    monkeypatch.setattr(mcp_mod, "_get", fake_get, raising=False)
+
+    _starlette_app, _mgr = mcp_mod.build_mcp_server(base_url="http://test")
+    fn = _get_tool(mcp_mod._mcp_instance, "select_for_capability")
+
+    result = await fn(min_context_window=100000, privacy="local_only")
+    assert "qwen3.5-9b" not in result["candidates"]
+    assert "qwen3.6-35b-a3b" in result["candidates"]
+    assert result["best"] == "qwen3.6-35b-a3b"
+    assert "100000" in result["rationale"]
+
+
+async def test_select_for_capability_excludes_cloud_when_local_only(monkeypatch):
+    """privacy='local_only' filters out cloud models even if they'd otherwise qualify."""
+    from llm_relay.mcp import server as mcp_mod
+
+    payloads = _stub_payloads()
+
+    async def fake_get(path: str):
+        return payloads[path]
+
+    monkeypatch.setattr(mcp_mod, "_get", fake_get, raising=False)
+
+    _starlette_app, _mgr = mcp_mod.build_mcp_server(base_url="http://test")
+    fn = _get_tool(mcp_mod._mcp_instance, "select_for_capability")
+
+    # cloud-test has 200K context and tool_use, but privacy=cloud_ok — must be excluded
+    result = await fn(
+        min_context_window=0,
+        requires_capabilities=["tool_use"],
+        privacy="local_only",
+    )
+    assert "cloud-test" not in result["candidates"]
+    # both local models have tool_use and should be present
+    assert "qwen3.6-35b-a3b" in result["candidates"]
+    assert "qwen3.5-9b" in result["candidates"]
+    # 35b has preference=1.0, 9b has preference=0.5 → 35b should be best
+    assert result["best"] == "qwen3.6-35b-a3b"
+
+
+async def test_select_for_capability_returns_empty_when_no_match(monkeypatch):
+    """When no model satisfies constraints, returns {candidates: [], best: None}."""
+    from llm_relay.mcp import server as mcp_mod
+
+    payloads = _stub_payloads()
+
+    async def fake_get(path: str):
+        return payloads[path]
+
+    monkeypatch.setattr(mcp_mod, "_get", fake_get, raising=False)
+
+    _starlette_app, _mgr = mcp_mod.build_mcp_server(base_url="http://test")
+    fn = _get_tool(mcp_mod._mcp_instance, "select_for_capability")
+
+    # Impossibly large context window — no model satisfies this
+    result = await fn(min_context_window=10_000_000, privacy="cloud_ok")
+    assert result["candidates"] == []
+    assert result["best"] is None
+    assert "rationale" in result

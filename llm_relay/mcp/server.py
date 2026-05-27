@@ -6,10 +6,12 @@ Streamable HTTP transport:
     http://<host>:<port>/mcp/mcp   (POST / SSE endpoint)
 
 Configured tool list:
-  relay_status    — active mode, alias resolutions, backend health
-  list_models     — all models with current availability
-  describe_alias  — resolve a single alias: current model, context_window,
-                    members, and saturation flag
+  relay_status           — active mode, alias resolutions, backend health
+  list_models            — all models with current availability
+  describe_alias         — resolve a single alias: current model, context_window,
+                           members, and saturation flag
+  select_for_capability  — find models matching constraints (context, capabilities,
+                           privacy), ranked by preference
 
 Important: the MCP session manager must be started in the parent app's
 lifespan.  ``build_mcp_server()`` returns the FastMCP instance and the
@@ -65,7 +67,11 @@ def build_mcp_server(
             "Use list_models to enumerate all configured models with availability. "
             "Use describe_alias to inspect a specific alias before sending a request: "
             "it tells you the resolved model, context window, and whether the backend "
-            "is saturated."
+            "is saturated. "
+            "Use select_for_capability to find models that meet your requirements "
+            "(minimum context window, required capability tags, privacy constraints) "
+            "without enumerating models yourself — it returns ranked candidates so "
+            "you can pick the best fit and then request it by name."
         ),
     )
 
@@ -145,6 +151,69 @@ def build_mcp_server(
             "context_window": info["context_window"],
             "members": info["members"],
             "saturated": saturated,
+        }
+
+    @mcp.tool()
+    async def select_for_capability(
+        min_context_window: int = 0,
+        requires_capabilities: list[str] | None = None,
+        privacy: str = "local_only",
+    ) -> dict[str, Any]:
+        """Find models matching given constraints, ranked by preference.
+
+        Args:
+            min_context_window: only return models whose context_window >= this.
+            requires_capabilities: list of capability tags the model must support
+                (e.g. ['tool_use', 'structured_output']).
+            privacy: 'local_only' or 'cloud_ok'. Default local_only.
+
+        Returns:
+            {"candidates": [id, ...], "best": id_or_None, "rationale": "..."}
+        """
+        data = await _get("/v1/available-models")
+
+        required_caps = set(requires_capabilities or [])
+        candidates = []
+        total = 0
+
+        for model_id, info in data.items():
+            if model_id in ("aliases", "alias_info"):
+                continue
+            total += 1
+
+            # Must be available
+            if info.get("status") != "available":
+                continue
+
+            # Context window check — missing/None treated as 0 (fails non-zero constraint)
+            cw = info.get("context_window") or 0
+            if cw < min_context_window:
+                continue
+
+            # Capabilities check — missing/None means no capabilities (fails non-empty constraint)
+            model_caps = set(info.get("capabilities") or [])
+            if not required_caps.issubset(model_caps):
+                continue
+
+            # Privacy filter
+            if privacy == "local_only" and info.get("privacy") != "local_only":
+                continue
+
+            candidates.append({"id": model_id, **info})
+
+        # Sort by preference descending, then id ascending for stability
+        candidates.sort(key=lambda m: (-(m.get("preference") or 0.0), m["id"]))
+
+        candidate_ids = [m["id"] for m in candidates]
+        return {
+            "candidates": candidate_ids,
+            "best": candidate_ids[0] if candidate_ids else None,
+            "rationale": (
+                f"filtered {len(candidate_ids)} of {total} models by "
+                f"min_context={min_context_window}, "
+                f"requires={list(requires_capabilities or [])}, "
+                f"privacy={privacy}"
+            ),
         }
 
     # streamable_http_app() lazily initialises the session_manager; call it
