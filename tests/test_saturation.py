@@ -252,8 +252,15 @@ async def test_register_backend_propagates_max_concurrent_from_provider_config()
         client = disc.clients["test-backend"]
         assert client.max_concurrent == 4
         assert client.inflight_sem is not None
-        # Semaphore has the right capacity
-        assert client.inflight_sem._value == 4
+        # Behaviorally prove the semaphore has 4 slots: acquire 4 times (must succeed)
+        # then verify the 5th times out (capacity exhausted).
+        for _ in range(4):
+            await asyncio.wait_for(client.inflight_sem.acquire(), timeout=0.1)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(client.inflight_sem.acquire(), timeout=0.05)
+        # Clean up: release the 4 we acquired so the disc.shutdown() path is tidy.
+        for _ in range(4):
+            client.inflight_sem.release()
     finally:
         await disc.shutdown()
 
