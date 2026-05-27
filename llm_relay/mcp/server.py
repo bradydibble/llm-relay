@@ -30,6 +30,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
 _BASE_URL: str = "http://127.0.0.1:8090"
+_mcp_instance: "FastMCP | None" = None  # set by build_mcp_server; used by tests
 
 
 async def _get(path: str) -> Any:
@@ -46,14 +47,14 @@ async def _get(path: str) -> Any:
 
 def build_mcp_server(
     base_url: str = _BASE_URL,
-) -> tuple[FastMCP, StreamableHTTPSessionManager]:
-    """Build the FastMCP server.  Returns ``(mcp_instance, session_manager)``.
+) -> tuple[Any, StreamableHTTPSessionManager]:
+    """Build the FastMCP server.  Returns ``(starlette_app, session_manager)``.
 
-    Mount the ASGI sub-app via ``mcp_instance.streamable_http_app()``.
+    The *starlette_app* is the ASGI sub-app to mount (e.g. ``app.mount("/mcp", starlette_app)``).
     The *session_manager* must be started (via ``async with session_manager.run()``) in
     the parent FastAPI app's lifespan before any MCP requests are handled.
     """
-    global _BASE_URL
+    global _BASE_URL, _mcp_instance
     _BASE_URL = base_url
 
     mcp = FastMCP(
@@ -120,7 +121,7 @@ def build_mcp_server(
             return {
                 "alias": name,
                 "error": f"unknown alias '{name}'",
-                "available_aliases": list(alias_info.keys()),
+                "available_aliases": list(payload.get("aliases", {}).keys()),
             }
 
         info = alias_info[name]
@@ -146,14 +147,13 @@ def build_mcp_server(
             "saturated": saturated,
         }
 
-    # session_manager is lazily initialised; streamable_http_app() must be
-    # called first to trigger that initialisation.
-    mcp.streamable_http_app()
-    return mcp, mcp.session_manager
+    # streamable_http_app() lazily initialises the session_manager; call it
+    # once here so the returned session_manager is non-None.  The caller uses
+    # the returned starlette_app as the ASGI sub-app to mount.
+    starlette_app = mcp.streamable_http_app()
+    _mcp_instance = mcp  # expose for test introspection
+    return starlette_app, mcp.session_manager
 
 
-# Backwards-compat aliases
-def build_mcp_app(base_url: str = _BASE_URL) -> Any:
-    """Return the ASGI sub-app only (caller is responsible for the lifespan)."""
-    mcp, _session_mgr = build_mcp_server(base_url)
-    return mcp.streamable_http_app()
+# Backwards-compat alias (returns app only; caller is responsible for the lifespan)
+build_mcp_app = lambda base_url=_BASE_URL: build_mcp_server(base_url)[0]  # noqa: E731

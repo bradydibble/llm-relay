@@ -77,8 +77,8 @@ async def test_describe_alias_returns_resolution_for_known_alias(monkeypatch):
 
     monkeypatch.setattr(mcp_mod, "_get", fake_get, raising=False)
 
-    mcp_server, _mgr = mcp_mod.build_mcp_server(base_url="http://test")
-    fn = _get_tool(mcp_server, "describe_alias")
+    _starlette_app, _mgr = mcp_mod.build_mcp_server(base_url="http://test")
+    fn = _get_tool(mcp_mod._mcp_instance, "describe_alias")
 
     result = await fn(name="main")
     assert result["alias"] == "main"
@@ -99,8 +99,8 @@ async def test_describe_alias_unknown_alias_returns_error_and_lists_available(mo
 
     monkeypatch.setattr(mcp_mod, "_get", fake_get, raising=False)
 
-    mcp_server, _mgr = mcp_mod.build_mcp_server(base_url="http://test")
-    fn = _get_tool(mcp_server, "describe_alias")
+    _starlette_app, _mgr = mcp_mod.build_mcp_server(base_url="http://test")
+    fn = _get_tool(mcp_mod._mcp_instance, "describe_alias")
 
     result = await fn(name="nonexistent-alias")
     assert result["alias"] == "nonexistent-alias"
