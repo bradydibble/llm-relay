@@ -164,7 +164,7 @@ class RequestRouter:
         if bearer and "Authorization" not in merged_headers:
             merged_headers["Authorization"] = f"Bearer {bearer}"
         # Reads are unbounded — SSE may stall between tokens on slow models.
-        timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+        timeout = httpx.Timeout(connect=10.0, read=600.0, write=10.0, pool=10.0)
         client = httpx.AsyncClient(timeout=timeout)
         try:
             req = client.build_request(
