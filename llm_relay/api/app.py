@@ -149,7 +149,8 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
     _mcp_session_mgr = None
     try:
         from ..mcp import build_mcp_server
-        _mcp_app, _mcp_session_mgr = build_mcp_server(base_url=_resolve_base_url())
+        _mcp_instance, _mcp_session_mgr = build_mcp_server(base_url=_resolve_base_url())
+        _mcp_app = _mcp_instance.streamable_http_app()
     except ImportError:
         pass
 
