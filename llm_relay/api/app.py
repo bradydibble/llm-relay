@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from ..config.loader import ConfigLoader
 from ..config.types import SaturationError
 from ..discovery.manager import DiscoveryManager
+from ..routing.keys import compose_backend_key
 from ..routing.router import RequestRouter
 from .instrumentation import emit_chat_completion, reassemble_sse
 
@@ -124,12 +125,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                         base = f"{base}:{port}"
                     if path:
                         base = f"{base}/{path.lstrip('/')}"
-                    key_parts = [provider_name]
-                    if port:
-                        key_parts.append(str(port))
-                    if path:
-                        key_parts.append(path.strip("/"))
-                    key = ":".join(key_parts)
+                    key = compose_backend_key(provider_name, port, path)
                     await discovery.register_backend(
                         key=key,
                         provider_name=provider_name,

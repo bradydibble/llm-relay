@@ -8,7 +8,7 @@ import httpx
 from fastapi import HTTPException
 
 from ..config.loader import ConfigLoader
-from ..config.types import ModelStatus, Privacy, SaturationError
+from ..config.types import Privacy, SaturationError
 from ..discovery.endpoint import _shared_upstream_bearer
 from ..discovery.manager import DiscoveryManager
 from .keys import compose_backend_key, compose_backend_url
@@ -41,82 +41,6 @@ class RequestRouter:
         if not provider:
             return None
         return compose_backend_url(provider.base_url, cfg.port, cfg.path)
-
-    async def route_request(
-        self,
-        request_data: dict[str, Any],
-        headers: dict[str, str] | None = None,
-    ) -> RouteResult:
-        headers = headers or {}
-        privacy_str = headers.get("X-Llm-Relay-Privacy", "local_only")
-        privacy = Privacy(privacy_str if privacy_str in ("local_only", "cloud_ok") else "local_only")
-
-        weights: dict[str, float] = {}
-        weights_str = headers.get("X-Llm-Relay-Weights", "")
-        if weights_str:
-            for pair in weights_str.split(","):
-                if "=" in pair:
-                    k, v = pair.split("=", 1)
-                    try:
-                        weights[k.strip()] = float(v.strip())
-                    except ValueError:
-                        pass
-
-        ctx = RoutingContext(
-            requested_model=request_data.get("model", "") or "",
-            privacy=privacy,
-            weights=weights,
-            require_tools=headers.get("X-Llm-Relay-Require-Tools", "false").lower() == "true",
-            min_context=int(headers.get("X-Llm-Relay-Min-Context", "0") or 0) or None,
-        )
-
-        selected = self.selector.select_best(ctx)
-        if not selected:
-            return RouteResult(
-                success=False,
-                selected_model=None,
-                backend_url=None,
-                provider_name=None,
-                error="No model matches constraints",
-                decision={"requested": ctx.requested_model, "candidates": ctx.candidates, "filtered": ctx.filtered},
-            )
-
-        for candidate in ctx.ranked:
-            cfg = self.config.models.models.get(candidate)
-            if not cfg:
-                continue
-            if self.discovery.get_model_state(candidate) != ModelStatus.available:
-                continue
-            url = self._backend_url(candidate)
-            if not url:
-                continue
-            backend_key = compose_backend_key(cfg.provider, cfg.port, cfg.path or "")
-            provider_cfg = self.config.providers.get(cfg.provider)
-            slot_wait_timeout = provider_cfg.slot_wait_timeout if provider_cfg else 30.0
-            return RouteResult(
-                success=True,
-                selected_model=candidate,
-                backend_url=url,
-                provider_name=cfg.provider,
-                decision={
-                    "requested": ctx.requested_model,
-                    "selected": candidate,
-                    "candidates": ctx.candidates,
-                    "ranked": ctx.ranked[:5],
-                    "privacy": ctx.privacy.value,
-                },
-                backend_key=backend_key,
-                slot_wait_timeout=slot_wait_timeout,
-            )
-
-        return RouteResult(
-            success=False,
-            selected_model=selected,
-            backend_url=None,
-            provider_name=(self.config.models.models.get(selected).provider if selected in self.config.models.models else None),
-            error="No candidate currently available",
-            decision={"requested": ctx.requested_model, "ranked": ctx.ranked, "filtered": ctx.filtered},
-        )
 
     async def forward_request(
         self,
