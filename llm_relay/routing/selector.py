@@ -73,8 +73,43 @@ class ModelSelector:
             ranked = list(filtered)
         else:
             ranked = self._rank(ctx, filtered)
+        # Load-aware re-sort: prefer least-loaded backend, break ties on the
+        # original priority order. Targets TTFT/TPS — even one in-flight slot
+        # on the priority backend can add multi-second slot-wait latency, so
+        # we aggressively spill to an idle alternate when one exists.
+        ranked = self._sort_by_load(ranked)
         ctx.ranked = ranked
         return ranked
+
+    def _sort_by_load(self, ranked: list[str]) -> list[str]:
+        """Re-order *ranked* so least-loaded candidates win; preserve original
+        priority on ties.
+
+        Sort key per candidate: ``(load_ratio, original_index)``. A candidate
+        with no backend client or no semaphore (unbounded) scores ``load_ratio
+        = 0.0`` — treated as fully idle.
+        """
+        scored: list[tuple[float, int, str]] = [
+            (self._load_ratio(name), idx, name) for idx, name in enumerate(ranked)
+        ]
+        scored.sort()
+        return [name for _, _, name in scored]
+
+    def _load_ratio(self, model_name: str) -> float:
+        """Current in-flight ratio for the backend serving *model_name*.
+
+        Returns 0.0 for backends with no semaphore (max_concurrent unset) or
+        when the model can't be resolved to a registered backend — those are
+        treated as "no contention" so they don't get penalized in routing.
+        """
+        cfg = self.config.models.models.get(model_name)
+        if not cfg:
+            return 0.0
+        key = compose_backend_key(cfg.provider, cfg.port, cfg.path or "")
+        client = self.discovery.clients.get(key)
+        if client is None or client.max_concurrent is None or client.max_concurrent <= 0:
+            return 0.0
+        return client.inflight_used / client.max_concurrent
 
     def select_best(self, ctx: RoutingContext) -> str | None:
         ranked = self._prepare_ranked(ctx)
