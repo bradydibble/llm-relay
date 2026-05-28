@@ -105,6 +105,27 @@ class DiscoveryManager:
                 return ModelStatus.degraded
         return ModelStatus.unavailable
 
+    def get_live_context_window(self, model_name: str) -> int | None:
+        """Live max_model_len for `model_name` from the latest /v1/models probe.
+
+        Returns None if no backend currently reports a value (either the model
+        isn't being served, the backend is down, or the backend's /v1/models
+        response doesn't include `max_model_len`). Callers should fall back to
+        the static models.yaml value in that case.
+        """
+        key = self.model_to_client.get(model_name)
+        if key:
+            client = self.clients.get(key)
+            if client is not None:
+                val = client.state.model_max_lens.get(model_name)
+                if isinstance(val, int) and val > 0:
+                    return val
+        for client in self.clients.values():
+            val = client.state.model_max_lens.get(model_name)
+            if isinstance(val, int) and val > 0:
+                return val
+        return None
+
     def get_client_for_model(self, model_name: str) -> EndpointClient | None:
         key = self.model_to_client.get(model_name)
         if key:

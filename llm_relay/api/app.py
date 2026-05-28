@@ -38,11 +38,16 @@ def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[
     out: dict[str, Any] = {}
     for name, m in cfg.models.models.items():
         status = disc.get_model_state(name)
+        # Prefer live max_model_len from the backend (authoritative); fall back
+        # to static models.yaml value when the backend isn't currently
+        # reporting one (down, no max_model_len field, etc.).
+        live_cw = disc.get_live_context_window(name)
         out[name] = {
             "provider": m.provider,
             "class": m.class_name,
             "status": status.value,
-            "context_window": m.context_window,
+            "context_window": live_cw if live_cw is not None else m.context_window,
+            "context_window_source": "live" if live_cw is not None else "config",
             "capabilities": m.capabilities,
             "tags": m.tags,
             "privacy": m.privacy.value,
@@ -71,7 +76,11 @@ def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[
                 if member in cfg.models.models:
                     current = member
                     break
-        cw = cfg.models.models[current].context_window if current else None
+        if current is not None:
+            live_cw = disc.get_live_context_window(current)
+            cw = live_cw if live_cw is not None else cfg.models.models[current].context_window
+        else:
+            cw = None
         alias_info[alias] = {
             "members": members_list,
             "current": current,

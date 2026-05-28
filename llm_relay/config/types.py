@@ -121,6 +121,10 @@ class EndpointState:
     status: EndpointStatus = EndpointStatus.healthy
     last_poll: str | None = None
     models: list[str] = field(default_factory=list)
+    # Per-model max_model_len reported by the backend (vLLM exposes this on
+    # /v1/models). Authoritative metadata source -- keeps the relay accurate
+    # when a backend's --max-model-len is changed without a models.yaml edit.
+    model_max_lens: dict[str, int] = field(default_factory=dict)
     consecutive_failures: int = 0
     circuit_open: bool = False
     circuit_opened_at: float | None = None

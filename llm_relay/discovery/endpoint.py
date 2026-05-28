@@ -72,16 +72,28 @@ class EndpointClient:
                 resp.raise_for_status()
                 data = resp.json()
                 models: list[str] = []
+                live_max_lens: dict[str, int] = {}
                 if isinstance(data, dict) and "data" in data:
                     for m in data["data"]:
                         if isinstance(m, dict) and "id" in m:
-                            models.append(m["id"])
+                            mid = m["id"]
+                            models.append(mid)
+                            # vLLM and most OpenAI-compatible servers publish
+                            # max_model_len here; capture for live metadata.
+                            mml = m.get("max_model_len")
+                            if isinstance(mml, int) and mml > 0:
+                                live_max_lens[mid] = mml
                 elif isinstance(data, list):
                     for m in data:
                         if isinstance(m, str):
                             models.append(m)
                         elif isinstance(m, dict) and "id" in m:
-                            models.append(m["id"])
+                            mid = m["id"]
+                            models.append(mid)
+                            mml = m.get("max_model_len")
+                            if isinstance(mml, int) and mml > 0:
+                                live_max_lens[mid] = mml
+                self.state.model_max_lens = live_max_lens
                 self.state.consecutive_failures = 0
                 self.state.circuit_open = False
                 return models
