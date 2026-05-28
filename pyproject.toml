@@ -31,6 +31,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "pytest-asyncio>=0.23",
 ]
 mcp = [
     "mcp>=1.10",
@@ -50,6 +51,9 @@ Issues = "https://github.com/bradydibble/llm-relay/issues"
 
 [project.scripts]
 llm-relay = "llm_relay.cli:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [build-system]
 requires = ["hatchling"]

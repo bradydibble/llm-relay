@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..config.loader import ConfigLoader
+from ..config.types import SaturationError
 from ..discovery.manager import DiscoveryManager
 from ..routing.router import RequestRouter
 from .instrumentation import emit_chat_completion, reassemble_sse
@@ -111,6 +112,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                         poll_interval=provider.poll_interval,
                         circuit_breaker=provider.circuit_breaker,
                         timeout=provider.health_check_timeout,
+                        max_concurrent=provider.max_concurrent,
                     )
                     continue
                 groups: dict[tuple[int | None, str], list[str]] = {}
@@ -137,6 +139,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                         poll_interval=provider.poll_interval,
                         circuit_breaker=provider.circuit_breaker,
                         timeout=provider.health_check_timeout,
+                        max_concurrent=provider.max_concurrent,
                     )
             yield
         await discovery.shutdown()
@@ -326,42 +329,63 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 hint_headers[key] = v
         user_agent = request.headers.get("user-agent", "")
         start_ns = time.time_ns()
-        result = await request.app.state.router.route_request(body, hint_headers)
-        if not result.success:
+        is_stream = body.get("stream") is True
+
+        try:
+            if is_stream:
+                upstream, body_iter, result = await request.app.state.router.route_and_forward(
+                    request_data=body, headers=hint_headers, stream=True,
+                )
+            else:
+                upstream, result = await request.app.state.router.route_and_forward(
+                    request_data=body, headers=hint_headers, stream=False,
+                )
+        except SaturationError as e:
             emit_chat_completion(
                 request_body=body, response_body=None, response_text=None, usage=None,
-                model_resolved=result.selected_model, provider_name=result.provider_name,
+                model_resolved=None, provider_name=None,
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
-                status_code=503, streamed=False, error=str(result.error),
+                status_code=503, streamed=is_stream, error=str(e),
             )
-            raise HTTPException(503, detail={"error": result.error, "decision": result.decision})
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "backend saturated", "backend": e.backend_key,
+                        "retry_after_seconds": e.retry_after_seconds},
+                headers={"Retry-After": str(max(1, int(e.retry_after_seconds)))},
+            )
+        except httpx.RequestError as e:
+            emit_chat_completion(
+                request_body=body, response_body=None, response_text=None, usage=None,
+                model_resolved=None, provider_name=None,
+                user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
+                status_code=502, streamed=is_stream, error=f"Backend network error: {e}",
+            )
+            raise HTTPException(502, detail=f"Backend network error: {e}")
+        except HTTPException:
+            # route_and_forward raises HTTPException for no-candidates 503.
+            # Emit telemetry then re-raise.
+            emit_chat_completion(
+                request_body=body, response_body=None, response_text=None, usage=None,
+                model_resolved=None, provider_name=None,
+                user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
+                status_code=503, streamed=is_stream, error="No model matches constraints",
+            )
+            raise
+        except Exception as e:
+            emit_chat_completion(
+                request_body=body, response_body=None, response_text=None, usage=None,
+                model_resolved=None, provider_name=None,
+                user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
+                status_code=502, streamed=is_stream, error=f"Backend error: {e}",
+            )
+            raise HTTPException(502, detail=f"Backend error: {e}")
 
         relay_headers = {
             "X-Llm-Relay-Selected-Model": result.selected_model or "",
             "X-Llm-Relay-Selected-Provider": result.provider_name or "",
         }
 
-        if body.get("stream") is True:
-            try:
-                upstream, body_iter = await request.app.state.router.stream_request(
-                    result.backend_url, result.selected_model, body
-                )
-            except httpx.RequestError as e:
-                emit_chat_completion(
-                    request_body=body, response_body=None, response_text=None, usage=None,
-                    model_resolved=result.selected_model, provider_name=result.provider_name,
-                    user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
-                    status_code=502, streamed=True, error=f"Backend network error: {e}",
-                )
-                raise HTTPException(502, detail=f"Backend network error: {e}")
-            except Exception as e:
-                emit_chat_completion(
-                    request_body=body, response_body=None, response_text=None, usage=None,
-                    model_resolved=result.selected_model, provider_name=result.provider_name,
-                    user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
-                    status_code=502, streamed=True, error=f"Backend error: {e}",
-                )
-                raise HTTPException(502, detail=f"Backend error: {e}")
+        if is_stream:
             media_type = upstream.headers.get("content-type", "text/event-stream")
             upstream_status = upstream.status_code
 
@@ -387,26 +411,6 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 headers=relay_headers,
             )
 
-        try:
-            upstream = await request.app.state.router.forward_request(
-                result.backend_url, result.selected_model, body
-            )
-        except httpx.RequestError as e:
-            emit_chat_completion(
-                request_body=body, response_body=None, response_text=None, usage=None,
-                model_resolved=result.selected_model, provider_name=result.provider_name,
-                user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
-                status_code=502, streamed=False, error=f"Backend network error: {e}",
-            )
-            raise HTTPException(502, detail=f"Backend network error: {e}")
-        except Exception as e:
-            emit_chat_completion(
-                request_body=body, response_body=None, response_text=None, usage=None,
-                model_resolved=result.selected_model, provider_name=result.provider_name,
-                user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
-                status_code=502, streamed=False, error=f"Backend error: {e}",
-            )
-            raise HTTPException(502, detail=f"Backend error: {e}")
         try:
             content = upstream.json()
             if isinstance(content, dict):

@@ -46,6 +46,8 @@ class ProviderConfig:
     health_check_timeout: int = 5
     circuit_breaker: CircuitBreaker = field(default_factory=CircuitBreaker)
     model_overrides: list[str] = field(default_factory=list)
+    max_concurrent: int | None = None
+    slot_wait_timeout: float = 30.0
 
 
 @dataclass
@@ -134,3 +136,17 @@ class ModelState:
     tags: list[str] = field(default_factory=list)
     preference: float = 0.5
     privacy: Privacy = Privacy.local_only
+
+
+class SaturationError(Exception):
+    """Raised when all in-flight slots for a backend are occupied and
+    `acquire_slot` exceeds its wait budget.
+
+    Carries a retry_after_seconds hint so the API layer can emit a
+    well-formed `Retry-After` HTTP header.
+    """
+
+    def __init__(self, backend_key: str, retry_after_seconds: float):
+        super().__init__(f"backend {backend_key} saturated; retry after {retry_after_seconds:.1f}s")
+        self.backend_key = backend_key
+        self.retry_after_seconds = retry_after_seconds

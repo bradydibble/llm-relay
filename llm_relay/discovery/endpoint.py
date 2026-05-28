@@ -1,6 +1,7 @@
 """OpenAI-compatible endpoint client with health checking."""
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from dataclasses import dataclass, field
@@ -32,10 +33,14 @@ class EndpointClient:
     timeout: float = 5.0
     state: EndpointState | None = None
     circuit_breaker: CircuitBreaker = field(default_factory=CircuitBreaker)
+    max_concurrent: int | None = None
+    inflight_sem: asyncio.Semaphore | None = field(default=None, init=False)
 
     def __post_init__(self):
         if self.state is None:
             self.state = EndpointState(provider=self.provider_name)
+        if self.max_concurrent is not None and self.max_concurrent > 0:
+            self.inflight_sem = asyncio.Semaphore(self.max_concurrent)
 
     def _maybe_recover_circuit(self) -> None:
         if not self.state.circuit_open:
