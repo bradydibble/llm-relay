@@ -257,6 +257,119 @@ async def test_register_backend_propagates_max_concurrent_from_provider_config()
         await disc.shutdown()
 
 
+async def test_inflight_used_increments_on_acquire_and_decrements_on_release():
+    """inflight_used must reflect the number of slots currently held."""
+    disc = DiscoveryManager()
+    disc.clients["k"] = _make_client(max_concurrent=2)
+    client = disc.clients["k"]
+
+    assert client.inflight_used == 0
+    async with disc.acquire_slot("k", wait_timeout=0.5):
+        assert client.inflight_used == 1
+        async with disc.acquire_slot("k", wait_timeout=0.5):
+            assert client.inflight_used == 2
+        assert client.inflight_used == 1
+    assert client.inflight_used == 0
+
+
+async def test_inflight_used_decrements_when_body_raises():
+    """If the with-body raises, inflight_used must still decrement."""
+    disc = DiscoveryManager()
+    disc.clients["k"] = _make_client(max_concurrent=1)
+    client = disc.clients["k"]
+
+    class _Boom(Exception):
+        pass
+
+    with pytest.raises(_Boom):
+        async with disc.acquire_slot("k", wait_timeout=0.5):
+            assert client.inflight_used == 1
+            raise _Boom()
+    assert client.inflight_used == 0
+
+
+async def test_inflight_used_unchanged_on_saturation_timeout():
+    """A saturation timeout never acquired a slot, so inflight_used must not
+    drift — the holder still owns its slot count, and the timed-out caller
+    contributes nothing."""
+    disc = DiscoveryManager()
+    disc.clients["k"] = _make_client(max_concurrent=1)
+    client = disc.clients["k"]
+
+    release = asyncio.Event()
+
+    async def holder():
+        async with disc.acquire_slot("k", wait_timeout=2.0):
+            await release.wait()
+
+    t = asyncio.create_task(holder())
+    await asyncio.sleep(0.05)
+    assert client.inflight_used == 1
+
+    with pytest.raises(SaturationError):
+        async with disc.acquire_slot("k", wait_timeout=0.05):
+            pytest.fail("should not have acquired")
+
+    # The failed acquire must NOT have nudged the counter — still exactly 1.
+    assert client.inflight_used == 1
+
+    release.set()
+    await t
+    assert client.inflight_used == 0
+
+
+async def test_inflight_used_stays_zero_when_max_concurrent_is_none():
+    """Unbounded backends don't track inflight — counter stays at 0."""
+    disc = DiscoveryManager()
+    disc.clients["k"] = _make_client(max_concurrent=None)
+    client = disc.clients["k"]
+
+    assert client.inflight_used == 0
+    async with disc.acquire_slot("k", wait_timeout=0.1):
+        # No semaphore means no tracking. Capacity is None, so consumers
+        # interpret "no saturation data" rather than "0/None saturated".
+        assert client.inflight_used == 0
+    assert client.inflight_used == 0
+
+
+async def test_status_endpoint_emits_inflight_fields(tmp_path):
+    """/status backend payload must include inflight_used and inflight_capacity
+    so the describe_alias MCP tool can surface saturation to consumers.
+
+    Bypasses lifespan — registers one backend manually on app.state.discovery,
+    then asserts the GET /status response shape.
+    """
+    import httpx
+    from httpx import ASGITransport
+
+    from llm_relay.api.app import create_app
+
+    cfg_dir = _make_minimal_config(tmp_path)
+    app = create_app(config_dir=cfg_dir)
+
+    # Manually register a backend (no real polling — large interval keeps it idle).
+    await app.state.discovery.register_backend(
+        key="test-backend",
+        provider_name="local-llm",
+        base_url="http://nope",
+        models_hint=["test-model"],
+        poll_interval=999999,
+        max_concurrent=3,
+    )
+    try:
+        async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.get("/status")
+    finally:
+        await app.state.discovery.shutdown()
+
+    assert resp.status_code == 200
+    backends = resp.json()["backends"]
+    assert "test-backend" in backends, backends
+    payload = backends["test-backend"]
+    assert payload["inflight_used"] == 0
+    assert payload["inflight_capacity"] == 3
+
+
 async def test_register_backend_without_max_concurrent_yields_no_semaphore():
     """When max_concurrent is omitted, inflight_sem stays None (unbounded)."""
     disc = DiscoveryManager()

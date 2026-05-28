@@ -281,6 +281,8 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 "status": c.state.status.value,
                 "models": c.state.models,
                 "last_poll": c.state.last_poll,
+                "inflight_used": c.inflight_used,
+                "inflight_capacity": c.max_concurrent,
             }
             for key, c in disc.clients.items()
         }
