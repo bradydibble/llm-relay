@@ -35,6 +35,9 @@ class EndpointClient:
     circuit_breaker: CircuitBreaker = field(default_factory=CircuitBreaker)
     max_concurrent: int | None = None
     inflight_sem: asyncio.Semaphore | None = field(default=None, init=False)
+    # Slots currently held — updated by DiscoveryManager.acquire_slot under the
+    # semaphore. Stays at 0 for unbounded backends (no inflight_sem).
+    inflight_used: int = field(default=0, init=False)
 
     def __post_init__(self):
         if self.state is None:

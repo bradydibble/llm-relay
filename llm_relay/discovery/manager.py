@@ -64,11 +64,13 @@ class DiscoveryManager:
             try:
                 await asyncio.wait_for(client.inflight_sem.acquire(), timeout=wait_timeout)
                 acquired = True
+                client.inflight_used += 1
             except asyncio.TimeoutError as e:
                 raise SaturationError(backend_key=key, retry_after_seconds=wait_timeout) from e
             yield
         finally:
             if acquired:
+                client.inflight_used -= 1
                 client.inflight_sem.release()
 
     async def _poll_loop(self, client: EndpointClient, interval: int) -> None:
