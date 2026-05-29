@@ -5,12 +5,13 @@ from pathlib import Path
 import httpx
 import pytest
 import yaml
+from fastapi import HTTPException
 
 from llm_relay.api.app import create_app
 from llm_relay.config.types import CircuitBreaker, EndpointState, EndpointStatus, SaturationError
 from llm_relay.discovery.endpoint import EndpointClient
 from llm_relay.discovery.manager import DiscoveryManager
-from llm_relay.routing.router import RequestRouter
+from llm_relay.routing.router import RequestRouter, _estimate_request_min_context
 
 
 # ---------------------------------------------------------------------------
@@ -330,3 +331,131 @@ async def test_route_and_forward_exhausted_chain_reports_correct_candidate(tmp_p
     assert result.selected_model == "model-a", (
         f"expected model-a (which served the 502 response), got {result.selected_model}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Context-aware routing: don't spill a request onto a backend too small to hold
+# it (makes an alias's advertised context window honorable under load).
+# ---------------------------------------------------------------------------
+
+def test_estimate_request_min_context_scales_with_message_size():
+    # ~3 chars/token (conservative over-count); no max_tokens => input only.
+    assert _estimate_request_min_context(
+        {"messages": [{"role": "user", "content": "x" * 30000}]}
+    ) == 10000
+    # A trivially small request rounds to nothing -> no implicit floor.
+    assert _estimate_request_min_context(
+        {"messages": [{"role": "user", "content": "hi"}]}
+    ) is None
+
+
+def test_estimate_request_min_context_reserves_max_tokens():
+    est = _estimate_request_min_context(
+        {"messages": [{"role": "user", "content": "x" * 3000}], "max_tokens": 5000}
+    )
+    assert est == 1000 + 5000  # 3000//3 input tokens + reserved output
+
+
+def test_estimate_request_min_context_handles_malformed_body():
+    assert _estimate_request_min_context({}) is None
+    assert _estimate_request_min_context({"messages": "not-a-list"}) is None
+    assert _estimate_request_min_context({"messages": [{"role": "user"}]}) is None
+
+
+def _make_ctx_app(tmp_path: Path):
+    """App where alias 'main' = [model-small (8192 ctx), model-big (200000 ctx)],
+    both healthy. model-small is FIRST so a large request must override priority
+    to land on model-big."""
+    cfg_dir = tmp_path / "ctxcfg"
+    cfg_dir.mkdir()
+    (cfg_dir / "providers.yaml").write_text(yaml.safe_dump({
+        "providers": {"local-llm": {"type": "openai", "base_url": "http://127.0.0.1", "enabled": True}}
+    }))
+    (cfg_dir / "models.yaml").write_text(yaml.safe_dump({
+        "models": {
+            "model-small": {"provider": "local-llm", "port": 8080, "context_window": 8192, "privacy": "local_only"},
+            "model-big": {"provider": "local-llm", "port": 8081, "context_window": 200000, "privacy": "local_only"},
+        },
+        "aliases": {"main": ["model-small", "model-big"]},
+    }))
+    (cfg_dir / "policy.yaml").write_text(yaml.safe_dump({
+        "policy": {"fallback": {"retry_on": ["502", "503", "504", "connection_error"]}}
+    }))
+    app = create_app(config_dir=cfg_dir)
+    disc = app.state.discovery
+    ss = EndpointState(provider="local-llm", status=EndpointStatus.healthy, models=["model-small"])
+    sb = EndpointState(provider="local-llm", status=EndpointStatus.healthy, models=["model-big"])
+    disc.clients["local-llm:8080"] = EndpointClient(
+        provider_name="local-llm", base_url="http://127.0.0.1:8080", state=ss, circuit_breaker=CircuitBreaker())
+    disc.clients["local-llm:8081"] = EndpointClient(
+        provider_name="local-llm", base_url="http://127.0.0.1:8081", state=sb, circuit_breaker=CircuitBreaker())
+    disc.model_to_client["model-small"] = "local-llm:8080"
+    disc.model_to_client["model-big"] = "local-llm:8081"
+    return app
+
+
+async def test_route_and_forward_pins_large_request_to_big_context_backend(tmp_path, monkeypatch):
+    """A request whose estimated context need exceeds the small backend must
+    route to the big-context backend, overriding the small one's alias priority."""
+    app = _make_ctx_app(tmp_path)
+    router = app.state.router
+
+    called: list[str] = []
+
+    async def _fake_forward(backend_url, model_name, *args, **kwargs):
+        called.append(model_name)
+        return httpx.Response(200, json={"choices": []})
+
+    monkeypatch.setattr(router, "forward_request", _fake_forward)
+
+    big_content = "x" * 150000  # ~50000 tokens: > model-small (8192), < model-big (200000)
+    resp, result = await router.route_and_forward(
+        request_data={"model": "main", "messages": [{"role": "user", "content": big_content}]},
+        stream=False,
+    )
+
+    assert resp.status_code == 200
+    assert result.selected_model == "model-big"
+    assert "model-small" not in called, "large request must not be routed to the 8192-ctx backend"
+
+
+async def test_route_and_forward_503_when_request_exceeds_all_backend_contexts(tmp_path, monkeypatch):
+    """A request larger than every available backend's context honestly 503s
+    (no candidate) rather than being routed somewhere it can't fit."""
+    app = _make_ctx_app(tmp_path)
+    router = app.state.router
+
+    async def _fake_forward(*args, **kwargs):  # pragma: no cover - must not be called
+        raise AssertionError("forward_request must not be called when nothing fits")
+
+    monkeypatch.setattr(router, "forward_request", _fake_forward)
+
+    huge = "x" * 900000  # ~300000 tokens > 200000
+    with pytest.raises(HTTPException) as ei:
+        await router.route_and_forward(
+            request_data={"model": "main", "messages": [{"role": "user", "content": huge}]},
+            stream=False,
+        )
+    assert ei.value.status_code == 503
+
+
+async def test_route_and_forward_small_request_still_uses_priority_backend(tmp_path, monkeypatch):
+    """A small request imposes no implicit floor, so normal alias priority /
+    spillover is unchanged (model-small, first in the alias, still serves)."""
+    app = _make_ctx_app(tmp_path)
+    router = app.state.router
+
+    called: list[str] = []
+
+    async def _fake_forward(backend_url, model_name, *args, **kwargs):
+        called.append(model_name)
+        return httpx.Response(200, json={"choices": []})
+
+    monkeypatch.setattr(router, "forward_request", _fake_forward)
+
+    resp, result = await router.route_and_forward(
+        request_data={"model": "main", "messages": [{"role": "user", "content": "hello"}]},
+        stream=False,
+    )
+    assert resp.status_code == 200
+    assert result.selected_model == "model-small"

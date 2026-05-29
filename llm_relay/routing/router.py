@@ -211,12 +211,19 @@ class RequestRouter:
                     except ValueError:
                         pass
 
+        # Context-aware routing: an explicit X-Llm-Relay-Min-Context header is a
+        # floor the caller asserts; we also estimate the request's own context
+        # need from its body and take the larger. The selector drops candidates
+        # whose context_window is below min_context, so a large request is never
+        # routed to a backend too small to hold it (which would fail mid-stream).
+        explicit_min = int(headers.get("X-Llm-Relay-Min-Context", "0") or 0)
+        estimated_min = _estimate_request_min_context(request_data) or 0
         ctx = RoutingContext(
             requested_model=request_data.get("model", "") or "",
             privacy=privacy,
             weights=weights,
             require_tools=headers.get("X-Llm-Relay-Require-Tools", "false").lower() == "true",
-            min_context=int(headers.get("X-Llm-Relay-Min-Context", "0") or 0) or None,
+            min_context=max(explicit_min, estimated_min) or None,
         )
 
         candidates = self.selector.select_chain(ctx)
@@ -322,3 +329,37 @@ def _candidate_to_route_result(candidate: ChainCandidate, ctx: RoutingContext) -
             "privacy": ctx.privacy.value,
         },
     )
+
+
+def _estimate_request_min_context(request_data: dict) -> int | None:
+    """Conservatively estimate the context window a chat request needs.
+
+    The relay is provider-agnostic and has no tokenizer, so this approximates
+    from character counts and deliberately OVER-estimates: under-estimating
+    would route a request to a backend too small to hold it (a mid-stream
+    failure), whereas over-estimating only forgoes spilling to a smaller, faster
+    backend. ~3 chars/token over-counts vs. the typical ~3.5-4 for English text.
+
+    Returns the estimated token budget (prompt chars / 3, plus any requested
+    ``max_tokens``), or None when the request is trivially small or unparseable —
+    in which case no implicit floor is imposed and normal routing applies.
+    """
+    try:
+        messages = request_data.get("messages") or []
+        chars = 0
+        for m in messages:
+            content = m.get("content") if isinstance(m, dict) else None
+            if isinstance(content, str):
+                chars += len(content)
+            elif isinstance(content, list):
+                # Multimodal content parts: count the text parts' lengths.
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        chars += len(part["text"])
+        est = chars // 3
+        max_tokens = request_data.get("max_tokens")
+        if isinstance(max_tokens, int) and max_tokens > 0:
+            est += max_tokens
+        return est or None
+    except Exception:
+        return None
