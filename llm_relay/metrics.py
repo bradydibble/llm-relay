@@ -21,9 +21,20 @@ from typing import Any, Iterable
 from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, CollectorRegistry, Counter, Histogram, disable_created_metrics, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
-# Calling agents we attribute traffic to. Anything else buckets to "other" so a
-# malformed or novel header value can't explode label cardinality.
-_KNOWN_CLIENTS = {"claude-code", "agent-a", "agent-b", "agent-c"}
+# Calling agents we attribute traffic to: bounds the `client` metric label so a
+# malformed or novel header value can't explode cardinality (anything else
+# buckets to "other"). The repo ships only the generic default below; real
+# deployments add their own labels via LLM_RELAY_KNOWN_CLIENTS (see
+# configure_clients_from_env), so no deployment's agent names live in version
+# control.
+_DEFAULT_KNOWN_CLIENTS = {"claude-code"}
+_KNOWN_CLIENTS = set(_DEFAULT_KNOWN_CLIENTS)
+
+
+def set_known_clients(names: set[str]) -> None:
+    """Replace the bounded set of known client labels (used by normalize_client)."""
+    _KNOWN_CLIENTS.clear()
+    _KNOWN_CLIENTS.update(names)
 
 # End-to-end latency buckets (seconds): sub-second routing overhead through
 # multi-minute large-model generations on the local fleet.
@@ -67,13 +78,21 @@ def normalize_client(raw: str | None) -> str:
 
 # User-Agent substrings that identify a calling agent when no explicit
 # X-Llm-Relay-Client header is present. Matched case-insensitively, in order.
-# Only agents with a *distinctive* UA belong here: agent-a hard-codes
-# "example-coding-agent", so it is attributable with zero client-side change. Agents
-# whose chat path sends a generic SDK User-Agent (e.g. agent-c via the OpenAI
-# SDK) are deliberately absent — they self-identify via the explicit header.
-_UA_CLIENT_PATTERNS: tuple[tuple[str, str], ...] = (
-    ("example-coding-agent", "agent-a"),
-)
+# Only agents with a *distinctive* UA belong here; agents whose chat path sends a
+# generic SDK User-Agent self-identify via the explicit header instead.
+#
+# Empty by default in the repo — real deployments add their own
+# substring->label patterns via LLM_RELAY_CLIENT_UA_PATTERNS (see
+# configure_clients_from_env), so no deployment's agent identifiers live in
+# version control.
+_UA_CLIENT_PATTERNS: tuple[tuple[str, str], ...] = ()
+
+
+def set_ua_client_patterns(patterns: tuple[tuple[str, str], ...]) -> None:
+    """Replace the User-Agent -> client-label patterns (used by
+    client_from_user_agent)."""
+    global _UA_CLIENT_PATTERNS
+    _UA_CLIENT_PATTERNS = tuple(patterns)
 
 
 def client_from_user_agent(user_agent: str | None) -> str | None:
@@ -97,6 +116,43 @@ def resolve_client(header_value: str | None, user_agent: str | None) -> str:
     if explicit != "unknown":
         return explicit
     return client_from_user_agent(user_agent) or "unknown"
+
+
+def configure_clients_from_env() -> None:
+    """Load deployment-specific client attribution from the environment.
+
+    The repo ships generic defaults (only ``claude-code`` is a known client and
+    no User-Agent patterns), so no deployment's agent names live in version
+    control. Operators add their own in the (off-repo) service environment:
+
+      ``LLM_RELAY_KNOWN_CLIENTS="claude-code,agent-a,agent-b"``
+          comma-separated labels that bound the ``client`` metric dimension;
+          merged with the built-in default so ``claude-code`` stays known.
+      ``LLM_RELAY_CLIENT_UA_PATTERNS="agent-a-cli=agent-a,agent-b=agent-b"``
+          comma-separated ``<ua-substring>=<label>`` pairs; a request with no
+          explicit ``X-Llm-Relay-Client`` header whose User-Agent contains the
+          substring is attributed to the label.
+
+    Called once at app startup. Idempotent; a missing/empty var leaves the
+    corresponding generic default in place.
+    """
+    known = os.environ.get("LLM_RELAY_KNOWN_CLIENTS", "")
+    labels = {c.strip().lower() for c in known.split(",") if c.strip()}
+    if labels:
+        set_known_clients(_DEFAULT_KNOWN_CLIENTS | labels)
+
+    raw = os.environ.get("LLM_RELAY_CLIENT_UA_PATTERNS", "")
+    pairs: list[tuple[str, str]] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        needle, _, label = item.partition("=")
+        needle, label = needle.strip().lower(), label.strip().lower()
+        if needle and label:
+            pairs.append((needle, label))
+    if pairs:
+        set_ua_client_patterns(tuple(pairs))
 
 
 def normalize_alias(raw: str | None) -> str:

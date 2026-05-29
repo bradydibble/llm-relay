@@ -19,7 +19,7 @@ from ..discovery.manager import DiscoveryManager
 from ..routing.keys import compose_backend_key
 from ..routing.router import RequestRouter
 from .instrumentation import emit_chat_completion, reassemble_sse
-from ..metrics import did_fall_back, metrics_enabled, register_discovery_collector, render_exposition, resolve_client, set_known_routable
+from ..metrics import configure_clients_from_env, did_fall_back, metrics_enabled, register_discovery_collector, render_exposition, resolve_client, set_known_routable
 
 
 def _resolve_base_url() -> str:
@@ -173,6 +173,10 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
     cfg_path = _resolve_config_dir(config_dir)
     config = ConfigLoader(config_dir=cfg_path)
     config.load()
+    # Load deployment-specific client attribution (known client labels + UA
+    # patterns) from the env; a no-op leaving generic defaults if unset. Done
+    # before routing so resolve_client is correct for telemetry and metrics.
+    configure_clients_from_env()
     discovery = DiscoveryManager()
     router = RequestRouter(config, discovery)
 
@@ -415,9 +419,12 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
             if v is not None:
                 hint_headers[key] = v
         user_agent = request.headers.get("user-agent", "")
-        # Explicit X-Llm-Relay-Client header wins; else fall back to a
-        # distinctive User-Agent (agent-a); else "unknown". Lets agent-a attribute with
-        # zero client-side change while agent-c/agent-b opt in via the header.
+        # Explicit X-Llm-Relay-Client header wins; else fall back to a configured
+        # distinctive User-Agent pattern; else "unknown". The known-client set and
+        # UA patterns are deployment-configured via the environment (see
+        # metrics.configure_clients_from_env), so a client with a distinctive UA
+        # can be attributed with zero client-side change while others opt in via
+        # the header.
         client = resolve_client(request.headers.get("X-Llm-Relay-Client"), user_agent)
         start_ns = time.time_ns()
         is_stream = body.get("stream") is True

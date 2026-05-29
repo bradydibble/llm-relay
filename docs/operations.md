@@ -56,9 +56,9 @@ listening on port 8084.
    curl -s http://127.0.0.1:8090/health | jq           # new (provider,port) polled
    ```
 
-You do **not** need to edit `llm-mode` itself, the systemd unit, or the pi
-extension. The relay polls the new port automatically; the pi extension
-re-fetches the model list on its next start.
+You do **not** need to edit `llm-mode` itself or the systemd unit. The relay
+polls the new port automatically; OpenAI-compatible clients pick up the new
+model on their next `/v1/models` refresh.
 
 ## Remove or rename a model
 

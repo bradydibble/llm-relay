@@ -14,6 +14,9 @@ from llm_relay.metrics import (
     normalize_client,
     normalize_alias,
     set_known_routable,
+    set_known_clients,
+    set_ua_client_patterns,
+    configure_clients_from_env,
     did_fall_back,
     resolve_client,
     client_from_user_agent,
@@ -26,28 +29,52 @@ def _rm() -> RelayMetrics:
     return RelayMetrics(registry=CollectorRegistry())
 
 
-def test_client_from_user_agent_matches_pi_hardcoded_ua():
-    # agent-a hard-codes "example-coding-agent" as its User-Agent, so it is attributable
-    # with zero client-side change.
-    assert client_from_user_agent("example-coding-agent") == "agent-a"
-    assert client_from_user_agent("Mozilla/5.0 example-coding-agent extra") == "agent-a"
+def test_client_from_user_agent_matches_configured_pattern():
+    # UA->label patterns are deployment-configured (no agent names ship in the
+    # repo). A configured distinctive substring maps to its label.
+    set_ua_client_patterns((("agent-x-cli", "agent-x"),))
+    try:
+        assert client_from_user_agent("agent-x-cli") == "agent-x"
+        assert client_from_user_agent("Mozilla/5.0 agent-x-cli extra") == "agent-x"
+    finally:
+        set_ua_client_patterns(())
 
 
-def test_client_from_user_agent_returns_none_for_generic_sdk_ua():
-    # agent-c' chat path and other OpenAI-SDK callers send a generic UA that must
-    # NOT be guessed at — they self-identify via the explicit header instead.
-    assert client_from_user_agent("OpenAI/Python 1.30.1") is None
-    assert client_from_user_agent("") is None
-    assert client_from_user_agent(None) is None
+def test_client_from_user_agent_returns_none_when_no_pattern_matches():
+    # A generic SDK UA matches no configured pattern -> not guessed at (such
+    # callers self-identify via the explicit header instead).
+    set_ua_client_patterns((("agent-x-cli", "agent-x"),))
+    try:
+        assert client_from_user_agent("OpenAI/Python 1.30.1") is None
+        assert client_from_user_agent("") is None
+        assert client_from_user_agent(None) is None
+    finally:
+        set_ua_client_patterns(())
+
+
+def test_client_from_user_agent_empty_patterns_is_repo_default():
+    # The committed default has no UA patterns: nothing is attributed by UA.
+    set_ua_client_patterns(())
+    assert client_from_user_agent("agent-x-cli") is None
 
 
 def test_resolve_client_prefers_explicit_header_over_user_agent():
-    assert resolve_client("agent-c", "example-coding-agent") == "agent-c"
+    set_known_clients({"claude-code", "agent-a"})
+    set_ua_client_patterns((("agent-b-cli", "agent-b"),))
+    try:
+        assert resolve_client("agent-a", "agent-b-cli") == "agent-a"
+    finally:
+        set_known_clients({"claude-code"})
+        set_ua_client_patterns(())
 
 
 def test_resolve_client_falls_back_to_user_agent_when_header_absent():
-    assert resolve_client(None, "example-coding-agent/0.1") == "agent-a"
-    assert resolve_client("", "example-coding-agent") == "agent-a"
+    set_ua_client_patterns((("agent-b-cli", "agent-b"),))
+    try:
+        assert resolve_client(None, "agent-b-cli/0.1") == "agent-b"
+        assert resolve_client("", "agent-b-cli") == "agent-b"
+    finally:
+        set_ua_client_patterns(())
 
 
 def test_resolve_client_unknown_when_neither_identifies():
@@ -58,7 +85,11 @@ def test_resolve_client_unknown_when_neither_identifies():
 def test_resolve_client_honors_explicit_other_value_over_ua_sniffing():
     # An intentional but unrecognized header value is honored as "other", not
     # silently overridden by User-Agent sniffing.
-    assert resolve_client("some-new-agent", "example-coding-agent") == "other"
+    set_ua_client_patterns((("agent-b-cli", "agent-b"),))
+    try:
+        assert resolve_client("some-new-agent", "agent-b-cli") == "other"
+    finally:
+        set_ua_client_patterns(())
 
 
 def test_normalize_alias_passes_through_when_no_known_set_registered():
@@ -155,19 +186,19 @@ def test_fallback_increments_fallbacks_total_only_when_fell_back():
     rm = _rm()
     rm.record_request(
         alias="balanced", model="qwen3.5-9b", provider="prov-a", outcome="success",
-        client="agent-b", usage=None, response_body=None, duration_s=1.0, fell_back=True,
+        client="claude-code", usage=None, response_body=None, duration_s=1.0, fell_back=True,
     )
     rm.record_request(
         alias="balanced", model="qwen3.5-35b", provider="prov-a", outcome="success",
-        client="agent-b", usage=None, response_body=None, duration_s=1.0, fell_back=False,
+        client="claude-code", usage=None, response_body=None, duration_s=1.0, fell_back=False,
     )
     fb = rm.registry.get_sample_value(
         "llm_relay_fallbacks_total",
-        {"alias": "balanced", "model": "qwen3.5-9b", "client": "agent-b"},
+        {"alias": "balanced", "model": "qwen3.5-9b", "client": "claude-code"},
     )
     none_fb = rm.registry.get_sample_value(
         "llm_relay_fallbacks_total",
-        {"alias": "balanced", "model": "qwen3.5-35b", "client": "agent-b"},
+        {"alias": "balanced", "model": "qwen3.5-35b", "client": "claude-code"},
     )
     assert fb == 1.0
     assert none_fb is None  # the non-fallback request created no fallback series
@@ -263,3 +294,35 @@ def test_discovery_collector_exposes_reconcile_and_reset_counters():
 
     assert get("llm_relay_slot_reconciliations_total", backend="prov-a:8080", provider="prov-a") == 2.0
     assert get("llm_relay_backend_resets_total", backend="prov-a:8080", provider="prov-a") == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Deployment-specific client attribution loaded from the environment
+# (keeps real agent names out of the repo; see configure_clients_from_env)
+# ---------------------------------------------------------------------------
+
+def test_configure_clients_from_env_loads_known_clients_and_ua_patterns(monkeypatch):
+    monkeypatch.setenv("LLM_RELAY_KNOWN_CLIENTS", "agent-a,agent-b")
+    monkeypatch.setenv("LLM_RELAY_CLIENT_UA_PATTERNS", "agent-a-cli=agent-a")
+    try:
+        configure_clients_from_env()
+        # claude-code remains a known default; env adds agent-a / agent-b.
+        assert normalize_client("agent-a") == "agent-a"
+        assert normalize_client("agent-b") == "agent-b"
+        assert normalize_client("claude-code") == "claude-code"
+        assert client_from_user_agent("agent-a-cli/1.0") == "agent-a"
+    finally:
+        set_known_clients({"claude-code"})
+        set_ua_client_patterns(())
+
+
+def test_configure_clients_from_env_no_env_keeps_generic_defaults(monkeypatch):
+    monkeypatch.delenv("LLM_RELAY_KNOWN_CLIENTS", raising=False)
+    monkeypatch.delenv("LLM_RELAY_CLIENT_UA_PATTERNS", raising=False)
+    set_known_clients({"claude-code"})
+    set_ua_client_patterns(())
+    configure_clients_from_env()
+    # The committed default: only claude-code is known, no UA attribution.
+    assert normalize_client("claude-code") == "claude-code"
+    assert normalize_client("agent-a") == "other"
+    assert client_from_user_agent("agent-a-cli") is None
