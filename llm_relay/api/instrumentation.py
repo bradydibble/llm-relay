@@ -12,6 +12,8 @@ import re
 import sys
 from typing import Any
 
+from .. import metrics
+
 _TRACER: Any = None
 _INITIALIZED = False
 
@@ -133,8 +135,30 @@ def emit_chat_completion(
     status_code: int,
     streamed: bool,
     error: str | None = None,
+    outcome: str = "success",
+    client: str | None = None,
+    fell_back: bool = False,
 ) -> None:
-    """Emit one OpenInference-style LLM span. Best-effort; never raises."""
+    """Emit telemetry for one chat completion: Prometheus metrics (always) and,
+    when LLM_RELAY_TELEMETRY is enabled, an OpenInference span. Best-effort;
+    never raises into the request path."""
+    # Metrics first, independent of the OTLP tracer (Phoenix may be down).
+    try:
+        duration_s = max(0.0, (end_ns - start_ns) / 1e9)
+        metrics.get_metrics().record_request(
+            alias=request_body.get("model") if isinstance(request_body, dict) else None,
+            model=model_resolved,
+            provider=provider_name,
+            outcome=outcome,
+            client=client,
+            usage=usage,
+            response_body=response_body,
+            duration_s=duration_s,
+            fell_back=fell_back,
+        )
+    except Exception as e:
+        print(f"[llm-relay] metrics record failed (ignored): {e}", file=sys.stderr)
+
     tracer = _init_tracer()
     if tracer is None:
         return

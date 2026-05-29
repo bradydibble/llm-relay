@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from ..config.loader import ConfigLoader
 from ..config.types import SaturationError
@@ -18,6 +18,7 @@ from ..discovery.manager import DiscoveryManager
 from ..routing.keys import compose_backend_key
 from ..routing.router import RequestRouter
 from .instrumentation import emit_chat_completion, reassemble_sse
+from ..metrics import did_fall_back, metrics_enabled, register_discovery_collector, render_exposition, set_known_routable
 
 
 def _resolve_base_url() -> str:
@@ -335,6 +336,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
             if v is not None:
                 hint_headers[key] = v
         user_agent = request.headers.get("user-agent", "")
+        client = request.headers.get("X-Llm-Relay-Client")
         start_ns = time.time_ns()
         is_stream = body.get("stream") is True
 
@@ -353,6 +355,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 model_resolved=None, provider_name=None,
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=503, streamed=is_stream, error=str(e),
+                outcome="saturated", client=client,
             )
             raise HTTPException(
                 status_code=503,
@@ -366,6 +369,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 model_resolved=None, provider_name=None,
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=502, streamed=is_stream, error=f"Backend network error: {e}",
+                outcome="network_error", client=client,
             )
             raise HTTPException(502, detail=f"Backend network error: {e}")
         except HTTPException:
@@ -376,6 +380,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 model_resolved=None, provider_name=None,
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=503, streamed=is_stream, error="No model matches constraints",
+                outcome="no_candidate", client=client,
             )
             raise
         except Exception as e:
@@ -384,6 +389,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 model_resolved=None, provider_name=None,
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=502, streamed=is_stream, error=f"Backend error: {e}",
+                outcome="backend_error", client=client,
             )
             raise HTTPException(502, detail=f"Backend error: {e}")
 
@@ -409,6 +415,9 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                         model_resolved=result.selected_model, provider_name=result.provider_name,
                         user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                         status_code=upstream_status, streamed=True,
+                        outcome="success" if upstream_status < 400 else "upstream_error",
+                        client=client,
+                        fell_back=did_fall_back(result.selected_model, (result.decision or {}).get("ranked") or []),
                     )
 
             return StreamingResponse(
@@ -436,6 +445,9 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
             model_resolved=result.selected_model, provider_name=result.provider_name,
             user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
             status_code=upstream.status_code, streamed=False,
+            outcome="success" if upstream.status_code < 400 else "upstream_error",
+            client=client,
+            fell_back=did_fall_back(result.selected_model, (result.decision or {}).get("ranked") or []),
         )
         return JSONResponse(status_code=upstream.status_code, content=content, headers=relay_headers)
 
@@ -449,6 +461,18 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
         app.routes.extend(_a2a_card_routes)
         app.routes.extend(_a2a_jsonrpc_routes)
         app.routes.extend(_a2a_rest_routes)
+
+    # Prometheus metrics: request/token/fallback counters + pull-based backend
+    # gauges, served directly at /metrics (a route, not a mounted sub-app, to
+    # avoid the trailing-slash redirect in front of the scrape endpoint).
+    if metrics_enabled():
+        set_known_routable(set(config.models.models) | set(config.models.aliases))
+        register_discovery_collector(discovery)
+
+        @app.get("/metrics")
+        def metrics_endpoint() -> Response:
+            body, content_type = render_exposition()
+            return Response(content=body, media_type=content_type)
 
     return app
 
