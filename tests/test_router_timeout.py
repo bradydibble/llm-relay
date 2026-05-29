@@ -12,7 +12,7 @@ def test_stream_request_read_timeout_is_bounded():
     # Look for httpx.Timeout(... read=...). The value must not be None.
     assert "read=None" not in src, (
         "stream_request must not use read=None — that lets the relay hang on a stalled upstream "
-        "indefinitely, which is the cascade trigger documented in docs/plans/2026-05-27-saturation-fixes.md"
+        "indefinitely, which is the cascade trigger this bounded read timeout guards against"
     )
     # Sanity: still references httpx.Timeout in the stream path.
     assert "httpx.Timeout" in src

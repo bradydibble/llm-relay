@@ -139,3 +139,38 @@ endpoints that make integration easy:
 Aliases are the recommended way to address the relay: a client that asks
 for `subagent` keeps working when you reshuffle which concrete model serves
 that role.
+
+## Observability (Prometheus metrics)
+
+The relay exposes Prometheus metrics at `GET /metrics` (a direct route with no
+trailing slash, so there's no 307 in front of the scrape endpoint). Disable
+with `LLM_RELAY_METRICS=0`.
+
+### Request metrics (recorded per chat-completion)
+
+| Series | Type | Labels | Meaning |
+|---|---|---|---|
+| `llm_relay_requests_total` | counter | provider, model, alias, outcome, client | Routed requests. `outcome` ∈ success / upstream_error / saturated / network_error / no_candidate / backend_error. |
+| `llm_relay_tokens_total` | counter | provider, model, direction, client | Tokens, `direction` ∈ prompt / completion. |
+| `llm_relay_fallbacks_total` | counter | alias, model, client | Requests served by a non-preferred candidate (router fell back). |
+| `llm_relay_request_duration_seconds` | histogram | provider, model | End-to-end relay request duration. |
+
+The `client` label is the calling agent, resolved from the `X-Llm-Relay-Client`
+header (falling back to a distinctive `User-Agent`); unknown values bucket to
+`other` so the label can't explode cardinality.
+
+### Backend metrics (pull-based, read off discovery at scrape time)
+
+| Series | Type | Labels | Meaning |
+|---|---|---|---|
+| `llm_relay_backend_up` | gauge | backend, provider | 1 if the backend is healthy/degraded, else 0. |
+| `llm_relay_inflight_requests` | gauge | backend, provider | In-flight slots currently held on a bounded backend. |
+| `llm_relay_backend_max_concurrent` | gauge | backend, provider | Configured `max_concurrent` (0 = unbounded). |
+| `llm_relay_circuit_breaker_state` | gauge | backend, provider | 1 if the circuit breaker is open, else 0. |
+| `llm_relay_slot_reconciliations_total` | counter | backend, provider | Times the poll loop force-reset a stranded in-flight counter (leaked-slot containment). |
+| `llm_relay_backend_resets_total` | counter | backend, provider | Times a backend recovery (circuit recovery or model reload) wiped stale in-flight state. |
+
+The last two are *containment* signals, not normal operation. A steadily-rising
+`slot_reconciliations_total` means in-flight slots are leaking faster than the
+synchronous release path should allow — worth investigating. `backend_resets_total`
+just tracks how often a backend restarted/reloaded out from under the relay.
