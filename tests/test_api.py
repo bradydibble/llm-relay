@@ -3,7 +3,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from llm_relay.api.app import _build_available_payload
+from llm_relay.api.app import (
+    _build_available_payload,
+    _build_model_card,
+    _build_models_list_payload,
+    _resolve_context_window,
+)
 from llm_relay.config.loader import ConfigLoader
 from llm_relay.config.types import EndpointState, EndpointStatus
 from llm_relay.discovery.endpoint import EndpointClient
@@ -19,10 +24,21 @@ def _load_cfg() -> ConfigLoader:
     return c
 
 
-def _seed(disc: DiscoveryManager, model: str, status: EndpointStatus) -> None:
-    """Wire `model` into discovery so get_model_state returns the given status."""
+def _seed(
+    disc: DiscoveryManager,
+    model: str,
+    status: EndpointStatus,
+    live_ctx: int | None = None,
+) -> None:
+    """Wire `model` into discovery so get_model_state returns the given status.
+
+    Pass live_ctx to simulate a backend reporting max_model_len for `model`
+    (mirrors a vLLM /v1/models response), so live-context resolution can be
+    exercised without a real probe."""
     key = f"k:{model}"
     state = EndpointState(provider="local-llm", status=status, models=[model])
+    if live_ctx is not None:
+        state.model_max_lens = {model: live_ctx}
     disc.clients[key] = EndpointClient(provider_name="local-llm", base_url="x", state=state)
     disc.model_to_client[model] = key
 
@@ -50,9 +66,9 @@ def test_alias_info_picks_first_available_member():
     assert info["context_window"] == cfg.models.models["qwen3.5-35b"].context_window
 
 
-def test_alias_info_skips_unavailable_first_member():
-    """If the first member is unavailable but a later one is healthy, current
-    should be that later one — matching the selector's behavior."""
+def test_alias_info_current_tracks_first_available_member():
+    """`current` still reflects the live-serving member: when the first member
+    is unavailable but a later one is healthy, current is that later one."""
     cfg = _load_cfg()
     disc = DiscoveryManager()
     _seed(disc, "qwen3.5-35b", EndpointStatus.unavailable)
@@ -60,7 +76,25 @@ def test_alias_info_skips_unavailable_first_member():
 
     info = _build_available_payload(cfg, disc)["alias_info"]["main"]
     assert info["current"] == "qwen3.5-9b"
-    assert info["context_window"] == cfg.models.models["qwen3.5-9b"].context_window
+
+
+def test_alias_info_context_window_is_primary_member_not_serving_fallback():
+    """context_window reports the alias's PRIMARY (first-declared) member's
+    context, stable even when the primary backend is down and a smaller fallback
+    is serving. `current` and `context_window` legitimately diverge here.
+
+    Regression: context_window used to follow `current`, so when main's 35b
+    primary went down it collapsed to the 9b's 32768 and broke context-gating
+    clients (e.g. an agent with a 64K floor)."""
+    cfg = _load_cfg()
+    disc = DiscoveryManager()
+    _seed(disc, "qwen3.5-35b", EndpointStatus.unavailable)
+    _seed(disc, "qwen3.5-9b", EndpointStatus.healthy)
+
+    info = _build_available_payload(cfg, disc)["alias_info"]["main"]
+    assert info["current"] == "qwen3.5-9b", "current reflects the live-serving fallback"
+    assert info["context_window"] == cfg.models.models["qwen3.5-35b"].context_window, \
+        "context_window reports the primary member (35b 262144), not the 9b fallback"
 
 
 def test_alias_info_falls_back_to_first_declared_when_none_available():
@@ -83,3 +117,72 @@ def test_aliases_block_remains_backward_compatible():
     for members in payload["aliases"].values():
         assert isinstance(members, list)
         assert all(isinstance(m, str) for m in members)
+
+
+# ---------------------------------------------------------------------------
+# Context-window resolution + OpenAI /v1/models context exposure
+# ---------------------------------------------------------------------------
+
+def test_resolve_context_window_concrete_model_prefers_live_over_config():
+    cfg = _load_cfg()
+    disc = DiscoveryManager()
+    # No backend reporting a live value → static config wins.
+    assert _resolve_context_window(cfg, disc, "qwen3.5-9b") == \
+        cfg.models.models["qwen3.5-9b"].context_window
+    # Backend reports a live max_model_len → authoritative, overrides config.
+    _seed(disc, "qwen3.5-9b", EndpointStatus.healthy, live_ctx=12345)
+    assert _resolve_context_window(cfg, disc, "qwen3.5-9b") == 12345
+
+
+def test_resolve_context_window_alias_reports_primary_member():
+    """An alias resolves to its first-declared member's context, regardless of
+    which member is currently available. main's primary is qwen3.5-35b."""
+    cfg = _load_cfg()
+    disc = DiscoveryManager()
+    expected = cfg.models.models["qwen3.5-35b"].context_window
+    assert _resolve_context_window(cfg, disc, "main") == expected
+    # Primary down, smaller fallback up → still reports the primary's context.
+    _seed(disc, "qwen3.5-35b", EndpointStatus.unavailable)
+    _seed(disc, "qwen3.5-9b", EndpointStatus.healthy)
+    assert _resolve_context_window(cfg, disc, "main") == expected
+
+
+def test_resolve_context_window_unknown_name_is_none():
+    cfg = _load_cfg()
+    assert _resolve_context_window(cfg, DiscoveryManager(), "no-such-model") is None
+
+
+def test_v1_models_list_entries_carry_context_length_and_max_model_len():
+    """Every /v1/models entry (concrete models and aliases) carries context so
+    an OpenAI-compatible client can discover it from the list. Both
+    `context_length` and `max_model_len` are present (clients read either)."""
+    cfg = _load_cfg()
+    payload = _build_models_list_payload(cfg, DiscoveryManager())
+    assert payload["object"] == "list"
+    by_id = {e["id"]: e for e in payload["data"]}
+
+    nine_b = by_id["qwen3.5-9b"]
+    assert nine_b["context_length"] == cfg.models.models["qwen3.5-9b"].context_window
+    assert nine_b["max_model_len"] == nine_b["context_length"]
+
+    main = by_id["main"]
+    assert main["owned_by"] == "llm-relay-alias"
+    assert main["context_length"] == cfg.models.models["qwen3.5-35b"].context_window
+    assert main["max_model_len"] == main["context_length"]
+
+
+def test_v1_model_card_for_model_alias_and_unknown():
+    cfg = _load_cfg()
+    disc = DiscoveryManager()
+
+    model_card = _build_model_card(cfg, disc, "qwen3.5-9b")
+    assert model_card["id"] == "qwen3.5-9b"
+    assert model_card["owned_by"] == "local-llm"
+    assert model_card["context_length"] == cfg.models.models["qwen3.5-9b"].context_window
+
+    alias_card = _build_model_card(cfg, disc, "main")
+    assert alias_card["id"] == "main"
+    assert alias_card["owned_by"] == "llm-relay-alias"
+    assert alias_card["context_length"] == cfg.models.models["qwen3.5-35b"].context_window
+
+    assert _build_model_card(cfg, disc, "definitely-not-a-model") is None

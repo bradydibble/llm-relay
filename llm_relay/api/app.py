@@ -36,6 +36,82 @@ def _resolve_config_dir(config_dir: str | Path | None) -> Path:
     return Path(__file__).resolve().parents[2] / "config"
 
 
+def _resolve_context_window(cfg: ConfigLoader, disc: DiscoveryManager, name: str) -> int | None:
+    """Context window for a model or alias `name`.
+
+    Concrete model: the backend's live ``max_model_len`` (authoritative) when it
+    reports one, else the static models.yaml value.
+
+    Alias: the context of its PRIMARY (first-declared, config-present) member —
+    stable regardless of which member is momentarily serving, so a
+    context-gating client sees the alias's intended capability rather than a
+    smaller fallback's when the primary backend is briefly down. (Under load the
+    selector may still route an individual request to a lower-context member;
+    that is a request-time concern, not this init-time capability gate. The
+    durable ceiling fix is curating sub-floor models out of high-context aliases
+    / context-aware routing.)
+
+    Returns None when `name` is neither a known model nor a resolvable alias.
+    """
+    models = cfg.models.models
+    if name in models:
+        live = disc.get_live_context_window(name)
+        return live if live is not None else models[name].context_window
+    members = cfg.models.aliases.get(name)
+    if members:
+        for member in members:
+            if member in models:
+                return _resolve_context_window(cfg, disc, member)
+    return None
+
+
+def _model_entry(cfg: ConfigLoader, disc: DiscoveryManager, model_id: str, owned_by: str) -> dict[str, Any]:
+    """One OpenAI ``/v1/models`` entry, enriched with context metadata.
+
+    The OpenAI schema omits context, but vLLM / llama.cpp-style clients discover
+    it from ``max_model_len`` / ``context_length`` on the entry. We publish both
+    (same value) so a client reading either field gets the right answer; clients
+    that don't care ignore the extra keys. Aliases report their primary member's
+    context (see :func:`_resolve_context_window`)."""
+    entry: dict[str, Any] = {"id": model_id, "object": "model", "owned_by": owned_by}
+    ctx = _resolve_context_window(cfg, disc, model_id)
+    if ctx is not None:
+        entry["context_length"] = ctx
+        entry["max_model_len"] = ctx
+    return entry
+
+
+def _build_models_list_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[str, Any]:
+    """OpenAI-compatible ``/v1/models`` list: every concrete model and alias,
+    each enriched with context metadata so discovery clients can read it from
+    the list response (the path most OpenAI-compat resolvers hit first)."""
+    data: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for name, m in cfg.models.models.items():
+        if name in seen:
+            continue
+        seen.add(name)
+        data.append(_model_entry(cfg, disc, name, m.provider))
+    for alias in cfg.models.aliases.keys():
+        if alias in seen:
+            continue
+        seen.add(alias)
+        data.append(_model_entry(cfg, disc, alias, "llm-relay-alias"))
+    return {"object": "list", "data": data}
+
+
+def _build_model_card(cfg: ConfigLoader, disc: DiscoveryManager, model: str) -> dict[str, Any] | None:
+    """Single OpenAI ``/v1/models/{model}`` card for a model or alias, with
+    context metadata. Returns None if `model` is neither a known model nor an
+    alias (the route turns that into a 404)."""
+    m = cfg.models.models.get(model)
+    if m is not None:
+        return _model_entry(cfg, disc, model, m.provider)
+    if model in cfg.models.aliases:
+        return _model_entry(cfg, disc, model, "llm-relay-alias")
+    return None
+
+
 def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for name, m in cfg.models.models.items():
@@ -78,15 +154,16 @@ def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[
                 if member in cfg.models.models:
                     current = member
                     break
-        if current is not None:
-            live_cw = disc.get_live_context_window(current)
-            cw = live_cw if live_cw is not None else cfg.models.models[current].context_window
-        else:
-            cw = None
+        # `context_window` reports the alias's PRIMARY (first-declared) member's
+        # context via _resolve_context_window — stable regardless of which member
+        # `current` resolves to. `current` (above) tracks the live-serving member
+        # for display, so the two intentionally diverge when the primary backend
+        # is down and a fallback is serving: this keeps a context-gating client
+        # from seeing a smaller fallback's window when the primary briefly blips.
         alias_info[alias] = {
             "members": members_list,
             "current": current,
-            "context_window": cw,
+            "context_window": _resolve_context_window(cfg, disc, alias),
         }
     out["alias_info"] = alias_info
     return out
@@ -207,20 +284,21 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
 
     @app.get("/v1/models")
     async def list_models_openai(request: Request) -> dict[str, Any]:
-        cfg = request.app.state.config
-        data: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for name, m in cfg.models.models.items():
-            if name in seen:
-                continue
-            seen.add(name)
-            data.append({"id": name, "object": "model", "owned_by": m.provider})
-        for alias in cfg.models.aliases.keys():
-            if alias in seen:
-                continue
-            seen.add(alias)
-            data.append({"id": alias, "object": "model", "owned_by": "llm-relay-alias"})
-        return {"object": "list", "data": data}
+        return _build_models_list_payload(
+            request.app.state.config, request.app.state.discovery
+        )
+
+    @app.get("/v1/models/{model}")
+    async def get_model_openai(model: str, request: Request) -> dict[str, Any]:
+        # OpenAI per-model card. Many OpenAI-compat discovery clients probe this
+        # before falling back to the list; today its absence (404) forced them
+        # onto stale/default context values. Serve a card with context metadata.
+        card = _build_model_card(
+            request.app.state.config, request.app.state.discovery, model
+        )
+        if card is None:
+            raise HTTPException(404, detail=f"Unknown model: {model}")
+        return card
 
     @app.get("/status")
     async def relay_status(request: Request) -> dict[str, Any]:
