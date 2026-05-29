@@ -220,6 +220,51 @@ def test_load_balance_select_chain_orders_by_load():
     assert [cand.model for cand in chain] == ["qwen3.5-35b", "qwen3.5-9b"]
 
 
+# ---------------------------------------------------------------------------
+# Context-window filter: must use LIVE max_model_len (matches advertisement),
+# falling back to static config only when no backend reports a live value.
+# ---------------------------------------------------------------------------
+
+def _disc_with_live_ctx(model: str, live_ctx: int | None):
+    """One healthy backend serving `model`; optionally seed its live
+    max_model_len so get_live_context_window(model) returns `live_ctx`."""
+    from llm_relay.routing.keys import compose_backend_key
+    disc = DiscoveryManager()
+    state = EndpointState(provider="local-llm", status=EndpointStatus.healthy, models=[model])
+    if live_ctx is not None:
+        state.model_max_lens = {model: live_ctx}
+    key = compose_backend_key("local-llm", 8081, "")
+    disc.clients[key] = EndpointClient(provider_name="local-llm", base_url="x", state=state)
+    disc.model_to_client[model] = key
+    return disc
+
+
+def test_min_context_filter_uses_live_context_over_config():
+    """When a backend's LIVE max_model_len is below the request floor, the
+    candidate must be filtered out even though its static config context_window
+    is large. Routing filters on live so it never admits a request the backend
+    advertised it cannot hold (the relay's /v1/models reports live)."""
+    c = _load()  # qwen3.5-35b static context_window is 262144
+    disc = _disc_with_live_ctx("qwen3.5-35b", live_ctx=8192)
+    sel = ModelSelector(c, disc)
+    ctx = RoutingContext(requested_model="qwen3.5-35b", min_context=50000)
+    assert sel._apply_constraints(ctx, ["qwen3.5-35b"]) == [], \
+        "live 8192 < min_context 50000 must filter it, despite static config 262144"
+
+
+def test_min_context_filter_falls_back_to_config_when_no_live():
+    """No backend reports a live max_model_len -> the filter must fall back to
+    the static config context_window (preserving the prior behavior)."""
+    c = _load()  # qwen3.5-35b static context_window is 262144
+    disc = _disc_with_live_ctx("qwen3.5-35b", live_ctx=None)
+    sel = ModelSelector(c, disc)
+    # min_context below config (262144) -> kept; above config -> filtered.
+    kept = sel._apply_constraints(RoutingContext(requested_model="qwen3.5-35b", min_context=50000), ["qwen3.5-35b"])
+    assert kept == ["qwen3.5-35b"], "no live value -> config 262144 >= 50000 keeps it"
+    filtered = sel._apply_constraints(RoutingContext(requested_model="qwen3.5-35b", min_context=300000), ["qwen3.5-35b"])
+    assert filtered == [], "no live value -> config 262144 < 300000 filters it"
+
+
 def test_strict_single_candidate_skips_load_sort(monkeypatch):
     """In strict mode with the requested model present there is exactly one
     candidate — there is no load decision to make, so _sort_by_load must be

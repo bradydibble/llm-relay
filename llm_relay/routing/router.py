@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -356,6 +357,19 @@ def _estimate_request_min_context(request_data: dict) -> int | None:
                 for part in content:
                     if isinstance(part, dict) and isinstance(part.get("text"), str):
                         chars += len(part["text"])
+        # Tool/function schemas are top-level and frequently large (full JSON
+        # parameter schemas); tool-using agents are a primary workload, so the
+        # definitions must count toward the floor. Omitting them under-counts —
+        # the unsafe direction. Serialize per-spec so a single unserializable
+        # entry can't void the message-based estimate.
+        for key in ("tools", "functions"):
+            spec = request_data.get(key)
+            if not spec:
+                continue
+            try:
+                chars += len(json.dumps(spec))
+            except (TypeError, ValueError):
+                pass
         est = chars // 3
         max_tokens = request_data.get("max_tokens")
         if isinstance(max_tokens, int) and max_tokens > 0:

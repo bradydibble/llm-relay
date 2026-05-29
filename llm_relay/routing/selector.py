@@ -190,7 +190,12 @@ class ModelSelector:
                 continue
             if ctx.require_tools and "tool_use" not in cfg.capabilities:
                 continue
-            if ctx.min_context and cfg.context_window and cfg.context_window < ctx.min_context:
+            # Filter on the LIVE context window when a backend reports one, so
+            # routing never admits a request larger than what /v1/models
+            # advertised (which is also live-preferred). Fall back to the static
+            # config value only when no backend currently reports max_model_len.
+            ctx_window = self.discovery.get_live_context_window(name) or cfg.context_window
+            if ctx.min_context and ctx_window and ctx_window < ctx.min_context:
                 continue
             out.append(name)
         return out

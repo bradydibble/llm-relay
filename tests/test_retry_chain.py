@@ -362,6 +362,18 @@ def test_estimate_request_min_context_handles_malformed_body():
     assert _estimate_request_min_context({"messages": [{"role": "user"}]}) is None
 
 
+def test_estimate_request_min_context_counts_tool_definitions():
+    """Tool schemas are top-level and often large; tool-using agents are the
+    target workload, so they must count toward the estimate. Omitting them
+    under-counts -- the unsafe direction."""
+    assert _estimate_request_min_context({"messages": [{"role": "user", "content": "hi"}]}) is None
+    est = _estimate_request_min_context({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": {"blob": "y" * 30000}}}],
+    })
+    assert est is not None and est > 8000, "large tool definitions must lift the estimate"
+
+
 def _make_ctx_app(tmp_path: Path):
     """App where alias 'main' = [model-small (8192 ctx), model-big (200000 ctx)],
     both healthy. model-small is FIRST so a large request must override priority
