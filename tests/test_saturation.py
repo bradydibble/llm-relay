@@ -463,6 +463,27 @@ async def test_reconcile_noop_when_counter_is_zero():
     assert client.slot_reconciliations == 0
 
 
+def test_slot_reconcile_idle_seconds_defaults_to_one_hour(monkeypatch):
+    """Default idle window is generous (1h) so a long-running job (e.g. a big
+    batched generation on a slow box) is never mistaken for a leaked slot."""
+    monkeypatch.delenv("LLM_RELAY_SLOT_RECONCILE_IDLE_SECONDS", raising=False)
+    assert DiscoveryManager().slot_reconcile_idle_seconds == 3600.0
+
+
+def test_slot_reconcile_idle_seconds_overridable_via_env(monkeypatch):
+    """Operators size the window to their longest job without a code edit."""
+    monkeypatch.setenv("LLM_RELAY_SLOT_RECONCILE_IDLE_SECONDS", "7200")
+    assert DiscoveryManager().slot_reconcile_idle_seconds == 7200.0
+
+
+def test_slot_reconcile_idle_seconds_bad_env_falls_back_to_default(monkeypatch):
+    """A malformed or non-positive env value must not break startup."""
+    monkeypatch.setenv("LLM_RELAY_SLOT_RECONCILE_IDLE_SECONDS", "not-a-number")
+    assert DiscoveryManager().slot_reconcile_idle_seconds == 3600.0
+    monkeypatch.setenv("LLM_RELAY_SLOT_RECONCILE_IDLE_SECONDS", "-5")
+    assert DiscoveryManager().slot_reconcile_idle_seconds == 3600.0
+
+
 # ---------------------------------------------------------------------------
 # Fix #3: backend-wipe lifecycle hook. A backend that was down (circuit tripped)
 # or reloaded (model set changed) has effectively restarted — its pre-outage

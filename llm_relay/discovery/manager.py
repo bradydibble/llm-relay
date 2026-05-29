@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -13,6 +14,22 @@ from ..config.types import CircuitBreaker, EndpointState, EndpointStatus, ModelS
 from .endpoint import EndpointClient
 
 logger = logging.getLogger(__name__)
+
+
+def _default_reconcile_idle() -> float:
+    """Default idle-reconcile window (seconds), env-overridable.
+
+    Reads ``LLM_RELAY_SLOT_RECONCILE_IDLE_SECONDS`` so operators can size the
+    window to their longest legitimate job without a code change; a missing,
+    malformed, or non-positive value falls back to 1 hour."""
+    raw = os.environ.get("LLM_RELAY_SLOT_RECONCILE_IDLE_SECONDS", "")
+    try:
+        v = float(raw)
+        if v > 0:
+            return v
+    except ValueError:
+        pass
+    return 3600.0
 
 
 class SlotHandle:
@@ -62,18 +79,21 @@ class DiscoveryManager:
     model_to_client: dict[str, str] = field(default_factory=dict)
     # Idle window (seconds) after which a bounded backend showing inflight_used
     # > 0 with no recent dispatch is treated as having leaked slots and is
-    # force-reconciled. Default 15 min.
+    # force-reconciled. Defaults to 1 hour; override with the
+    # LLM_RELAY_SLOT_RECONCILE_IDLE_SECONDS env var (read at construction, so the
+    # daemon and CLI both honor it — size the window to your longest job with no
+    # code edit).
     #
     # ASSUMPTION: this is a single manager-wide window (not per-client), and it
     # must exceed the longest a *legitimate* single request holds one slot on
-    # ANY backend. If a backend legitimately holds a slot longer (e.g. a batched
-    # 200K-context generation on a slow box > 15 min), that live slot gets
-    # false-reconciled mid-stream. Thanks to SlotHandle's swap-safe release this
-    # is harmless — at worst a transient over-admission by one until the stream
-    # ends — but it is a spurious reconcile (counter increment + WARNING log).
-    # Mitigation: raise this default. Per-client windows are the escalation if
-    # backends' max hold times ever diverge widely; not worth it today.
-    slot_reconcile_idle_seconds: float = 900.0
+    # ANY backend. A job that runs longer (e.g. a batched 200K-context generation
+    # on a slow box) would be false-reconciled mid-stream. Thanks to SlotHandle's
+    # swap-safe release that is harmless — at worst a transient over-admission by
+    # one until the request ends — but it is a spurious reconcile (counter
+    # increment + WARNING). Raise the env var for fleets with longer jobs;
+    # per-client windows are the escalation if backends' max hold times ever
+    # diverge widely.
+    slot_reconcile_idle_seconds: float = field(default_factory=_default_reconcile_idle)
     _tasks: list[asyncio.Task] = field(default_factory=list)
 
     async def register_backend(
