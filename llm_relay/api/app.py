@@ -326,7 +326,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
             if model_name in client.state.models:
                 return True
             # Fuzzy path: model name appears as prefix in a reported id
-            # (e.g. config "qwen3.6-35b-a3b" vs reported "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf")
+            # (e.g. config "model-x" vs reported "Model-X-Instruct-UD-Q4_K_XL.gguf")
             mn = model_name.lower()
             return any(mn in r.lower() for r in client.state.models)
 
