@@ -15,6 +15,8 @@ from llm_relay.metrics import (
     normalize_alias,
     set_known_routable,
     did_fall_back,
+    resolve_client,
+    client_from_user_agent,
 )
 
 
@@ -22,6 +24,41 @@ def _rm() -> RelayMetrics:
     # Isolated registry per test; reset alias bounding so unit tests pass through.
     set_known_routable(set())
     return RelayMetrics(registry=CollectorRegistry())
+
+
+def test_client_from_user_agent_matches_pi_hardcoded_ua():
+    # agent-a hard-codes "example-coding-agent" as its User-Agent, so it is attributable
+    # with zero client-side change.
+    assert client_from_user_agent("example-coding-agent") == "agent-a"
+    assert client_from_user_agent("Mozilla/5.0 example-coding-agent extra") == "agent-a"
+
+
+def test_client_from_user_agent_returns_none_for_generic_sdk_ua():
+    # agent-c' chat path and other OpenAI-SDK callers send a generic UA that must
+    # NOT be guessed at — they self-identify via the explicit header instead.
+    assert client_from_user_agent("OpenAI/Python 1.30.1") is None
+    assert client_from_user_agent("") is None
+    assert client_from_user_agent(None) is None
+
+
+def test_resolve_client_prefers_explicit_header_over_user_agent():
+    assert resolve_client("agent-c", "example-coding-agent") == "agent-c"
+
+
+def test_resolve_client_falls_back_to_user_agent_when_header_absent():
+    assert resolve_client(None, "example-coding-agent/0.1") == "agent-a"
+    assert resolve_client("", "example-coding-agent") == "agent-a"
+
+
+def test_resolve_client_unknown_when_neither_identifies():
+    assert resolve_client(None, "OpenAI/Python 1.30.1") == "unknown"
+    assert resolve_client(None, None) == "unknown"
+
+
+def test_resolve_client_honors_explicit_other_value_over_ua_sniffing():
+    # An intentional but unrecognized header value is honored as "other", not
+    # silently overridden by User-Agent sniffing.
+    assert resolve_client("some-new-agent", "example-coding-agent") == "other"
 
 
 def test_normalize_alias_passes_through_when_no_known_set_registered():

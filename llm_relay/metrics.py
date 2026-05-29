@@ -65,6 +65,40 @@ def normalize_client(raw: str | None) -> str:
     return "other"
 
 
+# User-Agent substrings that identify a calling agent when no explicit
+# X-Llm-Relay-Client header is present. Matched case-insensitively, in order.
+# Only agents with a *distinctive* UA belong here: agent-a hard-codes
+# "example-coding-agent", so it is attributable with zero client-side change. Agents
+# whose chat path sends a generic SDK User-Agent (e.g. agent-c via the OpenAI
+# SDK) are deliberately absent — they self-identify via the explicit header.
+_UA_CLIENT_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("example-coding-agent", "agent-a"),
+)
+
+
+def client_from_user_agent(user_agent: str | None) -> str | None:
+    """Map a distinctive User-Agent to a known client label, or None."""
+    if not user_agent:
+        return None
+    ua = user_agent.lower()
+    for needle, label in _UA_CLIENT_PATTERNS:
+        if needle in ua:
+            return label
+    return None
+
+
+def resolve_client(header_value: str | None, user_agent: str | None) -> str:
+    """Resolve the calling-agent label for the ``client`` metric dimension.
+
+    An explicit ``X-Llm-Relay-Client`` header wins (intentional
+    self-identification, honored even when unrecognized -> "other"); otherwise
+    fall back to a distinctive ``User-Agent``; otherwise "unknown"."""
+    explicit = normalize_client(header_value)
+    if explicit != "unknown":
+        return explicit
+    return client_from_user_agent(user_agent) or "unknown"
+
+
 def normalize_alias(raw: str | None) -> str:
     """Bound the (client-controlled) requested model/alias label. Pass through
     known routes; bucket unknown values to "other" once a known set is

@@ -19,7 +19,7 @@ from ..discovery.manager import DiscoveryManager
 from ..routing.keys import compose_backend_key
 from ..routing.router import RequestRouter
 from .instrumentation import emit_chat_completion, reassemble_sse
-from ..metrics import did_fall_back, metrics_enabled, register_discovery_collector, render_exposition, set_known_routable
+from ..metrics import did_fall_back, metrics_enabled, register_discovery_collector, render_exposition, resolve_client, set_known_routable
 
 
 def _resolve_base_url() -> str:
@@ -337,7 +337,10 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
             if v is not None:
                 hint_headers[key] = v
         user_agent = request.headers.get("user-agent", "")
-        client = request.headers.get("X-Llm-Relay-Client")
+        # Explicit X-Llm-Relay-Client header wins; else fall back to a
+        # distinctive User-Agent (agent-a); else "unknown". Lets agent-a attribute with
+        # zero client-side change while agent-c/agent-b opt in via the header.
+        client = resolve_client(request.headers.get("X-Llm-Relay-Client"), user_agent)
         start_ns = time.time_ns()
         is_stream = body.get("stream") is True
 
