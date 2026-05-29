@@ -1,8 +1,9 @@
 """Request routing and upstream forwarding."""
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 import httpx
 from fastapi import HTTPException
@@ -77,19 +78,23 @@ class RequestRouter:
         headers: dict[str, str] | None = None,
         backend_key: str | None = None,
         slot_wait_timeout: float = 30.0,
-    ) -> tuple[httpx.Response, AsyncIterator[bytes]]:
+    ) -> tuple[httpx.Response, AsyncIterator[bytes], Callable[[], Awaitable[None]]]:
         """Open a streaming upstream connection.
 
-        Returns the response (so the caller can read status/headers) and an
-        async iterator over raw bytes. The iterator owns the client lifecycle;
-        consume it to completion (or call .aclose() on it) to release the
-        connection.
+        Returns ``(response, body_iterator, cleanup)``. The caller reads
+        status/headers off ``response``, streams ``body_iterator``, and MUST
+        ensure ``cleanup`` runs once the response is finished — wire it as the
+        ``StreamingResponse`` background task. ``cleanup`` is idempotent: the
+        iterator's ``finally`` also invokes it, so whichever fires first wins
+        and the slot is freed promptly without waiting on generator GC.
 
         The in-flight slot is held from acquire (here) until the iterator is
-        exhausted or aborted.  We manually enter/exit the context manager
-        rather than using ``async with`` because the slot lifetime must span
-        the returned generator — a plain ``async with`` block would release
-        the slot as soon as this coroutine returns.
+        exhausted or aborted. We acquire a :class:`SlotHandle` rather than an
+        ``async with`` block because the slot lifetime must span the returned
+        generator, and the release must be a *synchronous* call: a client
+        disconnect cancels the generator, and a release sitting behind an
+        ``await`` can be preempted by that cancellation — which is exactly how
+        the slot used to leak.
         """
         body = dict(request_data)
         body["model"] = model_name
@@ -108,16 +113,11 @@ class RequestRouter:
         timeout = httpx.Timeout(connect=10.0, read=600.0, write=10.0, pool=10.0)
 
         # Acquire the slot BEFORE building the client so a SaturationError never
-        # leaks an open connection.  The slot is released in the iterator's finally.
-        slot_cm = self.discovery.acquire_slot(backend_key or "", wait_timeout=slot_wait_timeout)
-        await slot_cm.__aenter__()  # may raise SaturationError; propagates to caller
-        slot_released = False
-
-        async def _release_slot() -> None:
-            nonlocal slot_released
-            if not slot_released:
-                slot_released = True
-                await slot_cm.__aexit__(None, None, None)
+        # leaks an open connection. The handle's release is synchronous and runs
+        # FIRST in the iterator's finally — see the SlotHandle docstring.
+        handle = await self.discovery.acquire_slot_handle(
+            backend_key or "", wait_timeout=slot_wait_timeout,
+        )  # may raise SaturationError; propagates to caller
 
         client = httpx.AsyncClient(timeout=timeout)
         try:
@@ -129,20 +129,41 @@ class RequestRouter:
             )
             resp = await client.send(req, stream=True)
         except BaseException:
+            handle.release()
             await client.aclose()
-            await _release_slot()
             raise
+
+        cleaned = False
+
+        async def _cleanup() -> None:
+            """Idempotent per-request teardown: free the slot, then close the
+            response and client.
+
+            Wired in two places — the iterator's ``finally`` and the
+            StreamingResponse background task — so cleanup survives whichever
+            path FastAPI takes (normal drain, upstream error, or client
+            disconnect). Slot release runs first and synchronously on every
+            call, so a CancelledError on the later ``await``s can never strand
+            the slot; connection teardown runs once.
+            """
+            nonlocal cleaned
+            handle.release()
+            if cleaned:
+                return
+            cleaned = True
+            with contextlib.suppress(Exception):
+                await resp.aclose()
+            with contextlib.suppress(Exception):
+                await client.aclose()
 
         async def _iter() -> AsyncIterator[bytes]:
             try:
                 async for chunk in resp.aiter_raw():
                     yield chunk
             finally:
-                await resp.aclose()
-                await client.aclose()
-                await _release_slot()
+                await _cleanup()
 
-        return resp, _iter()
+        return resp, _iter(), _cleanup
 
     async def route_and_forward(
         self,
@@ -153,8 +174,9 @@ class RequestRouter:
         """Resolve the fallback chain and forward, retrying on retry_on errors.
 
         Non-streaming returns ``(httpx.Response, RouteResult)``.
-        Streaming returns ``(httpx.Response, AsyncIterator[bytes], RouteResult)``
-        — but streaming does NOT retry across candidates (see note below).
+        Streaming returns ``(httpx.Response, AsyncIterator[bytes], RouteResult,
+        cleanup)`` — the API layer wires ``cleanup`` as the response background
+        task. Streaming does NOT retry across candidates (see note below).
 
         Behavior
         --------
@@ -163,11 +185,10 @@ class RequestRouter:
           retry_on network exception (ConnectError, ReadTimeout,
           RemoteProtocolError), tries the next candidate.
         - Streaming: routes once with the existing ``stream_request`` path —
-          no cross-backend retry.  Streaming retry is deferred: the slot
-          lifecycle in ``stream_request`` ties the semaphore release to the
-          iterator's ``finally`` block; aborting a streamed response without
-          draining the iterator would leak the slot.  The 5/27 production 502
-          was non-streaming, so this gap is acceptable for now.
+          no cross-backend retry. Retry is deferred because a streamed response
+          can't be replayed across backends once bytes have flowed. (The slot
+          is no longer at risk on abort: ``stream_request`` releases it
+          synchronously and the API wires ``cleanup`` as a background task.)
         - ``SaturationError`` propagates IMMEDIATELY — slot saturation is
           backpressure, not a broken backend.  The caller should back off via
           ``Retry-After``, not amplify load by trying other backends.
@@ -228,13 +249,13 @@ class RequestRouter:
         if stream:
             candidate = candidates[0]
             route_result = _candidate_to_route_result(candidate, ctx)
-            upstream, body_iter = await self.stream_request(
+            upstream, body_iter, cleanup = await self.stream_request(
                 candidate.backend_url, candidate.model, request_data,
                 headers=headers,
                 backend_key=candidate.backend_key,
                 slot_wait_timeout=candidate.slot_wait_timeout,
             )
-            return upstream, body_iter, route_result
+            return upstream, body_iter, route_result, cleanup
 
         # Non-streaming: walk the chain, retry on retry_on errors.
         last_response: httpx.Response | None = None

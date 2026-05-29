@@ -218,3 +218,25 @@ def test_load_balance_select_chain_orders_by_load():
     sel = ModelSelector(c, disc)
     chain = sel.select_chain(RoutingContext(requested_model="subagent"))
     assert [cand.model for cand in chain] == ["qwen3.5-35b", "qwen3.5-9b"]
+
+
+def test_strict_single_candidate_skips_load_sort(monkeypatch):
+    """In strict mode with the requested model present there is exactly one
+    candidate — there is no load decision to make, so _sort_by_load must be
+    skipped entirely. Defensive: it keeps a corrupt inflight counter on the one
+    backend from ever touching the routing decision."""
+    c = _load()
+    c.policy.explicit.strict = True
+    # 9b carries (possibly corrupt) load; in strict mode it must not matter.
+    disc = _two_backend_disc(load_9b=2, load_35b=0)
+    sel = ModelSelector(c, disc)
+
+    calls: list[list[str]] = []
+    orig = sel._sort_by_load
+    monkeypatch.setattr(sel, "_sort_by_load", lambda ranked: calls.append(list(ranked)) or orig(ranked))
+
+    ctx = RoutingContext(requested_model="qwen3.5-9b")
+    ranked = sel._prepare_ranked(ctx)
+
+    assert ranked == ["qwen3.5-9b"]
+    assert calls == [], "single ordered candidate (strict mode) must not invoke _sort_by_load"

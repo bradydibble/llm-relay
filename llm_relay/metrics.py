@@ -19,7 +19,7 @@ import os
 from typing import Any, Iterable
 
 from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, CollectorRegistry, Counter, Histogram, disable_created_metrics, generate_latest
-from prometheus_client.core import GaugeMetricFamily
+from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
 # Calling agents we attribute traffic to. Anything else buckets to "other" so a
 # malformed or novel header value can't explode label cardinality.
@@ -174,7 +174,7 @@ class DiscoveryCollector:
     def __init__(self, discovery: Any):
         self.discovery = discovery
 
-    def collect(self) -> Iterable[GaugeMetricFamily]:
+    def collect(self) -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
         up = GaugeMetricFamily(
             "llm_relay_backend_up", "1 if backend is healthy/degraded else 0.",
             labels=["backend", "provider"],
@@ -191,6 +191,16 @@ class DiscoveryCollector:
             "llm_relay_circuit_breaker_state", "1 if the backend circuit breaker is open else 0.",
             labels=["backend", "provider"],
         )
+        reconciles = CounterMetricFamily(
+            "llm_relay_slot_reconciliations",
+            "Forced in-flight slot reconciles (leaked-slot containment by the poll loop).",
+            labels=["backend", "provider"],
+        )
+        resets = CounterMetricFamily(
+            "llm_relay_backend_resets",
+            "Backend resets detected on recovery (circuit recovery or model reload) that wiped in-flight state.",
+            labels=["backend", "provider"],
+        )
         clients = getattr(self.discovery, "clients", {}) or {}
         for key, client in clients.items():
             state = getattr(client, "state", None)
@@ -201,10 +211,14 @@ class DiscoveryCollector:
             mc = getattr(client, "max_concurrent", None)
             cap.add_metric([key, provider], float(mc) if mc else 0.0)
             circuit.add_metric([key, provider], 1.0 if getattr(state, "circuit_open", False) else 0.0)
+            reconciles.add_metric([key, provider], float(getattr(client, "slot_reconciliations", 0) or 0))
+            resets.add_metric([key, provider], float(getattr(client, "backend_resets", 0) or 0))
         yield up
         yield inflight
         yield cap
         yield circuit
+        yield reconciles
+        yield resets
 
 
 _METRICS: RelayMetrics | None = None

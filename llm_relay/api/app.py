@@ -11,6 +11,7 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 
 from ..config.loader import ConfigLoader
 from ..config.types import SaturationError
@@ -342,7 +343,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
 
         try:
             if is_stream:
-                upstream, body_iter, result = await request.app.state.router.route_and_forward(
+                upstream, body_iter, result, cleanup = await request.app.state.router.route_and_forward(
                     request_data=body, headers=hint_headers, stream=True,
                 )
             else:
@@ -420,11 +421,17 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                         fell_back=did_fall_back(result.selected_model, (result.decision or {}).get("ranked") or []),
                     )
 
+            # cleanup frees the in-flight slot and closes the upstream
+            # connection. Wiring it as the background task guarantees it runs
+            # when FastAPI closes the response — including the client-disconnect
+            # path, where the response generator might otherwise only be
+            # finalized by GC. It's idempotent with the iterator's own finally.
             return StreamingResponse(
                 _tee_and_emit(),
                 status_code=upstream_status,
                 media_type=media_type,
                 headers=relay_headers,
+                background=BackgroundTask(cleanup),
             )
 
         try:

@@ -255,10 +255,10 @@ async def test_route_and_forward_503_via_api_on_saturation(tmp_path, monkeypatch
 
 
 async def test_route_and_forward_streaming_passes_through_response(tmp_path, monkeypatch):
-    """Streaming path returns a 3-tuple (resp, iterator, route_result) from the first
-    available candidate without retrying across backends.
+    """Streaming path returns a 4-tuple (resp, iterator, route_result, cleanup)
+    from the first available candidate without retrying across backends.
 
-    Verifies the app.py 3-tuple unpack and that result.selected_model reflects
+    Verifies the app.py 4-tuple unpack and that result.selected_model reflects
     the actual candidate that was used.
     """
     app = _make_app_with_both_healthy(tmp_path)
@@ -269,17 +269,21 @@ async def test_route_and_forward_streaming_passes_through_response(tmp_path, mon
     async def _fake_body_iter():
         yield sse_bytes
 
+    async def _fake_cleanup():
+        return None
+
     async def _fake_stream(backend_url, model_name, *args, **kwargs):
-        return httpx.Response(200, content=b""), _fake_body_iter()
+        return httpx.Response(200, content=b""), _fake_body_iter(), _fake_cleanup
 
     monkeypatch.setattr(router, "stream_request", _fake_stream)
 
-    upstream, body_iter, result = await router.route_and_forward(
+    upstream, body_iter, result, cleanup = await router.route_and_forward(
         request_data={"model": "main", "messages": [], "stream": True},
         stream=True,
     )
 
     assert upstream.status_code == 200
+    assert cleanup is _fake_cleanup, "route_and_forward must surface stream_request's cleanup"
     # Collect all bytes from the iterator
     chunks = []
     async for chunk in body_iter:

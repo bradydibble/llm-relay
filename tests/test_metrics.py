@@ -206,3 +206,23 @@ def test_discovery_collector_exposes_backend_gauges_at_scrape():
     # prov-b unavailable + circuit open
     assert get("llm_relay_backend_up", backend="prov-b:8000", provider="prov-b") == 0.0
     assert get("llm_relay_circuit_breaker_state", backend="prov-b:8000", provider="prov-b") == 1.0
+
+
+def test_discovery_collector_exposes_reconcile_and_reset_counters():
+    """The leaked-slot containment paths (reconcile, backend-wipe) must surface
+    as counters so an operator can see whether they ever fire in production."""
+    c = _FakeClient("prov-a", "healthy", ["m"], False, 0, 3)
+    c.slot_reconciliations = 2
+    c.backend_resets = 1
+    collector = DiscoveryCollector(_FakeDiscovery({"prov-a:8080": c}))
+
+    samples = {}
+    for metric in collector.collect():
+        for s in metric.samples:
+            samples[(s.name, tuple(sorted(s.labels.items())))] = s.value
+
+    def get(name, **labels):
+        return samples.get((name, tuple(sorted(labels.items()))))
+
+    assert get("llm_relay_slot_reconciliations_total", backend="prov-a:8080", provider="prov-a") == 2.0
+    assert get("llm_relay_backend_resets_total", backend="prov-a:8080", provider="prov-a") == 1.0

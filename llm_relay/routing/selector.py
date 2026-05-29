@@ -77,7 +77,13 @@ class ModelSelector:
         # original priority order. Targets TTFT/TPS — even one in-flight slot
         # on the priority backend can add multi-second slot-wait latency, so
         # we aggressively spill to an idle alternate when one exists.
-        ranked = self._sort_by_load(ranked)
+        #
+        # Skip entirely when there's only one candidate (e.g. strict mode with
+        # the requested model present): there's no load decision to make, and
+        # this keeps a corrupt inflight counter on the lone backend from ever
+        # perturbing the routing decision.
+        if len(ranked) > 1:
+            ranked = self._sort_by_load(ranked)
         ctx.ranked = ranked
         return ranked
 
