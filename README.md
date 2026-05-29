@@ -207,7 +207,7 @@ vars:
 export LLM_RELAY_CONFIG_DIR=~/homelab/configs/llm-relay
 export LLM_MODE_CONFIG_DIR=~/homelab/configs/llm-relay
 export LLM_MODE_HOST=your-llm-host          # default: localhost
-export LLM_MODE_UPSTREAM_IP=10.0.0.5        # default: 127.0.0.1
+export LLM_MODE_UPSTREAM_IP=192.0.2.10      # default: 127.0.0.1
 export CADDY_CONFIG=/etc/caddy/your.conf    # default: /etc/caddy/llm-relay.conf
 ```
 
