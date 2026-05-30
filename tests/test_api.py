@@ -3,11 +3,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import httpx
+
 from llm_relay.api.app import (
     _build_available_payload,
     _build_model_card,
     _build_models_list_payload,
     _resolve_context_window,
+    create_app,
 )
 from llm_relay.config.loader import ConfigLoader
 from llm_relay.config.types import EndpointState, EndpointStatus
@@ -222,3 +225,18 @@ def test_v1_model_card_accepts_qualified_and_bare():
 
     assert _build_model_card(cfg, disc, "anthropic:qwen3.5-9b") is None, \
         "mismatched provider:model is not a valid pairing"
+
+
+async def test_v1_models_card_route_handles_colon_in_path():
+    """Over real HTTP: GET /v1/models/{qualified} captures the colon-bearing id
+    (Starlette path param) and serves the card; a mismatched pair 404s. Settles
+    that the qualified id survives the routing layer, not just the builder."""
+    app = create_app(config_dir=CONFIG_DIR)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        ok = await client.get("/v1/models/local-llm:qwen3.5-9b")
+        bad = await client.get("/v1/models/anthropic:qwen3.5-9b")
+    assert ok.status_code == 200
+    assert ok.json()["id"] == "local-llm:qwen3.5-9b"
+    assert bad.status_code == 404
