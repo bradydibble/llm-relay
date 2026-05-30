@@ -471,3 +471,28 @@ async def test_route_and_forward_small_request_still_uses_priority_backend(tmp_p
     )
     assert resp.status_code == 200
     assert result.selected_model == "model-small"
+
+
+async def test_route_and_forward_routes_host_qualified_id_to_that_backend(tmp_path, monkeypatch):
+    """End-to-end: a host-qualified 'provider:model' request is forwarded to
+    exactly that model's backend (the path a client uses to target one
+    deployment). Guards against a future model-name gate in the chat handler."""
+    app = _make_ctx_app(tmp_path)
+    router = app.state.router
+
+    called: list[str] = []
+
+    async def _fake_forward(backend_url, model_name, *args, **kwargs):
+        called.append(model_name)
+        return httpx.Response(200, json={"choices": []})
+
+    monkeypatch.setattr(router, "forward_request", _fake_forward)
+
+    # model-big is served by provider 'local-llm' -> 'local-llm:model-big'.
+    resp, result = await router.route_and_forward(
+        request_data={"model": "local-llm:model-big", "messages": [{"role": "user", "content": "hi"}]},
+        stream=False,
+    )
+    assert resp.status_code == 200
+    assert result.selected_model == "model-big"
+    assert called == ["model-big"], "qualified id must forward to exactly that backend"

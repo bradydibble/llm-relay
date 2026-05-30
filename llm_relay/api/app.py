@@ -16,7 +16,7 @@ from starlette.background import BackgroundTask
 from ..config.loader import ConfigLoader
 from ..config.types import SaturationError
 from ..discovery.manager import DiscoveryManager
-from ..routing.keys import compose_backend_key
+from ..routing.keys import compose_backend_key, compose_model_id, resolve_model_id
 from ..routing.router import RequestRouter
 from .instrumentation import emit_chat_completion, reassemble_sse
 from ..metrics import configure_clients_from_env, did_fall_back, metrics_enabled, register_discovery_collector, render_exposition, resolve_client, set_known_routable
@@ -65,8 +65,20 @@ def _resolve_context_window(cfg: ConfigLoader, disc: DiscoveryManager, name: str
     return None
 
 
-def _model_entry(cfg: ConfigLoader, disc: DiscoveryManager, model_id: str, owned_by: str) -> dict[str, Any]:
+def _model_entry(
+    cfg: ConfigLoader,
+    disc: DiscoveryManager,
+    model_id: str,
+    owned_by: str,
+    lookup_name: str | None = None,
+) -> dict[str, Any]:
     """One OpenAI ``/v1/models`` entry, enriched with context metadata.
+
+    ``model_id`` is the advertised id (a host-qualified ``provider:model`` for a
+    concrete model, or the alias name). ``lookup_name`` is the bare model/alias
+    name used to resolve context (defaults to ``model_id``); they differ because
+    a concrete model is advertised qualified but its context lives under the
+    bare name.
 
     The OpenAI schema omits context, but vLLM / llama.cpp-style clients discover
     it from ``max_model_len`` / ``context_length`` on the entry. We publish both
@@ -74,7 +86,7 @@ def _model_entry(cfg: ConfigLoader, disc: DiscoveryManager, model_id: str, owned
     that don't care ignore the extra keys. Aliases report their primary member's
     context (see :func:`_resolve_context_window`)."""
     entry: dict[str, Any] = {"id": model_id, "object": "model", "owned_by": owned_by}
-    ctx = _resolve_context_window(cfg, disc, model_id)
+    ctx = _resolve_context_window(cfg, disc, lookup_name if lookup_name is not None else model_id)
     if ctx is not None:
         entry["context_length"] = ctx
         entry["max_model_len"] = ctx
@@ -91,7 +103,9 @@ def _build_models_list_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dic
         if name in seen:
             continue
         seen.add(name)
-        data.append(_model_entry(cfg, disc, name, m.provider))
+        # Advertise the host-qualified id so the same model on different hosts is
+        # distinguishable; context is still resolved by the bare name.
+        data.append(_model_entry(cfg, disc, compose_model_id(m.provider, name), m.provider, lookup_name=name))
     for alias in cfg.models.aliases.keys():
         if alias in seen:
             continue
@@ -104,9 +118,11 @@ def _build_model_card(cfg: ConfigLoader, disc: DiscoveryManager, model: str) -> 
     """Single OpenAI ``/v1/models/{model}`` card for a model or alias, with
     context metadata. Returns None if `model` is neither a known model nor an
     alias (the route turns that into a 404)."""
-    m = cfg.models.models.get(model)
-    if m is not None:
-        return _model_entry(cfg, disc, model, m.provider)
+    # Accept a bare name or a host-qualified 'provider:model' id (provider
+    # validated). Echo the id the caller asked for; resolve context by bare name.
+    bare = resolve_model_id(cfg.models.models, model)
+    if bare is not None:
+        return _model_entry(cfg, disc, model, cfg.models.models[bare].provider, lookup_name=bare)
     if model in cfg.models.aliases:
         return _model_entry(cfg, disc, model, "llm-relay-alias")
     return None

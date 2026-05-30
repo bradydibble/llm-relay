@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from ..config.loader import ConfigLoader
 from ..config.types import ModelStatus, Privacy
 from ..discovery.manager import DiscoveryManager
-from .keys import compose_backend_key, compose_backend_url
+from .keys import compose_backend_key, compose_backend_url, resolve_model_id
 
 
 def _is_available(status: ModelStatus) -> bool:
@@ -165,6 +165,12 @@ class ModelSelector:
         req = ctx.requested_model
         if self.is_alias(req):
             return self.resolve_alias(req), True
+        # Normalize a host-qualified 'provider:model' id to its bare config name
+        # (the provider is validated against the model's configured provider).
+        # A bare name or unknown id passes through unchanged.
+        resolved = resolve_model_id(self.config.models.models, req)
+        if resolved is not None:
+            req = resolved
         if req in self.config.models.models:
             if self.config.policy.explicit.strict:
                 return [req], True

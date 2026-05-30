@@ -285,3 +285,32 @@ def test_strict_single_candidate_skips_load_sort(monkeypatch):
 
     assert ranked == ["qwen3.5-9b"]
     assert calls == [], "single ordered candidate (strict mode) must not invoke _sort_by_load"
+
+
+# ---------------------------------------------------------------------------
+# Host-qualified model identity: a 'provider:model' request resolves to the
+# bare concrete model (and validates the provider), so the same model on
+# different hosts is individually addressable.
+# ---------------------------------------------------------------------------
+
+def test_qualified_id_hits_concrete_branch():
+    """`provider:model` resolves to the bare concrete model (ordered branch),
+    not the unordered discovery-availability fallback."""
+    c = _load()  # qwen3.5-9b is served by provider 'local-llm' in the test config
+    sel = ModelSelector(c, DiscoveryManager())
+    candidates, ordered = sel._build_candidates(
+        RoutingContext(requested_model="local-llm:qwen3.5-9b")
+    )
+    assert ordered is True, "qualified id must hit the concrete-model branch, not discovery fallback"
+    assert candidates[0] == "qwen3.5-9b"
+
+
+def test_qualified_id_mismatched_provider_does_not_resolve():
+    """A provider that doesn't serve the model is not a valid pairing -> it must
+    NOT resolve to the concrete model."""
+    c = _load()
+    sel = ModelSelector(c, DiscoveryManager())
+    candidates, ordered = sel._build_candidates(
+        RoutingContext(requested_model="wrong-prov:qwen3.5-9b")
+    )
+    assert ordered is False and candidates == [], "mismatched provider must not resolve to a concrete model"

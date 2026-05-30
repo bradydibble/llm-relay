@@ -161,7 +161,7 @@ def test_v1_models_list_entries_carry_context_length_and_max_model_len():
     assert payload["object"] == "list"
     by_id = {e["id"]: e for e in payload["data"]}
 
-    nine_b = by_id["qwen3.5-9b"]
+    nine_b = by_id["local-llm:qwen3.5-9b"]
     assert nine_b["context_length"] == cfg.models.models["qwen3.5-9b"].context_window
     assert nine_b["max_model_len"] == nine_b["context_length"]
 
@@ -186,3 +186,39 @@ def test_v1_model_card_for_model_alias_and_unknown():
     assert alias_card["context_length"] == cfg.models.models["qwen3.5-35b"].context_window
 
     assert _build_model_card(cfg, disc, "definitely-not-a-model") is None
+
+
+def test_v1_models_list_advertises_qualified_ids():
+    """Concrete models are advertised as host-qualified 'provider:model' ids so
+    clients can differentiate the same model on different hosts. Bare names are
+    not advertised (they still resolve for back-compat); aliases are unchanged."""
+    cfg = _load_cfg()
+    payload = _build_models_list_payload(cfg, DiscoveryManager())
+    by_id = {e["id"]: e for e in payload["data"]}
+    ids = set(by_id)
+    assert "local-llm:qwen3.5-9b" in ids
+    assert "anthropic:claude-3-5-sonnet" in ids
+    assert "qwen3.5-9b" not in ids, "bare concrete names must not be advertised"
+    assert "main" in ids and "subagent" in ids, "aliases (categories) stay advertised"
+    assert by_id["local-llm:qwen3.5-9b"]["owned_by"] == "local-llm"
+    # context metadata still resolved (by bare name) and attached to the qualified entry
+    assert by_id["local-llm:qwen3.5-9b"]["context_length"] == \
+        cfg.models.models["qwen3.5-9b"].context_window
+
+
+def test_v1_model_card_accepts_qualified_and_bare():
+    """The card resolves a qualified id (echoing it) and a bare id (back-compat);
+    a mismatched provider:model pair is a 404 (None)."""
+    cfg = _load_cfg()
+    disc = DiscoveryManager()
+
+    q = _build_model_card(cfg, disc, "local-llm:qwen3.5-9b")
+    assert q["id"] == "local-llm:qwen3.5-9b", "card echoes the requested qualified id"
+    assert q["owned_by"] == "local-llm"
+    assert q["context_length"] == cfg.models.models["qwen3.5-9b"].context_window
+
+    b = _build_model_card(cfg, disc, "qwen3.5-9b")
+    assert b["id"] == "qwen3.5-9b", "bare id still resolves and echoes (back-compat)"
+
+    assert _build_model_card(cfg, disc, "anthropic:qwen3.5-9b") is None, \
+        "mismatched provider:model is not a valid pairing"
