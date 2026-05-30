@@ -44,3 +44,6 @@ GOOSE.md
 
 # OS
 .DS_Store
+
+# Local working drafts — not for publication
+docs/design/2026-05-30-architecture-simplification.md
