@@ -354,6 +354,276 @@ async def test_route_and_forward_streaming_passes_through_response(tmp_path, mon
     assert result.success is True
 
 
+# ---------------------------------------------------------------------------
+# Streaming saturation spill + pre-first-byte failover (Gap 1, Level 1 + 2).
+# Saturation/connect/5xx are all decided BEFORE the first SSE byte reaches the
+# client, so spilling to another backend is safe here (unlike mid-stream, which
+# is unreplayable). These mirror the non-streaming F2a/retry contracts.
+# ---------------------------------------------------------------------------
+
+def _fake_stream_factory(sse_bytes=b"data: {}\n\ndata: [DONE]\n\n"):
+    """Build a (cleanup_calls, make_return) pair for stubbing stream_request.
+
+    ``make_return(status)`` returns a fresh ``(httpx.Response(status), iterator,
+    cleanup)`` tuple whose cleanup appends its backend_url to ``cleanup_calls``
+    when awaited — so a test can assert a rejected candidate's slot was freed.
+    """
+    cleanup_calls: list[str] = []
+
+    def make_return(backend_url: str, status: int = 200):
+        async def _iter():
+            yield sse_bytes
+
+        async def _cleanup():
+            cleanup_calls.append(backend_url)
+
+        return httpx.Response(status, content=b""), _iter(), _cleanup
+
+    return cleanup_calls, make_return
+
+
+async def test_route_and_forward_streaming_spills_to_next_candidate_on_saturation(tmp_path, monkeypatch):
+    """Streaming: SaturationError from candidate A must SPILL to candidate B.
+
+    The streaming entry point previously picked candidates[0] blindly and let
+    SaturationError propagate — a 503 to the client even when a sibling had a
+    free slot. Saturation is decided at slot-acquire, BEFORE any byte flows, so
+    spilling here is pre-first-byte and safe. Mirrors the non-streaming F2a spill.
+    """
+    app = _make_app_with_both_healthy(tmp_path)
+    router = app.state.router
+    _, make_return = _fake_stream_factory()
+
+    call_count = 0
+
+    async def _fake_stream(backend_url, model_name, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise SaturationError(backend_key="local-llm:8080", retry_after_seconds=3.0)
+        return make_return(backend_url)
+
+    monkeypatch.setattr(router, "stream_request", _fake_stream)
+
+    upstream, body_iter, result, cleanup = await router.route_and_forward(
+        request_data={"model": "main", "messages": [], "stream": True},
+        stream=True,
+    )
+
+    assert upstream.status_code == 200
+    assert call_count == 2, "saturation on candidate A must spill to candidate B"
+    assert result.selected_model == "model-b"
+
+
+async def test_route_and_forward_streaming_skips_saturated_backend_without_opening_stream(tmp_path, monkeypatch):
+    """A streaming candidate already at its slot cap is skipped WITHOUT opening a
+    stream to it (no per-candidate slot-wait on a backend we know is full); the
+    first candidate WITH a free slot serves. Mirrors the non-streaming F2a skip.
+    """
+    app = _make_app_with_both_healthy(tmp_path)
+    disc = app.state.discovery
+    # model-a (8080) saturated 1/1; model-b (8081) has a free slot.
+    disc.clients["local-llm:8080"].max_concurrent = 1
+    disc.clients["local-llm:8080"].inflight_used = 1
+
+    router = app.state.router
+    _, make_return = _fake_stream_factory()
+    opened: list[str] = []
+
+    async def _fake_stream(backend_url, model_name, *args, **kwargs):
+        opened.append(model_name)
+        return make_return(backend_url)
+
+    monkeypatch.setattr(router, "stream_request", _fake_stream)
+
+    upstream, body_iter, result, cleanup = await router.route_and_forward(
+        request_data={"model": "main", "messages": [], "stream": True},
+        stream=True,
+    )
+
+    assert upstream.status_code == 200
+    assert opened == ["model-b"], "must skip the saturated backend without opening a stream to it"
+    assert result.selected_model == "model-b"
+
+
+async def test_route_and_forward_streaming_raises_saturation_when_all_candidates_saturated(tmp_path, monkeypatch):
+    """Every streaming candidate saturated → SaturationError propagates (→ 503 +
+    Retry-After at the API), and NO stream is opened — backpressure, not a 503 on
+    the first backend while a sibling is free.
+    """
+    app = _make_app_with_both_healthy(tmp_path)
+    disc = app.state.discovery
+    for key in ("local-llm:8080", "local-llm:8081"):
+        disc.clients[key].max_concurrent = 1
+        disc.clients[key].inflight_used = 1
+
+    router = app.state.router
+    _, make_return = _fake_stream_factory()
+    opened: list[str] = []
+
+    async def _fake_stream(backend_url, model_name, *args, **kwargs):
+        opened.append(model_name)
+        return make_return(backend_url)
+
+    monkeypatch.setattr(router, "stream_request", _fake_stream)
+
+    with pytest.raises(SaturationError):
+        await router.route_and_forward(
+            request_data={"model": "main", "messages": [], "stream": True},
+            stream=True,
+        )
+
+    assert opened == [], "no stream should be opened when all candidates are saturated"
+
+
+async def test_route_and_forward_streaming_fails_over_on_retryable_status(tmp_path, monkeypatch):
+    """Level 2: a retryable upstream status (502/503/504) seen BEFORE any SSE byte
+    is read must fail over to the next candidate. app.py reads upstream.status_code
+    before draining the body, so this is still pre-first-byte and safe.
+    """
+    app = _make_app_with_both_healthy(tmp_path)
+    router = app.state.router
+    _, make_return = _fake_stream_factory()
+
+    call_count = 0
+
+    async def _fake_stream(backend_url, model_name, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        status = 503 if call_count == 1 else 200
+        return make_return(backend_url, status=status)
+
+    monkeypatch.setattr(router, "stream_request", _fake_stream)
+
+    upstream, body_iter, result, cleanup = await router.route_and_forward(
+        request_data={"model": "main", "messages": [], "stream": True},
+        stream=True,
+    )
+
+    assert upstream.status_code == 200
+    assert call_count == 2, "a 503 from candidate A must fail over to candidate B"
+    assert result.selected_model == "model-b"
+
+
+async def test_route_and_forward_streaming_releases_rejected_candidate_slot(tmp_path, monkeypatch):
+    """Level 2 slot hygiene (the no-leak guarantee): when a candidate is abandoned
+    for a retryable status, its cleanup MUST run — freeing the in-flight slot and
+    closing the upstream connection — or the slot leaks and the backend reads
+    falsely saturated forever. The WINNING candidate's cleanup must NOT run here;
+    it's returned for the API to wire as the response background task.
+    """
+    app = _make_app_with_both_healthy(tmp_path)
+    router = app.state.router
+    cleanup_calls, make_return = _fake_stream_factory()
+
+    call_count = 0
+
+    async def _fake_stream(backend_url, model_name, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        status = 503 if call_count == 1 else 200
+        return make_return(backend_url, status=status)
+
+    monkeypatch.setattr(router, "stream_request", _fake_stream)
+
+    upstream, body_iter, result, cleanup = await router.route_and_forward(
+        request_data={"model": "main", "messages": [], "stream": True},
+        stream=True,
+    )
+
+    assert result.selected_model == "model-b"
+    assert cleanup_calls == ["http://127.0.0.1:8080/v1"], (
+        "rejected candidate A's slot must be freed; the winner B's must not be"
+    )
+
+
+async def test_route_and_forward_streaming_fails_over_on_connect_error(tmp_path, monkeypatch):
+    """Level 2: a connect-phase network error (before any byte) must fail over.
+    stream_request releases its own slot on a send failure, so there's no leak.
+    """
+    app = _make_app_with_both_healthy(tmp_path)
+    router = app.state.router
+    _, make_return = _fake_stream_factory()
+
+    call_count = 0
+
+    async def _fake_stream(backend_url, model_name, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise httpx.ConnectError("connection refused")
+        return make_return(backend_url, status=200)
+
+    monkeypatch.setattr(router, "stream_request", _fake_stream)
+
+    upstream, body_iter, result, cleanup = await router.route_and_forward(
+        request_data={"model": "main", "messages": [], "stream": True},
+        stream=True,
+    )
+
+    assert upstream.status_code == 200
+    assert call_count == 2
+    assert result.selected_model == "model-b"
+
+
+async def test_route_and_forward_streaming_does_not_fail_over_on_non_retryable_status(tmp_path, monkeypatch):
+    """Level 2 boundary: a 400 is the request's fault — do NOT burn the chain
+    failing over (every backend would 400 too). Return it, streamed back as-is.
+    """
+    app = _make_app_with_both_healthy(tmp_path)
+    router = app.state.router
+    _, make_return = _fake_stream_factory()
+
+    call_count = 0
+
+    async def _fake_stream(backend_url, model_name, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return make_return(backend_url, status=400)
+
+    monkeypatch.setattr(router, "stream_request", _fake_stream)
+
+    upstream, body_iter, result, cleanup = await router.route_and_forward(
+        request_data={"model": "main", "messages": [], "stream": True},
+        stream=True,
+    )
+
+    assert upstream.status_code == 400
+    assert call_count == 1, "must NOT fail over on a non-retryable 400"
+    assert result.selected_model == "model-a"
+
+
+async def test_route_and_forward_streaming_returns_last_retryable_status_when_all_fail(tmp_path, monkeypatch):
+    """Level 2 exhaustion: when EVERY candidate returns a retryable status, the
+    last one's stream is returned (client sees the upstream 5xx, as today) and all
+    EARLIER rejected candidates' slots are freed — no leak on the failure path.
+    """
+    app = _make_app_with_both_healthy(tmp_path)
+    router = app.state.router
+    cleanup_calls, make_return = _fake_stream_factory()
+
+    call_count = 0
+
+    async def _fake_stream(backend_url, model_name, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return make_return(backend_url, status=503)
+
+    monkeypatch.setattr(router, "stream_request", _fake_stream)
+
+    upstream, body_iter, result, cleanup = await router.route_and_forward(
+        request_data={"model": "main", "messages": [], "stream": True},
+        stream=True,
+    )
+
+    assert upstream.status_code == 503
+    assert call_count == 2, "must try both candidates before giving up"
+    # Only the earlier candidate (A) is cleaned up here; B is the returned stream,
+    # whose cleanup the API wires as the response background task.
+    assert cleanup_calls == ["http://127.0.0.1:8080/v1"], "earlier rejected slot must be freed"
+    assert result.selected_model == "model-b"
+
+
 async def test_route_and_forward_exhausted_chain_reports_correct_candidate(tmp_path, monkeypatch):
     """When chain exhausts via 502-then-network-error, the returned RouteResult
     must describe the candidate that produced the response (not the last attempted).

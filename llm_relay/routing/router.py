@@ -253,17 +253,78 @@ class RequestRouter:
             httpx.RemoteProtocolError,
         )
 
-        # Streaming: route once, no retry (slot lifecycle prevents safe retry).
+        # Streaming: spill past a saturated candidate BEFORE the first byte.
+        # Saturation is decided at slot-acquire, before any SSE byte flows, so
+        # choosing another backend here is pre-flight-safe — unlike mid-stream
+        # failover, which is unreplayable (see docstring).
         if stream:
-            candidate = candidates[0]
-            route_result = _candidate_to_route_result(candidate, ctx)
-            upstream, body_iter, cleanup = await self.stream_request(
-                candidate.backend_url, candidate.model, request_data,
-                headers=headers,
-                backend_key=candidate.backend_key,
-                slot_wait_timeout=candidate.slot_wait_timeout,
+            saturation_error: SaturationError | None = None
+            last_error: Exception | None = None
+            # A retry-status candidate held pending a better one. Pre-first-byte:
+            # we have the upstream status but have read no SSE body, so we can
+            # still abandon it for the next candidate. Only ONE is held at a time
+            # (the prior is freed before a newer is kept), so at most one extra
+            # slot is occupied transiently — and it is always released, never leaked.
+            pending: tuple | None = None
+            for candidate in candidates:
+                # Skip a backend with no free slot WITHOUT waiting on it — same
+                # pre-flight spill as the non-streaming path.
+                if not self.discovery.has_free_slot(candidate.backend_key):
+                    if saturation_error is None:
+                        saturation_error = SaturationError(
+                            backend_key=candidate.backend_key,
+                            retry_after_seconds=candidate.slot_wait_timeout,
+                        )
+                    continue
+                try:
+                    upstream, body_iter, cleanup = await self.stream_request(
+                        candidate.backend_url, candidate.model, request_data,
+                        headers=headers,
+                        backend_key=candidate.backend_key,
+                        slot_wait_timeout=candidate.slot_wait_timeout,
+                    )
+                except SaturationError as exc:
+                    saturation_error = saturation_error or exc
+                    continue
+                except retry_exceptions as exc:
+                    # Connect-phase failure, before any byte — stream_request has
+                    # already released its own slot, so just try the next candidate.
+                    last_error = exc
+                    continue
+                route_result = _candidate_to_route_result(candidate, ctx)
+                if str(upstream.status_code) in retry_codes:
+                    # Retryable upstream status, still pre-first-byte: free any
+                    # prior pending stream and hold this one while we try the rest.
+                    if pending is not None:
+                        await pending[3]()
+                    pending = (upstream, body_iter, route_result, cleanup)
+                    continue
+                # Success — or a non-retryable status (e.g. 400) we must not burn
+                # the chain on. Commit to it; free any pending retry-status stream.
+                if pending is not None:
+                    await pending[3]()
+                return upstream, body_iter, route_result, cleanup
+            # Chain exhausted.
+            if pending is not None:
+                # Every candidate gave a retryable status — return the last so the
+                # client still sees the upstream 5xx (as the single-candidate path
+                # did). Earlier candidates were already cleaned up above.
+                return pending
+            if saturation_error is not None:
+                raise saturation_error
+            if last_error is not None:
+                raise last_error
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "No model matches constraints",
+                    "decision": {
+                        "requested": ctx.requested_model,
+                        "candidates": ctx.candidates,
+                        "filtered": ctx.filtered,
+                    },
+                },
             )
-            return upstream, body_iter, route_result, cleanup
 
         # Non-streaming: walk the chain, retry on retry_on errors.
         last_response: httpx.Response | None = None
