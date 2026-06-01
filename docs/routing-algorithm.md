@@ -20,8 +20,24 @@ produces a candidate list, and each tells us whether that list is **ordered**
 | A fallback-graph key (e.g. `high-quality` not also an alias) | `fallback_graph[key]` | Yes |
 | Unknown | All currently-healthy models | No |
 
-In the homelab config aliases and fallback-graph keys can overlap — aliases
-win.
+**Aliases vs the fallback graph — one mental model.** Both express ordered
+fallback, but for different request shapes, with a strict precedence:
+
+1. **Alias** (request a *category*, e.g. `main`): the alias member list is the
+   ordered chain. Aliases always win — if a name is both an alias and a
+   `fallback.graph` key, the alias is used.
+2. **Explicit concrete model** (e.g. `qwen3.5-35b`): the chain is the model
+   itself followed by its `fallback.graph[model]` entry, if any. This is the
+   graph's load-bearing role — a per-model safety net for direct requests that
+   aliases cannot express.
+3. **Bare `fallback.graph` key** that is neither an alias nor a concrete model:
+   its graph chain is used directly.
+4. **Unknown name**: discovery-ranked candidates (preference sort).
+
+So curate **categories as aliases** and reserve **`fallback.graph` for
+per-concrete-model fallback**. When the same name lives in both, the graph entry
+is reachable only via the explicit-model path (2), never the category path (1) —
+keep the two consistent to avoid surprise.
 
 ## Step 2 — Filter
 
