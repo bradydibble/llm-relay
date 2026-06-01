@@ -57,6 +57,7 @@ class ModelConfig:
     port: int | None = None
     path: str = ""
     service: str | None = None  # systemd unit on the provider host; used by llm-mode
+    served_model_name: str | None = None  # id the backend reports in /v1/models, when it differs from the config key (e.g. a GGUF filename)
     context_window: int | None = None
     capabilities: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)

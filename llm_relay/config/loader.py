@@ -99,6 +99,7 @@ class ConfigLoader:
                 port=cfg.get("port"),
                 path=cfg.get("path", "") or "",
                 service=cfg.get("service"),
+                served_model_name=cfg.get("served_model_name"),
                 context_window=cfg.get("context_window"),
                 capabilities=cfg.get("capabilities", []) or [],
                 tags=cfg.get("tags", []) or [],

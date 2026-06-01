@@ -194,6 +194,11 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
     # before routing so resolve_client is correct for telemetry and metrics.
     configure_clients_from_env()
     discovery = DiscoveryManager()
+    # Seed served-name overrides so availability correlates a config model with the
+    # id its backend actually reports in /v1/models (e.g. a GGUF filename).
+    for _name, _m in config.models.models.items():
+        if _m.served_model_name:
+            discovery.served_names[_name] = _m.served_model_name
     router = RequestRouter(config, discovery)
 
     from contextlib import AsyncExitStack

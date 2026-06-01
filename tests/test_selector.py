@@ -102,6 +102,60 @@ def test_get_model_state_available_when_backend_serves_model():
     assert disc.get_model_state("qwen3.5-9b") == ModelStatus.available
 
 
+def test_get_model_state_matches_served_model_name_override():
+    """Explicit served_model_name: a backend reporting a different served id is
+    available when the config declares that served name."""
+    disc = DiscoveryManager()
+    disc.served_names["model-x"] = "Model-X-7B-UD-Q4_K_XL.gguf"
+    state = EndpointState(
+        provider="local-llm", status=EndpointStatus.healthy,
+        models=["Model-X-7B-UD-Q4_K_XL.gguf"],
+    )
+    disc.clients["k1"] = EndpointClient(provider_name="local-llm", base_url="x", state=state)
+    disc.model_to_client["model-x"] = "k1"
+
+    assert disc.get_model_state("model-x") == ModelStatus.available
+
+
+def test_get_model_state_fuzzy_matches_gguf_filename_without_override():
+    """Robustness: even with no explicit override, a backend reporting a GGUF
+    filename that contains the config name (case-insensitive) is recognized as
+    serving it — so llama.cpp backends reporting '<Name>-UD-Q4_K_XL.gguf' don't
+    read unavailable. Mirrors the /status _actually_available convention."""
+    disc = DiscoveryManager()
+    state = EndpointState(
+        provider="local-llm", status=EndpointStatus.healthy,
+        models=["Model-X-7B-UD-Q4_K_XL.gguf"],
+    )
+    disc.clients["k1"] = EndpointClient(provider_name="local-llm", base_url="x", state=state)
+    disc.model_to_client["model-x"] = "k1"
+
+    assert disc.get_model_state("model-x") == ModelStatus.available
+
+
+def test_get_model_state_unavailable_when_serving_an_unrelated_model():
+    """Issue-2 guard preserved: a healthy backend serving an UNRELATED model (config
+    name neither present nor a substring) must still read unavailable."""
+    disc = DiscoveryManager()
+    state = EndpointState(
+        provider="local-llm", status=EndpointStatus.healthy, models=["model-y"],
+    )
+    disc.clients["k1"] = EndpointClient(provider_name="local-llm", base_url="x", state=state)
+    disc.model_to_client["model-x"] = "k1"
+
+    assert disc.get_model_state("model-x") == ModelStatus.unavailable
+
+
+def test_loader_parses_served_model_name(tmp_path):
+    """models.yaml `served_model_name` is parsed onto ModelConfig."""
+    (tmp_path / "models.yaml").write_text(
+        "models:\n  m1:\n    provider: p\n    served_model_name: M1-UD-Q4_K_XL.gguf\n"
+    )
+    c = ConfigLoader(config_dir=tmp_path)
+    c.load()
+    assert c.models.models["m1"].served_model_name == "M1-UD-Q4_K_XL.gguf"
+
+
 def test_privacy_local_only_excludes_cloud():
     c = _load()
     disc = DiscoveryManager()

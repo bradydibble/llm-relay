@@ -77,6 +77,10 @@ class DiscoveryManager:
 
     clients: dict[str, EndpointClient] = field(default_factory=dict)
     model_to_client: dict[str, str] = field(default_factory=dict)
+    # Optional override: config model name -> the id the backend reports in
+    # /v1/models when they differ (e.g. a GGUF filename). Lets the relay correlate
+    # a configured model with what the backend actually serves.
+    served_names: dict[str, str] = field(default_factory=dict)
     # Idle window (seconds) after which a bounded backend showing inflight_used
     # > 0 with no recent dispatch is treated as having leaked slots and is
     # force-reconciled. Defaults to 1 hour; override with the
@@ -234,24 +238,40 @@ class DiscoveryManager:
             return True
         return client.inflight_used < client.max_concurrent
 
+    def _serves(self, client: EndpointClient, model_name: str) -> bool:
+        """Whether *client* currently reports serving *model_name*.
+
+        Matches the backend's reported ids against the model's served name
+        (explicit ``served_names`` override, else the config name): exact first,
+        then a case-insensitive substring fallback so a llama.cpp backend that
+        reports a GGUF filename (e.g. ``Name-UD-Q4_K_XL.gguf``) is still
+        recognized. Same convention as the /status ``_actually_available`` check.
+        """
+        served = self.served_names.get(model_name, model_name)
+        reported = client.state.models
+        if served in reported or model_name in reported:
+            return True
+        needles = {served.lower(), model_name.lower()}
+        return any(any(n in r.lower() for n in needles) for r in reported)
+
     def get_model_state(self, model_name: str) -> ModelStatus:
         key = self.model_to_client.get(model_name)
         if key:
             client = self.clients.get(key)
             # Availability is per-MODEL, not per-backend: only trust the mapped
-            # client if it is actually reporting this model right now. A healthy
-            # backend that isn't serving the model (e.g. reimaged with a different
-            # served-model-name) must NOT read available — otherwise the router
-            # selects it and the upstream 404s. If the mapped client isn't serving
-            # it, fall through to see whether any other backend is.
-            if client and model_name in client.state.models:
+            # client if it is actually serving this model right now (matched via
+            # served name / fuzzy). A healthy backend that isn't serving the model
+            # (e.g. reimaged with a different served-model-name) must NOT read
+            # available — otherwise the router selects it and the upstream 404s.
+            # If the mapped client isn't serving it, fall through to any other.
+            if client and self._serves(client, model_name):
                 if client.state.status == EndpointStatus.healthy:
                     return ModelStatus.available
                 if client.state.status == EndpointStatus.degraded:
                     return ModelStatus.degraded
                 return ModelStatus.unavailable
         for client in self.clients.values():
-            if model_name in client.state.models:
+            if self._serves(client, model_name):
                 if client.state.status == EndpointStatus.healthy:
                     return ModelStatus.available
                 return ModelStatus.degraded
