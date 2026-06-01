@@ -165,6 +165,27 @@ GET /routing-table                # Fallback graphs
 GET /routing-table/qwen3.5-35b    # Fallback chain for a model
 ```
 
+## Observability
+
+Prometheus metrics are exposed at `GET /metrics` (on by default; set
+`LLM_RELAY_METRICS=0` to disable). They cover request / token / fallback
+counts, request and time-to-first-token latency, per-cause streaming outcomes,
+and per-backend health, saturation, and circuit-breaker gauges.
+
+OpenTelemetry tracing to an OTLP endpoint (e.g. Arize Phoenix, for per-request
+prompt/completion inspection) is **opt-in and off by default**. Enable it with
+the `otel` extra and an env flag:
+
+```bash
+pip install -e .[otel]
+export LLM_RELAY_TELEMETRY=1
+export LLM_RELAY_OTLP_ENDPOINT=http://127.0.0.1:4318/v1/traces   # default
+export PHOENIX_PROJECT_NAME=llm-relay                            # default
+```
+
+Metrics and tracing are independent: tracing being disabled or unreachable
+never affects metrics or request handling.
+
 ## CLI
 
 ```bash
