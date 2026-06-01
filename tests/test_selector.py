@@ -69,6 +69,39 @@ def test_alias_skips_unavailable():
     assert pick == "qwen3.5-35b"
 
 
+def test_get_model_state_unavailable_when_backend_healthy_but_not_serving_model():
+    """Availability is per-MODEL, not per-backend.
+
+    A model mapped to a healthy backend that is NOT actually reporting it (e.g. the
+    box was reimaged and relaunched with a different served-model-name) must read
+    unavailable. Otherwise the router selects it and the upstream returns 404 — the
+    dominant production failure mode. The backend being up is not enough; it must be
+    serving THIS model.
+    """
+    disc = DiscoveryManager()
+    # Backend is healthy, but its reported model set does NOT include our model.
+    state = EndpointState(
+        provider="local-llm", status=EndpointStatus.healthy, models=["a-different-model"]
+    )
+    disc.clients["k1"] = EndpointClient(provider_name="local-llm", base_url="x", state=state)
+    disc.model_to_client["qwen3.5-9b"] = "k1"
+
+    assert disc.get_model_state("qwen3.5-9b") == ModelStatus.unavailable
+
+
+def test_get_model_state_available_when_backend_serves_model():
+    """Regression guard for the happy path: a healthy backend that DOES report the
+    model reads available."""
+    disc = DiscoveryManager()
+    state = EndpointState(
+        provider="local-llm", status=EndpointStatus.healthy, models=["qwen3.5-9b"]
+    )
+    disc.clients["k1"] = EndpointClient(provider_name="local-llm", base_url="x", state=state)
+    disc.model_to_client["qwen3.5-9b"] = "k1"
+
+    assert disc.get_model_state("qwen3.5-9b") == ModelStatus.available
+
+
 def test_privacy_local_only_excludes_cloud():
     c = _load()
     disc = DiscoveryManager()

@@ -219,11 +219,32 @@ class DiscoveryManager:
             self._reconcile_stuck_slots(client)
             await asyncio.sleep(interval)
 
+    def has_free_slot(self, key: str) -> bool:
+        """Whether backend `key` can take a request right now without waiting.
+
+        True when the backend is unbounded (no ``max_concurrent``) or has an
+        in-flight slot free. The router uses this to spill past a saturated
+        backend WITHOUT paying the per-candidate slot-wait. Unknown keys return
+        True (treated as a no-op slot, matching ``acquire_slot``).
+        """
+        client = self.clients.get(key)
+        if client is None:
+            return True
+        if client.max_concurrent is None or client.max_concurrent <= 0:
+            return True
+        return client.inflight_used < client.max_concurrent
+
     def get_model_state(self, model_name: str) -> ModelStatus:
         key = self.model_to_client.get(model_name)
         if key:
             client = self.clients.get(key)
-            if client:
+            # Availability is per-MODEL, not per-backend: only trust the mapped
+            # client if it is actually reporting this model right now. A healthy
+            # backend that isn't serving the model (e.g. reimaged with a different
+            # served-model-name) must NOT read available — otherwise the router
+            # selects it and the upstream 404s. If the mapped client isn't serving
+            # it, fall through to see whether any other backend is.
+            if client and model_name in client.state.models:
                 if client.state.status == EndpointStatus.healthy:
                     return ModelStatus.available
                 if client.state.status == EndpointStatus.degraded:

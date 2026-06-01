@@ -269,9 +269,24 @@ class RequestRouter:
         last_response: httpx.Response | None = None
         last_response_candidate: ChainCandidate | None = None
         last_error: Exception | None = None
+        # Set when a candidate is saturated. Saturation is spilled past
+        # candidate-by-candidate and only surfaced if the WHOLE chain is full —
+        # at which point backpressure (503 + Retry-After) is the correct answer.
+        saturation_error: SaturationError | None = None
 
         for candidate in candidates:
             route_result = _candidate_to_route_result(candidate, ctx)
+            # Spill past a backend with no free slot WITHOUT waiting on it: a single
+            # saturated backend is not a reason to fail when another can serve the
+            # request. Skipping here also avoids paying slot_wait_timeout per
+            # already-full candidate before falling through.
+            if not self.discovery.has_free_slot(candidate.backend_key):
+                if saturation_error is None:
+                    saturation_error = SaturationError(
+                        backend_key=candidate.backend_key,
+                        retry_after_seconds=candidate.slot_wait_timeout,
+                    )
+                continue
             try:
                 resp = await self.forward_request(
                     candidate.backend_url, candidate.model, request_data,
@@ -284,10 +299,12 @@ class RequestRouter:
                     last_response_candidate = candidate
                     continue
                 return resp, route_result
-            except SaturationError:
-                # Slot saturation is backpressure, not backend failure.
-                # Propagate immediately so the caller emits Retry-After.
-                raise
+            except SaturationError as exc:
+                # Raced: passed the free-slot check but filled before acquire.
+                # Treat like any other saturated candidate — spill to the next.
+                if saturation_error is None:
+                    saturation_error = exc
+                continue
             except retry_exceptions as exc:
                 last_error = exc
                 continue
@@ -300,6 +317,9 @@ class RequestRouter:
             return last_response, final_result
         if last_error is not None:
             raise last_error
+        # Every viable candidate was saturated → backpressure.
+        if saturation_error is not None:
+            raise saturation_error
         raise HTTPException(
             status_code=503,
             detail={

@@ -194,15 +194,46 @@ async def test_route_and_forward_exhausts_chain_returns_last_502(tmp_path, monke
     assert result.selected_model == "model-b"
 
 
-async def test_route_and_forward_propagates_saturation_error_immediately(tmp_path, monkeypatch):
-    """SaturationError from backend A does NOT trigger retry to backend B.
+async def test_route_and_forward_spills_to_next_candidate_on_saturation(tmp_path, monkeypatch):
+    """SaturationError from candidate A must SPILL to candidate B, not fail.
 
-    Slot saturation is backpressure, not backend failure — surface immediately
-    so the caller can back off (Retry-After) instead of cascading load.
+    Reverses the old 'propagate immediately' contract. Slot saturation on ONE
+    backend is not a reason to fail the request when another candidate can serve
+    it — fall through to the next. (503 only when ALL candidates are saturated;
+    see the companion test below.) This is the fix for the overnight
+    `503 backend saturated` failures where the relay gave up on the first
+    saturated backend instead of spilling to a free one.
+    """
+    app = _make_app_with_both_healthy(tmp_path)
+    router = app.state.router
 
-    Critically: forward_request is called EXACTLY ONCE when SaturationError fires.
-    This asserts behavioral correctness (not just status code), ensuring the
-    retry loop does not silently swallow and re-raise the exception.
+    resp_200 = httpx.Response(200, json={"choices": []})
+    call_count = 0
+
+    async def _fake_forward(backend_url, model_name, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise SaturationError(backend_key="local-llm:8080", retry_after_seconds=3.0)
+        return resp_200
+
+    monkeypatch.setattr(router, "forward_request", _fake_forward)
+
+    resp, result = await router.route_and_forward(
+        request_data={"model": "main", "messages": []},
+        stream=False,
+    )
+
+    assert resp.status_code == 200
+    assert call_count == 2, "saturation on candidate A must spill to candidate B"
+    assert result.selected_model == "model-b"
+
+
+async def test_route_and_forward_raises_saturation_only_when_all_candidates_saturated(tmp_path, monkeypatch):
+    """When EVERY candidate is saturated, SaturationError propagates (→ 503 + Retry-After).
+
+    Updated contract: saturation is spilled past candidate-by-candidate and only
+    surfaces once the whole chain is full — at which point backpressure is correct.
     """
     app = _make_app_with_both_healthy(tmp_path)
     router = app.state.router
@@ -222,13 +253,41 @@ async def test_route_and_forward_propagates_saturation_error_immediately(tmp_pat
             stream=False,
         )
 
-    # Must have stopped after the first backend — NOT tried model-b.
-    assert call_count == 1, (
-        "SaturationError must NOT trigger cross-backend retry; "
-        f"forward_request was called {call_count} time(s)"
-    )
-    assert excinfo.value.backend_key == "local-llm:8080"
+    assert call_count == 2, "must try BOTH candidates before surfacing saturation"
     assert excinfo.value.retry_after_seconds == 3.0
+
+
+async def test_route_and_forward_skips_saturated_backend_without_forwarding(tmp_path, monkeypatch):
+    """A backend already at its slot cap is skipped WITHOUT calling forward_request
+    on it — no per-candidate slot-wait on a backend we already know is full. When
+    all candidates are full, surface saturation immediately (fast 503 + Retry-After)
+    rather than waiting `slot_wait_timeout` on each.
+    """
+    app = _make_app_with_both_healthy(tmp_path)
+    disc = app.state.discovery
+    # Both backends saturated (1/1). A load-tie keeps configured order, and both
+    # have no free slot — so neither should be forwarded to.
+    for key in ("local-llm:8080", "local-llm:8081"):
+        disc.clients[key].max_concurrent = 1
+        disc.clients[key].inflight_used = 1
+
+    router = app.state.router
+    called = False
+
+    async def _fake_forward(*args, **kwargs):
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={"choices": []})
+
+    monkeypatch.setattr(router, "forward_request", _fake_forward)
+
+    with pytest.raises(SaturationError):
+        await router.route_and_forward(
+            request_data={"model": "main", "messages": []},
+            stream=False,
+        )
+
+    assert called is False, "must not forward to a backend with no free slot"
 
 
 async def test_route_and_forward_503_via_api_on_saturation(tmp_path, monkeypatch):
