@@ -37,12 +37,8 @@ dev = [
 mcp = [
     "mcp>=1.10",
 ]
-a2a = [
-    "a2a-sdk>=1.0",
-]
 all = [
     "mcp>=1.10",
-    "a2a-sdk>=1.0",
 ]
 
 [project.urls]
