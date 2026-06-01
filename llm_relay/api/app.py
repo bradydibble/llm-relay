@@ -28,7 +28,7 @@ from ..metrics import configure_clients_from_env, did_fall_back, metrics_enabled
 
 
 def _resolve_base_url() -> str:
-    """Externally-reachable root URL for A2A agent-card and MCP config."""
+    """Externally-reachable root URL advertised in the MCP config."""
     return os.environ.get("LLM_RELAY_BASE_URL", "http://127.0.0.1:8090").rstrip("/")
 
 
@@ -264,18 +264,6 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
     try:
         from ..mcp import build_mcp_server
         _mcp_app, _mcp_session_mgr = build_mcp_server(base_url=_resolve_base_url())
-    except ImportError:
-        pass
-
-    # --- A2A routes (optional dep) -------------------------------------
-    _a2a_card_routes: list = []
-    _a2a_jsonrpc_routes: list = []
-    _a2a_rest_routes: list = []
-    try:
-        from ..a2a import build_a2a_routes
-        _a2a_card_routes, _a2a_jsonrpc_routes, _a2a_rest_routes = build_a2a_routes(
-            base_url=_resolve_base_url(),
-        )
     except ImportError:
         pass
 
@@ -594,13 +582,6 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
     # Mount MCP at /mcp
     if _mcp_app is not None:
         app.mount("/mcp", _mcp_app)
-
-    # Mount A2A routes (agent card at /.well-known/agent-card.json,
-    # JSON-RPC at /a2a/jsonrpc, REST at /a2a/rest)
-    if _a2a_card_routes:
-        app.routes.extend(_a2a_card_routes)
-        app.routes.extend(_a2a_jsonrpc_routes)
-        app.routes.extend(_a2a_rest_routes)
 
     # Prometheus metrics: request/token/fallback counters + pull-based backend
     # gauges, served directly at /metrics (a route, not a mounted sub-app, to
