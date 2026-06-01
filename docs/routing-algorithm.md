@@ -39,13 +39,15 @@ entirely:
 ## Step 3 — Order
 
 - **Ordered candidates** (aliases, explicit, fallback-graph key): the list
-  order *is* the priority. llm-relay does not rerank by preference. This means
-  `subagent: [qwen3.5-9b, qwen3.5-35b]` will pick `qwen3.5-9b` whenever it is
-  up, even though `qwen3.5-35b` has higher preference, latency, and quality
-  scores.
-- **Unordered candidates** (unknown model): ranked by
-  `quality × preference + latency_bonus + cost_bonus + availability` where
-  weights come from `policy.yaml` (or the `X-Llm-Relay-Weights` header).
+  order *is* the priority — llm-relay never reranks by preference. It does
+  apply **load-aware spill**: among candidates of equal priority the
+  least-loaded backend wins, and a saturated backend (no free slot) is skipped
+  in favour of a free one. So `subagent: [qwen3.5-9b, qwen3.5-35b]` picks
+  `qwen3.5-9b` while it has capacity, but spills to `qwen3.5-35b` when the 9B
+  backend is busy — preferring an available alternate over a slot wait.
+- **Unordered candidates** (unknown model): sorted by `preference`
+  (descending), ties broken by name — the same ordering the MCP
+  `select_for_capability` tool returns, so the two surfaces never disagree.
 
 ## Step 4 — Select
 

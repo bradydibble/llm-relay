@@ -11,7 +11,7 @@ each operational change is a single edit in a single file.
 | `config/providers.yaml` | Backend hosts (`base_url`, polling cadence, circuit breaker). |
 | `config/models.yaml` | Concrete model definitions and **aliases**. For local models, the `port` and `service` fields are read by both llm-relay (for routing) and `llm-mode` (for systemd lifecycle). |
 | `config/modes.yaml` | `llm-mode` profiles. Lists the *models* a mode should run; ports and units are derived from `models.yaml`. |
-| `config/policy.yaml` | Routing policy: ranking weights, privacy defaults, fallback graph, `llm-mode` hint messages. |
+| `config/policy.yaml` | Routing policy: privacy defaults, fallback graph, `llm-mode` hint messages. |
 
 If you find yourself editing the same fact in two files, that is a bug — open
 an issue.
@@ -117,7 +117,7 @@ default upstream may break. Prefer `llm-mode <mode>` or `llm-mode set-default`.
 | `llm-mode <mode>` (services start/stop on the LLM host) | No (polling picks it up in ≤15s) | n/a |
 | Edit `models.yaml` (new/removed/changed model) | Yes | No (reads YAML every call) |
 | Edit `modes.yaml` | No (relay does not use modes) | No |
-| Edit `policy.yaml` (fallback graph, weights) | Yes | No |
+| Edit `policy.yaml` (fallback graph, privacy) | Yes | No |
 | Edit `providers.yaml` | Yes | No |
 
 Restart is cheap (~2s):

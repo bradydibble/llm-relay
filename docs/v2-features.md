@@ -169,23 +169,11 @@ regions:
 
 **Description:** Collect and expose usage metrics (requests per model, latency, errors).
 
-**Why not in v1:**
-- v1 focuses on core routing functionality
-- Metrics can be added via middleware (Prometheus, Grafana)
-
-**v2 design:**
-
-```yaml
-metrics:
-  enabled: false
-  prometheus:
-    port: 9090
-    path: /metrics
-  models:
-    - request_count
-    - avg_latency
-    - error_rate
-```
+**Status: shipped.** Prometheus metrics are exposed at `GET /metrics` (on by
+default): request / token / fallback counts, request and time-to-first-token
+latency, per-cause streaming outcomes, and per-backend health, saturation, and
+circuit-breaker gauges. Optional OpenTelemetry→Phoenix tracing is opt-in (see
+the README "Observability" section). This item is no longer out of scope.
 
 ### 9. WebSocket streaming support
 

@@ -102,12 +102,6 @@ Define routing policy and fallback:
 
 ```yaml
 policy:
-  ranking:
-    quality: 0.4
-    latency: 0.3
-    cost: 0.1
-    availability: 0.2
-
   constraints:
     privacy:
       default: local_only
@@ -150,7 +144,6 @@ curl -X POST http://127.0.0.1:8090/v1/chat/completions \
 | Header | Values | Description |
 |--------|--------|-------------|
 | `X-Llm-Relay-Privacy` | `local_only`, `cloud_ok` | Privacy constraint |
-| `X-Llm-Relay-Weights` | `quality=0.4,latency=0.3,...` | Override ranking weights |
 | `X-Llm-Relay-Require-Tools` | `true`, `false` | Require tool_use capability |
 | `X-Llm-Relay-Min-Context` | `131072` | Minimum context window |
 
@@ -158,8 +151,8 @@ curl -X POST http://127.0.0.1:8090/v1/chat/completions \
 
 ```bash
 GET /health                       # Endpoint health status
-GET /available-models             # All models with rich metadata + aliases
-GET /v1/available-models          # Same payload, /v1-prefixed for clients
+GET /v1/available-models          # All models with rich metadata + aliases (canonical)
+GET /available-models             # Deprecated alias of the above (same payload)
 GET /v1/models                    # OpenAI-compatible model list (concrete + aliases)
 GET /routing-table                # Fallback graphs
 GET /routing-table/qwen3.5-35b    # Fallback chain for a model
@@ -203,9 +196,10 @@ llm-relay config                   # Print config
    **ordered** (the user/config specified the priority). If the requested name
    is unknown, candidates are drawn from currently-discovered models.
 2. **Filter**: Apply hard constraints (privacy, tools, context).
-3. **Order**: For ordered candidates, the configured order *is* the ranking —
-   llm-relay does not re-rank by preference. For the unknown case, candidates
-   are ranked by `quality + latency + cost + availability`.
+3. **Order**: For ordered candidates the configured order *is* the priority
+   (never reranked by preference), with load-aware spill to a free/less-loaded
+   backend among equal priority. For the unknown case, candidates are sorted by
+   `preference` (descending), ties broken by name.
 4. **Select**: Walk the ordered (or ranked) list and return the first candidate
    the discovery layer currently reports as available.
 5. **Fallback**: On backend HTTP 5xx the router moves on to the next available
