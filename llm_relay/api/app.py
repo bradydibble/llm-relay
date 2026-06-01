@@ -18,7 +18,12 @@ from ..config.types import SaturationError
 from ..discovery.manager import DiscoveryManager
 from ..routing.keys import compose_backend_key, compose_model_id, resolve_model_id
 from ..routing.router import RequestRouter
-from .instrumentation import emit_chat_completion, reassemble_sse
+from .instrumentation import (
+    _classify_stream_outcome,
+    emit_chat_completion,
+    reassemble_sse,
+    sse_finished,
+)
 from ..metrics import configure_clients_from_env, did_fall_back, metrics_enabled, register_discovery_collector, render_exposition, resolve_client, set_known_routable
 
 
@@ -514,20 +519,39 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
 
             async def _tee_and_emit():
                 chunks: list[bytes] = []
+                exc: BaseException | None = None
+                first_chunk_ns: int | None = None
                 try:
                     async for chunk in body_iter:
+                        if first_chunk_ns is None:
+                            first_chunk_ns = time.time_ns()
                         chunks.append(chunk)
                         yield chunk
+                except BaseException as e:
+                    # Capture HOW the stream ended so the outcome is honest, then
+                    # always re-raise: a swallowed CancelledError/GeneratorExit would
+                    # strand the cleanup that frees the in-flight slot.
+                    exc = e
+                    raise
                 finally:
-                    text, usage = reassemble_sse(b"".join(chunks))
+                    raw = b"".join(chunks)
+                    text, usage = reassemble_sse(raw)
+                    # Outcome reflects the ACTUAL termination, not just the initial
+                    # status: a 200 that stalls mid-stream is not a success. Only
+                    # synchronous calls here — under GeneratorExit we must not await.
+                    outcome = _classify_stream_outcome(upstream_status, exc, sse_finished(raw))
+                    # End-to-end TTFT (first chunk ~= first byte, includes routing);
+                    # None when no chunk ever flowed.
+                    ttft_ns = (first_chunk_ns - start_ns) if first_chunk_ns is not None else None
                     emit_chat_completion(
                         request_body=body, response_body=None, response_text=text, usage=usage,
                         model_resolved=result.selected_model, provider_name=result.provider_name,
                         user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                         status_code=upstream_status, streamed=True,
-                        outcome="success" if upstream_status < 400 else "upstream_error",
+                        outcome=outcome,
                         client=client,
                         fell_back=did_fall_back(result.selected_model, (result.decision or {}).get("ranked") or []),
+                        ttft_ns=ttft_ns,
                     )
 
             # cleanup frees the in-flight slot and closes the upstream

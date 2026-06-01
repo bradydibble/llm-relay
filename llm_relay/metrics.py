@@ -40,6 +40,10 @@ def set_known_clients(names: set[str]) -> None:
 # multi-minute large-model generations on the local fleet.
 _DURATION_BUCKETS = (0.1, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, float("inf"))
 
+# Time-to-first-token buckets (seconds): snappy small models through slow
+# prompt-processing on large-context requests, which dominates streaming TTFT.
+_TTFT_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, float("inf"))
+
 # Dedicated registry for relay metrics — kept off the global default REGISTRY so
 # repeated create_app() calls (tests, reloads) never collide, and the relay's
 # series stay isolated from any future default collectors.
@@ -224,6 +228,14 @@ class RelayMetrics:
             buckets=_DURATION_BUCKETS,
             registry=self.registry,
         )
+        self.ttft = Histogram(
+            "llm_relay_ttft_seconds",
+            "Streaming time-to-first-token (first chunk) in seconds, end-to-end "
+            "including routing. Observed only for streamed responses.",
+            ["provider", "model"],
+            buckets=_TTFT_BUCKETS,
+            registry=self.registry,
+        )
 
     def record_request(
         self,
@@ -237,6 +249,7 @@ class RelayMetrics:
         response_body: dict | None,
         duration_s: float | None,
         fell_back: bool,
+        ttft_s: float | None = None,
     ) -> None:
         if not metrics_enabled():
             return
@@ -252,6 +265,9 @@ class RelayMetrics:
 
         if duration_s is not None and duration_s >= 0:
             self.duration.labels(provider=prov, model=mdl).observe(duration_s)
+
+        if ttft_s is not None and ttft_s >= 0:
+            self.ttft.labels(provider=prov, model=mdl).observe(ttft_s)
 
         if fell_back:
             self.fallbacks.labels(alias=ali, model=mdl, client=cli).inc()

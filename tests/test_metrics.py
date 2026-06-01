@@ -182,6 +182,58 @@ def test_records_request_duration_observation():
     assert count == 1.0
 
 
+def test_records_ttft_observation_when_provided():
+    # Streaming requests pass a measured time-to-first-token; it lands in the
+    # llm_relay_ttft_seconds histogram, labelled by provider/model.
+    rm = _rm()
+    rm.record_request(
+        alias="a", model="m", provider="prov-a", outcome="success",
+        client="unknown", usage=None, response_body=None, duration_s=2.0, fell_back=False,
+        ttft_s=0.25,
+    )
+    count = rm.registry.get_sample_value(
+        "llm_relay_ttft_seconds_count", {"provider": "prov-a", "model": "m"})
+    assert count == 1.0
+
+
+def test_ttft_not_observed_when_none():
+    # Non-streaming (or zero-chunk) requests pass ttft_s=None -> no observation,
+    # so the series is never created (TTFT only meaningful for streamed tokens).
+    rm = _rm()
+    rm.record_request(
+        alias="a", model="m", provider="prov-a", outcome="success",
+        client="unknown", usage=None, response_body=None, duration_s=2.0, fell_back=False,
+        ttft_s=None,
+    )
+    count = rm.registry.get_sample_value(
+        "llm_relay_ttft_seconds_count", {"provider": "prov-a", "model": "m"})
+    assert count is None
+
+
+def test_emit_chat_completion_threads_ttft_ns_to_histogram(monkeypatch):
+    """emit_chat_completion converts ttft_ns -> seconds and records the histogram."""
+    from llm_relay.api.instrumentation import emit_chat_completion
+    from llm_relay import metrics as metrics_mod
+
+    rm = RelayMetrics(registry=CollectorRegistry())
+    monkeypatch.setattr(metrics_mod, "get_metrics", lambda: rm)
+
+    emit_chat_completion(
+        request_body={"model": "main"}, response_body=None, response_text="hi", usage=None,
+        model_resolved="m", provider_name="prov-a",
+        user_agent="ua", start_ns=0, end_ns=1_000_000_000,
+        status_code=200, streamed=True, outcome="success",
+        ttft_ns=250_000_000,
+    )
+
+    count = rm.registry.get_sample_value(
+        "llm_relay_ttft_seconds_count", {"provider": "prov-a", "model": "m"})
+    s = rm.registry.get_sample_value(
+        "llm_relay_ttft_seconds_sum", {"provider": "prov-a", "model": "m"})
+    assert count == 1.0
+    assert abs(s - 0.25) < 1e-9
+
+
 def test_fallback_increments_fallbacks_total_only_when_fell_back():
     rm = _rm()
     rm.record_request(

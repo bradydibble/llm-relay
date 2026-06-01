@@ -393,3 +393,105 @@ async def test_streaming_request_end_to_end_releases_slot(tmp_path, monkeypatch)
     assert b"DONE" in body
     assert acquired_keys == [key], "the real bounded backend's slot must have been acquired"
     assert client.inflight_used == 0, "slot must be released after the streaming response completes"
+
+
+# ---------------------------------------------------------------------------
+# F3: streaming outcome fidelity. The recorded `outcome` must reflect how the
+# stream actually terminated, not just the initial upstream status — so a
+# 200-then-stall stops being logged as success. (The client-disconnect branch
+# is covered by the pure classifier unit tests; a real disconnect resists
+# ASGITransport, see above.)
+# ---------------------------------------------------------------------------
+
+def _stream_app_emitting(tmp_path, monkeypatch, body_chunks, status=200):
+    """App whose streaming route yields ``body_chunks``; returns a dict that
+    captures the kwargs of the single emit_chat_completion call."""
+    app = create_app(config_dir=_make_minimal_config(tmp_path))
+
+    async def _cleanup() -> None:
+        return None
+
+    async def _body():
+        for c in body_chunks:
+            yield c
+
+    async def _rf(request_data, headers=None, stream=False):
+        result = RouteResult(
+            success=True, selected_model="test-model", backend_url="http://127.0.0.1",
+            provider_name="local-llm", decision={"ranked": ["test-model"]},
+        )
+        upstream = httpx.Response(status, headers={"content-type": "text/event-stream"})
+        return upstream, _body(), result, _cleanup
+
+    monkeypatch.setattr(app.state.router, "route_and_forward", _rf)
+
+    captured: dict = {}
+
+    def _spy_emit(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(app_mod, "emit_chat_completion", _spy_emit)
+    return app, captured
+
+
+async def test_streaming_outcome_success_on_clean_done(tmp_path, monkeypatch):
+    """A stream that ends with [DONE] records outcome='success'."""
+    app, captured = _stream_app_emitting(
+        tmp_path, monkeypatch,
+        [b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n', b"data: [DONE]\n\n"],
+    )
+    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
+        resp = await http.post(
+            "/v1/chat/completions",
+            json={"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        )
+        assert resp.status_code == 200
+        _ = resp.content  # drain
+    assert captured.get("outcome") == "success"
+
+
+async def test_streaming_outcome_incomplete_when_no_terminal_marker(tmp_path, monkeypatch):
+    """A 200 stream that ends WITHOUT [DONE]/finish_reason records
+    'stream_incomplete', not 'success' — the silent-hangup fix."""
+    app, captured = _stream_app_emitting(
+        tmp_path, monkeypatch,
+        [b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'],
+    )
+    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
+        resp = await http.post(
+            "/v1/chat/completions",
+            json={"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        )
+        assert resp.status_code == 200
+        _ = resp.content  # drain
+    assert captured.get("outcome") == "stream_incomplete"
+
+
+async def test_streaming_captures_ttft_when_chunks_flow(tmp_path, monkeypatch):
+    """A streaming response records a non-None time-to-first-token (ns)."""
+    app, captured = _stream_app_emitting(
+        tmp_path, monkeypatch,
+        [b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n', b"data: [DONE]\n\n"],
+    )
+    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
+        resp = await http.post(
+            "/v1/chat/completions",
+            json={"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        )
+        assert resp.status_code == 200
+        _ = resp.content  # drain
+    assert captured.get("ttft_ns") is not None
+    assert captured["ttft_ns"] >= 0
+
+
+async def test_streaming_ttft_none_when_no_chunks(tmp_path, monkeypatch):
+    """An empty stream (zero chunks) records ttft_ns=None — no first token to time."""
+    app, captured = _stream_app_emitting(tmp_path, monkeypatch, [])
+    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
+        resp = await http.post(
+            "/v1/chat/completions",
+            json={"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        )
+        assert resp.status_code == 200
+        _ = resp.content  # drain
+    assert captured.get("ttft_ns") is None

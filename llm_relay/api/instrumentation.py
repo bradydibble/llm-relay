@@ -6,6 +6,7 @@ the request path never blocks on it, and an exporter failure is silent.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -75,6 +76,52 @@ def _init_tracer() -> Any:
     return _TRACER
 
 
+def _classify_stream_outcome(status: int, exc: BaseException | None, finished: bool) -> str:
+    """Outcome label for a streamed response, based on how it ACTUALLY terminated.
+
+    Priority (first match wins):
+      - error HTTP status (>=400) -> ``upstream_error``: the response itself was an
+        error regardless of how its body drained (e.g. the all-retryable-5xx stream
+        the spill path returns, which has no ``[DONE]``).
+      - client cancellation (``CancelledError``/``GeneratorExit``) ->
+        ``client_disconnect``: the client hung up mid-stream — not the backend's
+        fault, so it must not count against backend reliability.
+      - any other exception -> ``stream_error``: the backend dropped mid-stream.
+      - clean finish (``[DONE]`` or a non-null ``finish_reason`` was seen) ->
+        ``success``.
+      - otherwise -> ``stream_incomplete``: ended early with no terminal marker
+        (the silent hangup that was previously mislabeled ``success``).
+    """
+    if status >= 400:
+        return "upstream_error"
+    if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+        return "client_disconnect"
+    if exc is not None:
+        return "stream_error"
+    return "success" if finished else "stream_incomplete"
+
+
+def sse_finished(raw: bytes) -> bool:
+    """True if the SSE stream terminated cleanly — a ``[DONE]`` sentinel or a
+    non-null ``finish_reason`` on any choice was seen. False means the stream was
+    cut off before any terminal marker (a truncated / aborted generation)."""
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        s = line.strip()
+        if not s.startswith("data:"):
+            continue
+        payload = s[5:].strip()
+        if payload == "[DONE]":
+            return True
+        try:
+            j = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        for ch in j.get("choices") or []:
+            if ch.get("finish_reason") is not None:
+                return True
+    return False
+
+
 def reassemble_sse(raw: bytes) -> tuple[str, dict]:
     """Reassemble llama.cpp SSE chat-completion stream into (text, usage).
 
@@ -138,6 +185,7 @@ def emit_chat_completion(
     outcome: str = "success",
     client: str | None = None,
     fell_back: bool = False,
+    ttft_ns: int | None = None,
 ) -> None:
     """Emit telemetry for one chat completion: Prometheus metrics (always) and,
     when LLM_RELAY_TELEMETRY is enabled, an OpenInference span. Best-effort;
@@ -155,6 +203,7 @@ def emit_chat_completion(
             response_body=response_body,
             duration_s=duration_s,
             fell_back=fell_back,
+            ttft_s=(ttft_ns / 1e9) if ttft_ns is not None else None,
         )
     except Exception as e:
         print(f"[llm-relay] metrics record failed (ignored): {e}", file=sys.stderr)
@@ -166,10 +215,13 @@ def emit_chat_completion(
         span = tracer.start_span("chat_completion", start_time=start_ns)
         try:
             span.set_attribute("openinference.span.kind", "LLM")
+            span.set_attribute("llm.relay.outcome", outcome)
             if model_resolved:
                 span.set_attribute("llm.model_name", model_resolved)
             if provider_name:
                 span.set_attribute("llm.provider", provider_name)
+            if ttft_ns is not None:
+                span.set_attribute("llm.latency.time_to_first_token_seconds", ttft_ns / 1e9)
 
             invocation = {
                 k: v for k, v in request_body.items()
