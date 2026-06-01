@@ -33,7 +33,6 @@ class ChainCandidate:
 class RoutingContext:
     requested_model: str
     privacy: Privacy = Privacy.local_only
-    weights: dict[str, float] = field(default_factory=dict)
     require_tools: bool = False
     min_context: int | None = None
     resolved_model: str | None = None
@@ -72,7 +71,7 @@ class ModelSelector:
         if ordered:
             ranked = list(filtered)
         else:
-            ranked = self._rank(ctx, filtered)
+            ranked = self._rank(filtered)
         # Load-aware re-sort: prefer least-loaded backend, break ties on the
         # original priority order. Targets TTFT/TPS — even one in-flight slot
         # on the priority backend can add multi-second slot-wait latency, so
@@ -206,30 +205,19 @@ class ModelSelector:
             out.append(name)
         return out
 
-    def _rank(self, ctx: RoutingContext, candidates: list[str]) -> list[str]:
-        w = ctx.weights or {
-            "quality": self.config.policy.ranking.quality,
-            "latency": self.config.policy.ranking.latency,
-            "cost": self.config.policy.ranking.cost,
-            "availability": self.config.policy.ranking.availability,
-        }
-        scored: list[tuple[str, float]] = []
-        for name in candidates:
-            cfg = self.config.models.models.get(name)
-            if not cfg:
-                continue
-            q = cfg.preference * w.get("quality", 0.4)
-            latency = (0.9 if "local" in cfg.tags else 0.5) * w.get("latency", 0.3)
-            cost = (1.0 if "local" in cfg.tags else 0.3) * w.get("cost", 0.1)
-            status = self.discovery.get_model_state(name)
-            av = {
-                ModelStatus.available: 1.0,
-                ModelStatus.degraded: 0.5,
-                ModelStatus.unavailable: 0.0,
-            }.get(status, 0.0) * w.get("availability", 0.2)
-            scored.append((name, q + latency + cost + av))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return [s[0] for s in scored]
+    def _rank(self, candidates: list[str]) -> list[str]:
+        """Deterministic preference sort for the unknown-model branch.
+
+        Orders by configured ``preference`` (descending), breaking ties on name
+        (ascending) -- the same ordering MCP ``select_for_capability`` returns,
+        so the two discovery surfaces never disagree. Candidates without a
+        config entry are skipped (their preference is unknown), preserving the
+        prior behaviour.
+        """
+        models = self.config.models.models
+        configured = [name for name in candidates if name in models]
+        configured.sort(key=lambda name: (-(models[name].preference or 0.0), name))
+        return configured
 
     def get_fallback_chain(self, model_name: str) -> list[str]:
         for chain in self.config.policy.fallback.graph.values():

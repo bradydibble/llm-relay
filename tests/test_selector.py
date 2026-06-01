@@ -401,3 +401,27 @@ def test_qualified_id_mismatched_provider_does_not_resolve():
         RoutingContext(requested_model="wrong-prov:qwen3.5-9b")
     )
     assert ordered is False and candidates == [], "mismatched provider must not resolve to a concrete model"
+
+
+# ---------------------------------------------------------------------------
+# Deterministic preference ranking (unknown-model branch). The weighted engine
+# (quality/latency/cost/availability + per-request X-Llm-Relay-Weights) is gone;
+# ordering is now preference desc, then name asc -- identical to MCP's
+# select_for_capability, so the two discovery surfaces never disagree.
+# ---------------------------------------------------------------------------
+
+def test_rank_sorts_by_preference_then_name_only(tmp_path):
+    """A non-local, higher-preference model must rank ahead of a local
+    lower-preference one. Under the old weighted _rank the local model's
+    latency/cost boost flipped this; pure preference ordering must not."""
+    (tmp_path / "models.yaml").write_text(
+        "models:\n"
+        "  alpha:\n    provider: p\n    preference: 0.3\n    tags: [local]\n"
+        "  bravo:\n    provider: p\n    preference: 0.9\n    tags: []\n"
+        "  zeta:\n    provider: p\n    preference: 0.9\n    tags: [local]\n"
+    )
+    c = ConfigLoader(config_dir=tmp_path)
+    c.load()
+    sel = ModelSelector(c, DiscoveryManager())
+    # Input order scrambled; expect preference desc, ties broken by name asc.
+    assert sel._rank(["zeta", "alpha", "bravo"]) == ["bravo", "zeta", "alpha"]

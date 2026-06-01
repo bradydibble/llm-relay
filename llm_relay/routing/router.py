@@ -201,17 +201,6 @@ class RequestRouter:
         privacy_str = headers.get("X-Llm-Relay-Privacy", "local_only")
         privacy = Privacy(privacy_str if privacy_str in ("local_only", "cloud_ok") else "local_only")
 
-        weights: dict[str, float] = {}
-        weights_str = headers.get("X-Llm-Relay-Weights", "")
-        if weights_str:
-            for pair in weights_str.split(","):
-                if "=" in pair:
-                    k, v = pair.split("=", 1)
-                    try:
-                        weights[k.strip()] = float(v.strip())
-                    except ValueError:
-                        pass
-
         # Context-aware routing: an explicit X-Llm-Relay-Min-Context header is a
         # floor the caller asserts; we also estimate the request's own context
         # need from its body and take the larger. The selector drops candidates
@@ -222,7 +211,6 @@ class RequestRouter:
         ctx = RoutingContext(
             requested_model=request_data.get("model", "") or "",
             privacy=privacy,
-            weights=weights,
             require_tools=headers.get("X-Llm-Relay-Require-Tools", "false").lower() == "true",
             min_context=max(explicit_min, estimated_min) or None,
         )

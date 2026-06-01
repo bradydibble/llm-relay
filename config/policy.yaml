@@ -4,13 +4,6 @@
 # policy by setting LLM_RELAY_CONFIG_DIR.
 
 policy:
-  # Ranking weights for model selection (unordered candidates only).
-  ranking:
-    quality: 0.4
-    latency: 0.3
-    cost: 0.1
-    availability: 0.2
-
   # Hard constraints.
   constraints:
     privacy:

@@ -425,7 +425,6 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
         hint_headers: dict[str, str] = {}
         for key in (
             "X-Llm-Relay-Privacy",
-            "X-Llm-Relay-Weights",
             "X-Llm-Relay-Require-Tools",
             "X-Llm-Relay-Min-Context",
         ):

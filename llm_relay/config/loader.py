@@ -17,7 +17,6 @@ from .types import (
     Privacy,
     ProviderConfig,
     ProviderType,
-    RankingWeights,
 )
 
 
@@ -129,17 +128,10 @@ class ConfigLoader:
         with open(path) as f:
             data = yaml.safe_load(f) or {}
         policy_data = data.get("policy") or {}
-        ranking = policy_data.get("ranking") or {}
         constraints = policy_data.get("constraints") or {}
         priv = constraints.get("privacy") or {}
         fallback = policy_data.get("fallback") or {}
         self._policy = PolicyConfig(
-            ranking=RankingWeights(
-                quality=ranking.get("quality", 0.4),
-                latency=ranking.get("latency", 0.3),
-                cost=ranking.get("cost", 0.1),
-                availability=ranking.get("availability", 0.2),
-            ),
             constraints=PrivacyConstraints(
                 default=Privacy(priv.get("default", "local_only")),
                 cloud_allowed_tags=priv.get("cloud_allowed_tags", []) or [],

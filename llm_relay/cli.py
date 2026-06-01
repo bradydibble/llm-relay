@@ -101,7 +101,7 @@ def cmd_route(args: argparse.Namespace) -> int:
     )
     candidates, ordered = selector._build_candidates(ctx)
     filtered = selector._apply_constraints(ctx, candidates)
-    ranked = list(filtered) if ordered else selector._rank(ctx, filtered)
+    ranked = list(filtered) if ordered else selector._rank(filtered)
     console.print(f"[bold]Routing simulation (no live availability):[/bold]")
     console.print(f"  requested: {args.model}")
     console.print(f"  candidates: {', '.join(candidates) or '(none)'}")

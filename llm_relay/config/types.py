@@ -74,14 +74,6 @@ class ModeConfig:
 
 
 @dataclass
-class RankingWeights:
-    quality: float = 0.4
-    latency: float = 0.3
-    cost: float = 0.1
-    availability: float = 0.2
-
-
-@dataclass
 class PrivacyConstraints:
     default: Privacy = Privacy.local_only
     cloud_allowed_tags: list[str] = field(default_factory=list)
@@ -109,7 +101,6 @@ class ModeHint:
 
 @dataclass
 class PolicyConfig:
-    ranking: RankingWeights = field(default_factory=RankingWeights)
     constraints: PrivacyConstraints = field(default_factory=PrivacyConstraints)
     fallback: FallbackGraph = field(default_factory=FallbackGraph)
     explicit: ExplicitBehavior = field(default_factory=ExplicitBehavior)

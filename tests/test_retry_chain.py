@@ -716,8 +716,12 @@ def _make_ctx_app(tmp_path: Path):
         "models": {
             "model-small": {"provider": "local-llm", "port": 8080, "context_window": 8192, "privacy": "local_only"},
             "model-big": {"provider": "local-llm", "port": 8081, "context_window": 200000, "privacy": "local_only"},
+            # aliases nest UNDER models -- the loader reads data["models"]["aliases"]
+            # (ConfigLoader._load_models). A top-level sibling is silently ignored,
+            # which would drop 'main' to the unknown-model branch instead of an
+            # ordered alias.
+            "aliases": {"main": ["model-small", "model-big"]},
         },
-        "aliases": {"main": ["model-small", "model-big"]},
     }))
     (cfg_dir / "policy.yaml").write_text(yaml.safe_dump({
         "policy": {"fallback": {"retry_on": ["502", "503", "504", "connection_error"]}}
