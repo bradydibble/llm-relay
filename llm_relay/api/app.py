@@ -293,7 +293,12 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
         }
 
     @app.get("/available-models")
-    async def available_models(request: Request) -> dict[str, Any]:
+    async def available_models(request: Request, response: Response) -> dict[str, Any]:
+        # Deprecated alias of /v1/available-models (the canonical, OpenAI-namespaced
+        # path MCP and clients use). Kept working so no caller breaks; RFC 8594
+        # headers point them at the successor.
+        response.headers["Deprecation"] = "true"
+        response.headers["Link"] = '</v1/available-models>; rel="successor-version"'
         return await _available(request)
 
     @app.get("/v1/available-models")

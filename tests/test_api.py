@@ -240,3 +240,21 @@ async def test_v1_models_card_route_handles_colon_in_path():
     assert ok.status_code == 200
     assert ok.json()["id"] == "local-llm:qwen3.5-9b"
     assert bad.status_code == 404
+
+
+async def test_available_models_legacy_path_is_deprecated_alias():
+    """`/available-models` is a deprecated alias of the canonical, OpenAI-namespaced
+    `/v1/available-models`. It must still return the identical payload (no client
+    breaks) but carry RFC 8594 deprecation headers pointing at the successor; the
+    canonical path carries no such header."""
+    app = create_app(config_dir=CONFIG_DIR)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        legacy = await client.get("/available-models")
+        canonical = await client.get("/v1/available-models")
+    assert legacy.status_code == 200 and canonical.status_code == 200
+    assert legacy.json() == canonical.json(), "deprecated alias must return the identical payload"
+    assert legacy.headers.get("Deprecation") == "true"
+    assert "/v1/available-models" in legacy.headers.get("Link", "")
+    assert "Deprecation" not in canonical.headers, "canonical path must not be marked deprecated"
