@@ -163,7 +163,16 @@ class ModelSelector:
         """Return (candidates, ordered). When ordered=True, list order is the priority."""
         req = ctx.requested_model
         if self.is_alias(req):
-            return self.resolve_alias(req), True
+            # Open-by-default: an alias is a PRIORITY ORDER over the whole live
+            # fleet, not a whitelist. Named members are the priority prefix; every
+            # other live model follows as a preference-ranked tail, so the alias
+            # degrades to anything live rather than dead-ending when its members
+            # are down. Context / privacy / reasoning-floor filters run downstream
+            # in _apply_constraints, so the tail only yields a model that can serve.
+            # Fallthrough is for aliases only — explicit / host-pinned requests
+            # (below) stay deliberately specific.
+            members = self.resolve_alias(req)
+            return members + self._fleet_tail(members), True
         # Normalize a host-qualified 'provider:model' id to its bare config name
         # (the provider is validated against the model's configured provider).
         # A bare name or unknown id passes through unchanged.
@@ -218,6 +227,19 @@ class ModelSelector:
         configured = [name for name in candidates if name in models]
         configured.sort(key=lambda name: (-(models[name].preference or 0.0), name))
         return configured
+
+    def _fleet_tail(self, exclude: list[str]) -> list[str]:
+        """The open-by-default fallthrough tail: every live model NOT already named
+        in ``exclude``, preference-ranked.
+
+        Sourced from discovery (the live fleet) — the same surface the unknown-model
+        branch uses — so an alias degrades to whatever is currently up. Availability,
+        context-fit, privacy and the reasoning floor are all enforced later in
+        ``_apply_constraints`` / selection, so this only widens the candidate set; it
+        never admits a model that cannot actually serve the request.
+        """
+        excluded = set(exclude)
+        return self._rank([m for m in self.discovery.get_available_models() if m not in excluded])
 
     def get_fallback_chain(self, model_name: str) -> list[str]:
         for chain in self.config.policy.fallback.graph.values():

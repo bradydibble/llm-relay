@@ -425,3 +425,71 @@ def test_rank_sorts_by_preference_then_name_only(tmp_path):
     sel = ModelSelector(c, DiscoveryManager())
     # Input order scrambled; expect preference desc, ties broken by name asc.
     assert sel._rank(["zeta", "alpha", "bravo"]) == ["bravo", "zeta", "alpha"]
+
+
+# ---------------------------------------------------------------------------
+# Open-by-default: an alias is a PRIORITY ORDER over the whole live fleet, not a
+# whitelist. When its named members are unavailable, the request falls through to
+# any other live model (preference-ranked) instead of dead-ending at the list.
+# The named members stay the priority prefix; the live fleet is the tail. Context
+# / privacy / reasoning-floor filters still run downstream, so the tail only ever
+# yields a model that can actually serve.
+# ---------------------------------------------------------------------------
+
+def _disc_serving(*models: str):
+    """A DiscoveryManager with one healthy backend per model name, each mapped and
+    reporting only that model. Registered under arbitrary keys (not the composed
+    backend key), so load-ratio lookups miss and score 0.0 (idle) — selection is
+    then driven purely by priority/preference, not load."""
+    disc = DiscoveryManager()
+    for m in models:
+        state = EndpointState(provider="local-llm", status=EndpointStatus.healthy, models=[m])
+        disc.clients[f"k::{m}"] = EndpointClient(provider_name="local-llm", base_url="x", state=state)
+        disc.model_to_client[m] = f"k::{m}"
+    return disc
+
+
+def test_alias_falls_through_to_live_model_outside_its_list():
+    """subagent = [qwen3.5-9b, qwen3.5-35b]; both DOWN, but trinity-mini (NOT a
+    member) is live -> the request must route to trinity-mini, not return None.
+    This is the open-by-default principle: never dead-end while something's live."""
+    c = _load()
+    disc = _disc_serving("trinity-mini")  # neither subagent member is live
+    sel = ModelSelector(c, disc)
+    pick = sel.select_best(RoutingContext(requested_model="subagent"))
+    assert pick == "trinity-mini", "alias must fall through to the live fleet, not dead-end at its list"
+
+
+def test_fleet_tail_is_preference_ranked():
+    """All named members down; multiple non-members live -> the higher-preference
+    one wins the fallthrough. trinity-mini (pref 0.6) vs llama-3.3-70b (pref 0.9)
+    -> llama wins."""
+    c = _load()
+    disc = _disc_serving("trinity-mini", "llama-3.3-70b")
+    sel = ModelSelector(c, disc)
+    pick = sel.select_best(RoutingContext(requested_model="subagent"))
+    assert pick == "llama-3.3-70b", "fallthrough tail must be ranked by preference desc"
+
+
+def test_named_members_take_priority_over_fleet_tail_when_idle():
+    """A live NAMED member beats a higher-preference non-member tail model when
+    neither is under load: the named list is the priority prefix, the fleet is the
+    tail. subagent's qwen3.5-9b (pref 0.7) live + deepseek-r1-70b (pref 0.95, not a
+    member) live -> 9b still wins. Guards against ranking the whole set by preference
+    (which would wrongly promote deepseek)."""
+    c = _load()
+    disc = _disc_serving("qwen3.5-9b", "deepseek-r1-70b")
+    sel = ModelSelector(c, disc)
+    pick = sel.select_best(RoutingContext(requested_model="subagent"))
+    assert pick == "qwen3.5-9b", "named members are the priority prefix; the tail follows them"
+
+
+def test_explicit_model_does_not_fall_through_to_fleet():
+    """Fallthrough is for ALIASES (the use-case front door), NOT explicit/host-pinned
+    requests — that tier is deliberately specific. A strict explicit request for a
+    DOWN model must still yield no candidate even when other models are live."""
+    c = _load()  # explicit.strict is True in the test policy
+    disc = _disc_serving("trinity-mini")  # the requested model is not live; trinity is
+    sel = ModelSelector(c, disc)
+    pick = sel.select_best(RoutingContext(requested_model="qwen3.5-9b"))
+    assert pick is None, "explicit/strict requests must not fall through to the fleet"
