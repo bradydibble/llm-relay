@@ -557,6 +557,26 @@ def test_alias_falls_through_to_live_model_outside_its_list():
     assert pick == "trinity-mini", "alias must fall through to the live fleet, not dead-end at its list"
 
 
+def test_fleet_tail_includes_gguf_reported_backends():
+    """The open-fallthrough tail must include heterogeneous (llama.cpp / GGUF)
+    backends that report a filename id, not the config name. trinity-mini's backend
+    reports 'Trinity-Mini-UD-Q4_K_XL.gguf' (fuzzy-matched via get_model_state);
+    subagent's members are down -> the request must still fall through to it.
+    Regression guard: enumerating raw backend-reported ids drops it (the GGUF id
+    isn't a config key), silently excluding every GGUF backend from the tail."""
+    c = _load()
+    disc = DiscoveryManager()
+    state = EndpointState(
+        provider="local-llm", status=EndpointStatus.healthy,
+        models=["Trinity-Mini-UD-Q4_K_XL.gguf"],  # GGUF filename, not the config name
+    )
+    disc.clients["k::trinity"] = EndpointClient(provider_name="local-llm", base_url="x", state=state)
+    disc.model_to_client["trinity-mini"] = "k::trinity"
+    sel = ModelSelector(c, disc)
+    assert sel.select_best(RoutingContext(requested_model="subagent")) == "trinity-mini", \
+        "fallthrough tail must include GGUF-reported backends (matched to config name via get_model_state)"
+
+
 def test_fleet_tail_is_preference_ranked():
     """All named members down; multiple non-members live -> the higher-preference
     one wins the fallthrough. trinity-mini (pref 0.6) vs llama-3.3-70b (pref 0.9)

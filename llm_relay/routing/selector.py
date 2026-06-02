@@ -263,17 +263,24 @@ class ModelSelector:
         return configured
 
     def _fleet_tail(self, exclude: list[str]) -> list[str]:
-        """The open-by-default fallthrough tail: every live model NOT already named
-        in ``exclude``, preference-ranked.
+        """The open-by-default fallthrough tail: every CONFIGURED model that is
+        currently available and NOT already named in ``exclude``, preference-ranked.
 
-        Sourced from discovery (the live fleet) — the same surface the unknown-model
-        branch uses — so an alias degrades to whatever is currently up. Availability,
-        context-fit, privacy and the reasoning floor are all enforced later in
+        Enumerates config models and resolves availability via
+        ``discovery.get_model_state`` — which fuzzy-matches a backend's reported id
+        (e.g. a llama.cpp GGUF filename) back to the config name. Enumerating the raw
+        backend-reported ids instead would silently drop every heterogeneous
+        (GGUF-reporting) backend from the tail, since those ids are not config keys.
+        Context-fit, privacy and the reasoning floor are still enforced later in
         ``_apply_constraints`` / selection, so this only widens the candidate set; it
         never admits a model that cannot actually serve the request.
         """
         excluded = set(exclude)
-        return self._rank([m for m in self.discovery.get_available_models() if m not in excluded])
+        live = [
+            name for name in self.config.models.models
+            if name not in excluded and _is_available(self.discovery.get_model_state(name))
+        ]
+        return self._rank(live)
 
     def _category_floor(self, requested: str) -> float | None:
         """The reasoning floor (min preference) for `requested` when it names a
