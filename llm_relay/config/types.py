@@ -63,6 +63,20 @@ class ModelConfig:
     tags: list[str] = field(default_factory=list)
     preference: float = 0.5
     privacy: Privacy = Privacy.local_only
+    # Use-case (category) membership as {use_case: priority}. Model-major config:
+    # the loader transposes these into the alias map at load time
+    # (aliases[uc] = models tagged uc, sorted by priority desc, then preference,
+    # then name). Higher priority = preferred earlier in that category's chain.
+    use_cases: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class CategoryConfig:
+    """Per-use-case (category) metadata, keyed by category name under
+    ``models.categories``. ``reasoning_floor`` is the opt-in quality gate: a
+    minimum ``preference`` a model must clear to serve this category. ``None``
+    (the default) means open — any live model in priority order may serve it."""
+    reasoning_floor: float | None = None
 
 
 @dataclass

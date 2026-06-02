@@ -1,11 +1,13 @@
 """YAML configuration loader for llm-relay."""
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import yaml
 
 from .types import (
+    CategoryConfig,
     CircuitBreaker,
     ExplicitBehavior,
     FallbackGraph,
@@ -18,6 +20,8 @@ from .types import (
     ProviderConfig,
     ProviderType,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_duration(s) -> int:
@@ -39,6 +43,7 @@ class ModelRegistry:
     def __init__(self):
         self.models: dict[str, ModelConfig] = {}
         self.aliases: dict[str, list[str]] = {}
+        self.categories: dict[str, CategoryConfig] = {}
 
 
 class ConfigLoader:
@@ -92,6 +97,12 @@ class ConfigLoader:
                 for alias_name, members in (cfg or {}).items():
                     self._models.aliases[alias_name] = list(members)
                 continue
+            if name == "categories":
+                for cat_name, meta in (cfg or {}).items():
+                    self._models.categories[cat_name] = CategoryConfig(
+                        reasoning_floor=(meta or {}).get("reasoning_floor"),
+                    )
+                continue
             self._models.models[name] = ModelConfig(
                 provider=cfg["provider"],
                 class_name=cfg.get("class", "unknown"),
@@ -104,7 +115,38 @@ class ConfigLoader:
                 tags=cfg.get("tags", []) or [],
                 preference=cfg.get("preference", 0.5),
                 privacy=Privacy(cfg.get("privacy", "local_only")),
+                use_cases={k: float(v) for k, v in (cfg.get("use_cases") or {}).items()},
             )
+        self._derive_aliases_from_use_cases()
+
+    def _derive_aliases_from_use_cases(self) -> None:
+        """Transpose per-model ``use_cases`` tags into the alias map: for each
+        use-case, ``aliases[uc] = models tagged uc, sorted by (uc-priority desc,
+        preference desc, name asc)`` — the same ordering the selector and MCP
+        ``select_for_capability`` use, so the surfaces never disagree.
+
+        Explicit ``models.aliases`` entries win on conflict (a deprecation shim so
+        a live list-form config keeps working) and emit a warning, so migrating to
+        tags is just deleting the explicit list.
+        """
+        derived: dict[str, list[str]] = {}
+        for mname, mcfg in self._models.models.items():
+            for uc in mcfg.use_cases:
+                derived.setdefault(uc, []).append(mname)
+        for uc, names in derived.items():
+            names.sort(key=lambda n: (
+                -(self._models.models[n].use_cases.get(uc) or 0.0),
+                -(self._models.models[n].preference or 0.0),
+                n,
+            ))
+            if uc in self._models.aliases:
+                logger.warning(
+                    "use-case %r is defined both explicitly under models.aliases and via "
+                    "per-model use_cases tags; the explicit list wins. Remove the explicit "
+                    "alias to activate the tag-derived list.", uc,
+                )
+                continue
+            self._models.aliases[uc] = names
 
     def _load_modes(self) -> None:
         path = self.config_dir / "modes.yaml"

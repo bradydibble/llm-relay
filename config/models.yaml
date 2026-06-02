@@ -1,8 +1,21 @@
 # LLM Relay models (TEMPLATE — committed defaults)
 #
-# Each model declares which provider+port serves it. Discovery polls each
+# Each model declares which provider+port serves it, plus the use-cases
+# (categories) it serves and at what priority. Discovery polls each
 # (provider, port) combination independently — when llm-mode switches modes,
 # llm-relay sees the change on the next poll without restart.
+#
+# MODEL-MAJOR CONFIG: a category (alias) is NOT a static list — it is DERIVED at
+# load from the per-model `use_cases: {category: priority}` tags. The loader builds
+# `aliases[category] = models tagged with it, ordered by priority desc, then
+# preference desc, then name`. To add / retire / re-rank a model for a category,
+# edit that one model's `use_cases` — there is no scattered list to keep in sync.
+#
+# Categories are PRIORITY ORDERS over the whole live fleet, not whitelists: at
+# request time the selector prefers the tagged models in order, then falls through
+# to any other live model that fits, so a request is served whenever ANYTHING live
+# can hold it (context permitting). Opt into a quality gate per category with
+# `categories.<name>.reasoning_floor` (a minimum preference); off by default.
 #
 # This file is a generic example. To override with your own model registry,
 # set LLM_RELAY_CONFIG_DIR to a private config dir.
@@ -17,6 +30,7 @@ models:
     capabilities: [tool_use, structured_output]
     tags: [local, fast]
     preference: 0.7
+    use_cases: {subagent: 2, code_fast: 2, fast: 1, subagent-64k: 1, main: 1, code_medium: 1}
 
   qwen3.5-35b:
     provider: local-llm
@@ -27,6 +41,7 @@ models:
     capabilities: [tool_use, structured_output, long_context]
     tags: [local, medium-speed]
     preference: 0.9
+    use_cases: {main: 4, high-quality: 3, long-context: 2, code_medium: 2, subagent-64k: 2, reasoning: 1, subagent: 1, code_fast: 1, code_heavy: 1}
 
   qwen3.5-9b-64k:
     provider: local-llm
@@ -37,6 +52,7 @@ models:
     capabilities: [tool_use, structured_output]
     tags: [local, subagent, long-context]
     preference: 0.75
+    use_cases: {subagent-64k: 3, long-context: 1}
 
   trinity-mini:
     provider: local-llm
@@ -47,6 +63,8 @@ models:
     capabilities: [tool_use]
     tags: [local, on-demand]
     preference: 0.6
+    # No use_cases: not a member of any category. Still reachable via open
+    # fallthrough (when it is the only thing live) and by explicit name.
 
   deepseek-r1-70b:
     provider: local-llm
@@ -57,6 +75,7 @@ models:
     capabilities: [tool_use, structured_output, reasoning]
     tags: [local, slow, high-quality, reasoning]
     preference: 0.95
+    use_cases: {code_heavy: 3, main: 3, reasoning: 2, high-quality: 2}
 
   llama-3.3-70b:
     provider: local-llm
@@ -67,8 +86,11 @@ models:
     capabilities: [tool_use, structured_output]
     tags: [local, slow, high-quality]
     preference: 0.9
+    use_cases: {main: 2, code_heavy: 2, high-quality: 1}
 
-  # Cloud (disabled unless privacy: cloud_ok)
+  # Cloud (disabled unless privacy: cloud_ok). No use_cases here — cloud is a
+  # last-resort the fallback graph (policy.yaml) appends; tag it into a category
+  # only if you want it in that category's normal priority order.
   claude-3-5-sonnet:
     provider: anthropic
     class: cloud-anthropic
@@ -87,16 +109,16 @@ models:
     preference: 0.7
     privacy: cloud_ok
 
-  # Aliases — ordered priority lists. The selector resolves to the first
-  # ranked-and-available candidate at request time.
-  aliases:
-    main:           [qwen3.5-35b, deepseek-r1-70b, llama-3.3-70b, qwen3.5-9b]
-    subagent:       [qwen3.5-9b, qwen3.5-35b]
-    subagent-64k:   [qwen3.5-9b-64k, qwen3.5-35b, qwen3.5-9b]
-    fast:           [qwen3.5-9b]
-    high-quality:   [qwen3.5-35b, deepseek-r1-70b, llama-3.3-70b]
-    long-context:   [qwen3.5-35b, qwen3.5-9b-64k]
-    reasoning:      [deepseek-r1-70b, qwen3.5-35b]
-    code_fast:      [qwen3.5-9b, qwen3.5-35b]
-    code_medium:    [qwen3.5-35b, qwen3.5-9b]
-    code_heavy:     [deepseek-r1-70b, llama-3.3-70b, qwen3.5-35b]
+  # Optional per-category metadata. `reasoning_floor` is the opt-in quality gate:
+  # a minimum `preference` a model must clear to serve the category — refuse (or
+  # fall to the next category member) rather than serve below the bar. Off by
+  # default; omit for open routing. Example (commented out):
+  # categories:
+  #   reasoning:
+  #     reasoning_floor: 0.9    # only deepseek-r1-70b (0.95) qualifies
+  #   high-quality:
+  #     reasoning_floor: 0.85
+
+  # Categories are DERIVED from the per-model `use_cases` tags above. An explicit
+  # `aliases:` block still works as a deprecated override (it wins per-category and
+  # logs a warning at load), but the tag form is the supported way.

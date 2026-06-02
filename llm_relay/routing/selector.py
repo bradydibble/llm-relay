@@ -35,6 +35,10 @@ class RoutingContext:
     privacy: Privacy = Privacy.local_only
     require_tools: bool = False
     min_context: int | None = None
+    # Minimum model `preference` admissible for this request — the reasoning floor
+    # (the opt-in quality gate). None = open (no floor). When the request is an
+    # alias whose category declares a reasoning_floor, _prepare_ranked fills this in.
+    min_preference: float | None = None
     resolved_model: str | None = None
     candidates: list[str] = field(default_factory=list)
     filtered: list[str] = field(default_factory=list)
@@ -63,6 +67,10 @@ class ModelSelector:
         """
         candidates, ordered = self._build_candidates(ctx)
         ctx.candidates = candidates
+        # Apply the category's reasoning floor (opt-in quality gate) if the request
+        # is an aliased category that declares one. None = open (no floor).
+        if ctx.min_preference is None:
+            ctx.min_preference = self._category_floor(ctx.requested_model)
         filtered = self._apply_constraints(ctx, candidates)
         ctx.filtered = filtered
         if not filtered:
@@ -206,6 +214,11 @@ class ModelSelector:
                 continue
             if ctx.require_tools and "tool_use" not in cfg.capabilities:
                 continue
+            # Reasoning floor (opt-in quality gate): drop models whose preference is
+            # below the requested category's floor. Applies to named members AND the
+            # open-fallthrough tail, so a floored category never serves below the bar.
+            if ctx.min_preference is not None and (cfg.preference or 0.0) < ctx.min_preference:
+                continue
             # Filter on the LIVE context window when a backend reports one, so
             # routing never admits a request larger than what /v1/models
             # advertised (which is also live-preferred). Fall back to the static
@@ -244,6 +257,12 @@ class ModelSelector:
         """
         excluded = set(exclude)
         return self._rank([m for m in self.discovery.get_available_models() if m not in excluded])
+
+    def _category_floor(self, requested: str) -> float | None:
+        """The reasoning floor (min preference) for `requested` when it names a
+        category that declares one; None otherwise (open). Off by default."""
+        cat = self.config.models.categories.get(requested)
+        return cat.reasoning_floor if cat else None
 
     def _window_of(self, name: str) -> int:
         """Effective context window for `name`: live max_model_len when a backend

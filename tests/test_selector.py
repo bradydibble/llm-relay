@@ -28,6 +28,27 @@ def test_aliases_loaded():
     assert c.models.aliases["subagent"][0] == "qwen3.5-9b"
 
 
+def test_public_config_aliases_match_canonical_lists():
+    """Round-trip guard for the list->tags transpose: the loaded alias map (derived
+    from per-model use_cases) must EXACTLY equal the canonical ordered lists. Passes
+    both before the migration (explicit lists) and after (tag-derived), so it catches
+    a priority-encoding typo during the migration."""
+    c = _load()
+    expected = {
+        "main": ["qwen3.5-35b", "deepseek-r1-70b", "llama-3.3-70b", "qwen3.5-9b"],
+        "subagent": ["qwen3.5-9b", "qwen3.5-35b"],
+        "subagent-64k": ["qwen3.5-9b-64k", "qwen3.5-35b", "qwen3.5-9b"],
+        "fast": ["qwen3.5-9b"],
+        "high-quality": ["qwen3.5-35b", "deepseek-r1-70b", "llama-3.3-70b"],
+        "long-context": ["qwen3.5-35b", "qwen3.5-9b-64k"],
+        "reasoning": ["deepseek-r1-70b", "qwen3.5-35b"],
+        "code_fast": ["qwen3.5-9b", "qwen3.5-35b"],
+        "code_medium": ["qwen3.5-35b", "qwen3.5-9b"],
+        "code_heavy": ["deepseek-r1-70b", "llama-3.3-70b", "qwen3.5-35b"],
+    }
+    assert c.models.aliases == expected
+
+
 def test_models_loaded_with_ports():
     c = _load()
     assert c.models.models["qwen3.5-9b"].port == 8080
@@ -425,6 +446,82 @@ def test_rank_sorts_by_preference_then_name_only(tmp_path):
     sel = ModelSelector(c, DiscoveryManager())
     # Input order scrambled; expect preference desc, ties broken by name asc.
     assert sel._rank(["zeta", "alpha", "bravo"]) == ["bravo", "zeta", "alpha"]
+
+
+# ---------------------------------------------------------------------------
+# Tag transpose: aliases (categories) are DERIVED from per-model use_cases tags
+# at load — `aliases[uc] = models tagged uc, sorted by (uc-priority desc,
+# preference desc, name asc)`. Model-major config: a model's whole story lives in
+# one place. Explicit `aliases:` still works as a deprecation shim (wins on
+# conflict, with a warning).
+# ---------------------------------------------------------------------------
+
+def test_aliases_derived_from_model_use_cases(tmp_path):
+    """A model's `use_cases: {uc: priority}` tags derive the alias map at load:
+    higher uc-priority first, preference desc breaks a priority tie, name asc last."""
+    (tmp_path / "models.yaml").write_text(
+        "models:\n"
+        "  small:\n    provider: p\n    preference: 0.7\n    use_cases: {chat: 1, fast: 5}\n"
+        "  big:\n    provider: p\n    preference: 0.9\n    use_cases: {chat: 5}\n"
+        "  mid:\n    provider: p\n    preference: 0.8\n    use_cases: {chat: 5}\n"
+    )
+    c = ConfigLoader(config_dir=tmp_path)
+    c.load()
+    # chat: big & mid tie on priority 5 -> preference desc (0.9 > 0.8); small priority 1 last.
+    assert c.models.aliases["chat"] == ["big", "mid", "small"]
+    assert c.models.aliases["fast"] == ["small"]
+
+
+def test_explicit_alias_overrides_derived_and_warns(tmp_path, caplog):
+    """An explicit `aliases:` entry wins over the tag-derived one (deprecation
+    shim) and emits a warning so the config can migrate to tags."""
+    import logging
+    (tmp_path / "models.yaml").write_text(
+        "models:\n"
+        "  a:\n    provider: p\n    use_cases: {chat: 1}\n"
+        "  b:\n    provider: p\n    use_cases: {chat: 5}\n"
+        "  aliases:\n    chat: [a]\n"
+    )
+    c = ConfigLoader(config_dir=tmp_path)
+    with caplog.at_level(logging.WARNING):
+        c.load()
+    assert c.models.aliases["chat"] == ["a"], "explicit alias must win over the tag-derived list"
+    assert any("chat" in r.getMessage() for r in caplog.records), "overlap must warn"
+
+
+def test_reasoning_floor_refuses_sub_floor_models(tmp_path):
+    """A category with `reasoning_floor` (opt-in, off by default) only admits models
+    whose preference clears the floor — the quality gate. A sub-floor model is
+    refused even when it's the only thing live (better an honest no-candidate than
+    quality below the bar); a model clearing the floor is selected normally."""
+    (tmp_path / "models.yaml").write_text(
+        "models:\n"
+        "  weak:\n    provider: local-llm\n    port: 8080\n    preference: 0.5\n    use_cases: {smart: 1}\n"
+        "  strong:\n    provider: local-llm\n    port: 8081\n    preference: 0.95\n    use_cases: {smart: 2}\n"
+        "  categories:\n    smart:\n      reasoning_floor: 0.9\n"
+    )
+    c = ConfigLoader(config_dir=tmp_path)
+    c.load()
+    # weak (0.5) is below the 0.9 floor -> excluded even though it's the only live model.
+    sel = ModelSelector(c, _disc_serving("weak"))
+    assert sel.select_best(RoutingContext(requested_model="smart")) is None, "sub-floor model must be refused"
+    # strong (0.95) clears the floor -> selected.
+    sel2 = ModelSelector(c, _disc_serving("strong"))
+    assert sel2.select_best(RoutingContext(requested_model="smart")) == "strong"
+
+
+def test_no_reasoning_floor_is_open_by_default(tmp_path):
+    """Without a reasoning_floor, a category admits any live model in priority order
+    — the floor is strictly opt-in."""
+    (tmp_path / "models.yaml").write_text(
+        "models:\n"
+        "  weak:\n    provider: local-llm\n    port: 8080\n    preference: 0.5\n    use_cases: {smart: 1}\n"
+        "  strong:\n    provider: local-llm\n    port: 8081\n    preference: 0.95\n    use_cases: {smart: 2}\n"
+    )
+    c = ConfigLoader(config_dir=tmp_path)
+    c.load()
+    sel = ModelSelector(c, _disc_serving("weak"))  # only the weak model is live
+    assert sel.select_best(RoutingContext(requested_model="smart")) == "weak", "no floor -> weak still serves"
 
 
 # ---------------------------------------------------------------------------
