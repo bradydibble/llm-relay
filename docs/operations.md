@@ -21,7 +21,8 @@ an issue.
 Example: a new GGUF you've packaged on your LLM host as `example-llm-30b.service`,
 listening on port 8084.
 
-1. **Add the model to `config/models.yaml`** (one entry):
+1. **Add the model to `config/models.yaml`** (one entry — its `use_cases` tags
+   place it in every category at once; there is no separate list to edit):
    ```yaml
    qwen3.5-30b:
      provider: local-llm
@@ -32,12 +33,16 @@ listening on port 8084.
      capabilities: [tool_use, structured_output]
      tags: [local, medium-speed]
      preference: 0.85
+     # Categories this model serves + priority (higher = preferred earlier).
+     use_cases: {main: 3, high-quality: 1, code_medium: 2}
    ```
-2. **(Optional) Add it to an alias** in the same file:
-   ```yaml
-   aliases:
-     main: [qwen3.5-35b, qwen3.5-30b, llama-3.3-70b, qwen3.5-9b]
-   ```
+   The relay derives the category map from these tags at load, so the model is
+   immediately a ranked member of `main`, `high-quality`, and `code_medium` with
+   no separate alias list to keep in sync. (An explicit `aliases:` block still
+   works as a deprecated override.)
+2. **(Optional) Tune priorities or add a quality gate** — adjust the `use_cases`
+   priorities above, or set a `categories.<name>.reasoning_floor` (a minimum
+   `preference`) to refuse models below a quality bar for that category.
 3. **(Optional) Add it to a `llm-mode` profile** in `config/modes.yaml`:
    ```yaml
    modes:
@@ -62,8 +67,10 @@ model on their next `/v1/models` refresh.
 
 ## Remove or rename a model
 
-1. Remove (or rename) the entry in `config/models.yaml`.
-2. Remove any reference in alias lists in the same file.
+1. Remove (or rename) the entry in `config/models.yaml`. Its `use_cases` tags go
+   with it, so it drops from every category automatically — nothing else to edit.
+2. Remove any reference in an explicit `aliases:` block, if you use that
+   deprecated form.
 3. Remove from any mode in `config/modes.yaml` (or leave — `llm-mode` will
    error helpfully if a mode references an unknown model).
 4. Remove from `config/policy.yaml` fallback graphs if present.

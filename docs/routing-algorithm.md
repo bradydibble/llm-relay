@@ -9,35 +9,45 @@ deterministic and rule-based — there is no LLM in the routing path.
 
 ## Step 1 — Build candidates
 
-The `model` field in the incoming request can be one of four things; each
-produces a candidate list, and each tells us whether that list is **ordered**
-(the caller chose the priority) or **unordered** (we have to pick).
+Categories (aliases) are **derived from per-model `use_cases` tags** at load:
+`aliases[category] = models tagged with it, ordered by priority desc, then
+preference desc, then name` (an explicit `aliases:` block still works as a
+deprecated override that wins per-category and logs a warning). The `model` field
+in the incoming request can be one of four things; each produces a candidate list,
+and each tells us whether that list is **ordered** (the caller chose the priority)
+or **unordered** (we have to pick).
 
 | `model` is | Candidate list | Ordered? |
 |---|---|---|
-| An alias (e.g. `subagent`) | The alias's member list | Yes |
+| A category / alias (e.g. `subagent`) | The category's tagged members (priority prefix) **+ every other live model, preference-ranked** (open fallthrough) | Yes |
 | An explicit model (e.g. `qwen3.5-35b`) | `[model] + fallback_graph[model]` | Yes |
 | A fallback-graph key (e.g. `high-quality` not also an alias) | `fallback_graph[key]` | Yes |
 | Unknown | All currently-healthy models | No |
 
+**Open by default — a category is a priority order, not a whitelist.** A category
+request prefers its tagged members in order, then falls through to *any other live
+model* (preference-ranked) that survives the filters. So a category degrades to
+whatever is currently up rather than dead-ending in a 503 when its named members
+are down — the only honest refusal is when *nothing live* can serve the request.
+Fallthrough is for categories only; explicit / host-pinned requests stay strict
+(that tier is deliberately specific).
+
 **Aliases vs the fallback graph — one mental model.** Both express ordered
 fallback, but for different request shapes, with a strict precedence:
 
-1. **Alias** (request a *category*, e.g. `main`): the alias member list is the
-   ordered chain. Aliases always win — if a name is both an alias and a
-   `fallback.graph` key, the alias is used.
-2. **Explicit concrete model** (e.g. `qwen3.5-35b`): the chain is the model
-   itself followed by its `fallback.graph[model]` entry, if any. This is the
-   graph's load-bearing role — a per-model safety net for direct requests that
-   aliases cannot express.
-3. **Bare `fallback.graph` key** that is neither an alias nor a concrete model:
+1. **Category alias** (request a *category*, e.g. `main`): the derived member list
+   plus the open-fallthrough tail is the chain. Categories always win — if a name
+   is both a category and a `fallback.graph` key, the category is used.
+2. **Explicit concrete model** (e.g. `qwen3.5-35b`): the chain is the model itself
+   followed by its `fallback.graph[model]` entry, if any — a per-model safety net
+   for direct requests that categories cannot express. No open fallthrough here.
+3. **Bare `fallback.graph` key** that is neither a category nor a concrete model:
    its graph chain is used directly.
 4. **Unknown name**: discovery-ranked candidates (preference sort).
 
-So curate **categories as aliases** and reserve **`fallback.graph` for
+So curate **categories via `use_cases` tags** and reserve **`fallback.graph` for
 per-concrete-model fallback**. When the same name lives in both, the graph entry
-is reachable only via the explicit-model path (2), never the category path (1) —
-keep the two consistent to avoid surprise.
+is reachable only via the explicit-model path (2), never the category path (1).
 
 ## Step 2 — Filter
 
@@ -49,8 +59,13 @@ entirely:
   `X-Llm-Relay-Privacy: cloud_ok` header.
 - **Tool requirement**: with `X-Llm-Relay-Require-Tools: true`, models without
   `tool_use` in their capabilities are dropped.
-- **Context window**: with `X-Llm-Relay-Min-Context: N`, models whose
-  `context_window < N` are dropped.
+- **Context window**: with `X-Llm-Relay-Min-Context: N` (or the relay's own
+  conservative estimate of the request when no header is sent), models whose
+  **live** `context_window < N` are dropped — see the context-fit contract below.
+- **Reasoning floor** (opt-in, off by default): a category may declare
+  `categories.<name>.reasoning_floor`, a minimum `preference`; models below it are
+  dropped for that category — including the open-fallthrough tail — so a
+  quality-sensitive category refuses rather than serves below the bar.
 
 ## Step 3 — Order
 
@@ -67,10 +82,15 @@ entirely:
 
 ## Step 4 — Select
 
-Walk the ordered (or ranked) list and return the first candidate whose
-discovery state is `available`. Skip `degraded` and `unavailable`. If no
-candidate is currently available, return 503 with the decision trace in the
-error body.
+Walk the ordered (or ranked) list and return the first candidate whose discovery
+state is `available` (or `degraded`). Open fallthrough makes "no candidate" rare —
+it happens only when nothing live survives the filters. When it does, return 503
+with the decision trace in the error body. If the binding constraint was
+**context** (no live model is big enough for the request), the 503 body also
+carries a structured `context` diagnosis distinguishing **`oversize_for_now`** (a
+big-enough model exists in the catalog but is currently down → back off and retry)
+from **`oversize_period`** (nothing in the fleet is big enough → resize or defer),
+with the estimated tokens, the max available now, and the max in catalog.
 
 ## Step 5 — Forward
 
@@ -79,6 +99,23 @@ error body.
 - Rewrite the request body's `model` field to the resolved name (so the
   upstream sees the concrete model id, not the alias).
 - POST. Return the upstream response with a `llm-relay` metadata block added.
+
+## Context-fit contract
+
+The relay routes; it does not chunk or truncate. Two pieces let a client size
+requests correctly and adapt deterministically (no model-side decision):
+
+- **Advertise the live-servable ceiling.** `/v1/available-models` (`alias_info`)
+  and `/v1/models` report, per category, the *largest context the category can
+  serve right now* — the max live window among the models it would actually route
+  to (members + open fallthrough), not a down primary's nominal window. Size a
+  request so that `chars/3 + max_tokens <= context_window`; the relay estimates
+  the same way (a deliberate over-count, `~3 chars/token`), so the two agree by
+  construction and "sized it right, still 503'd" can't happen.
+- **Refuse informatively.** When no live model can hold the request, the 503
+  carries the `oversize_for_now` vs `oversize_period` signal (see Step 4). The
+  relay never silently truncates; the client waits, resizes, or defers — all
+  deterministic arithmetic, no second LLM call.
 
 ## Circuit breaker
 
@@ -125,14 +162,16 @@ available at request time, with no human intervention.
 3. Order: trivially `[llama-3.3-70b]`
 4. Select: not available → 503 with `decision.ranked` in the body
 
-### Alias spanning local and cloud, default privacy
+### Category spanning local and cloud, default privacy
 
 `POST /v1/chat/completions { "model": "fast" }`
-with `aliases.fast: [qwen3.5-9b, claude-3-5-haiku]` and default
+with `fast` tagged on `[qwen3.5-9b, claude-3-5-haiku]` and default
 `privacy: local_only`:
 
-1. Build: `[qwen3.5-9b, claude-3-5-haiku]`
-2. Filter: claude drops out (cloud_ok)
-3. Order: `[qwen3.5-9b]`
-4. Select: pick whichever local 9B status is — fail if down (no cloud
-   fallback because privacy=local_only)
+1. Build: `[qwen3.5-9b, claude-3-5-haiku]` + open-fallthrough tail (other live
+   local models, preference-ranked)
+2. Filter: claude drops out (cloud_ok under local_only)
+3. Order: `[qwen3.5-9b, <other live local models that fit>]`
+4. Select: `qwen3.5-9b` if up; otherwise fall through to the next live local
+   model. Only 503s if no live local model can serve the request — and then with
+   the context diagnosis if the cause was size.

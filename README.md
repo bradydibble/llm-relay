@@ -73,7 +73,8 @@ providers:
 
 ### `config/models.yaml`
 
-Define models, aliases, and metadata:
+Define models and the use-cases (categories) each serves; the relay **derives**
+the category map from these tags at load:
 
 ```yaml
 models:
@@ -85,16 +86,32 @@ models:
     capabilities: [tool_use, structured_output]
     tags: [local, fast]
     preference: 0.7
+    # Categories this model serves, with a priority per category. The category
+    # map is DERIVED: aliases[uc] = models tagged uc, ordered by priority desc,
+    # then preference desc, then name. Re-rank a model everywhere with one edit.
+    use_cases: {subagent: 2, fast: 1, main: 1}
 
-  # Aliases are ORDERED priority lists. llm-relay walks them at request time
-  # and picks the first available candidate — so the alias `subagent: [9b, 35b]`
-  # always prefers 9b when it is up, falling back to 35b when it is not.
-  aliases:
-    subagent:     [qwen3.5-9b, qwen3.5-35b]
-    main:         [qwen3.5-35b, llama-3.3-70b, qwen3.5-9b]
-    fast:         [qwen3.5-9b]
-    high-quality: [qwen3.5-35b, llama-3.3-70b]
+  qwen3.5-35b:
+    provider: local-llm
+    class: local-35b
+    port: 8081
+    context_window: 262144
+    capabilities: [tool_use, structured_output, long_context]
+    tags: [local]
+    preference: 0.9
+    use_cases: {main: 4, high-quality: 3, subagent: 1}
+
+  # Optional per-category quality gate, off by default. When set, models below
+  # the floor preference are refused for that category rather than served.
+  # categories:
+  #   high-quality: {reasoning_floor: 0.85}
 ```
+
+A category is a **priority order over the live fleet, not a whitelist**: the
+relay prefers the tagged models in order, then falls through to any *other* live
+model that fits the request, so traffic is served whenever anything live can hold
+it (context permitting). An explicit `aliases:` block still works as a deprecated
+override (it wins per-category and logs a warning).
 
 ### `config/policy.yaml`
 
