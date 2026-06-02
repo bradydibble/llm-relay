@@ -217,7 +217,16 @@ class ModelSelector:
             return out, True
         if req in self.config.policy.fallback.graph:
             return list(self.config.policy.fallback.graph[req]), True
-        return list(self.discovery.get_available_models().keys()), False
+        # Unknown id: best-effort over the whole LIVE fleet. Enumerate CONFIGURED
+        # models resolved as available via get_model_state (which fuzzy-matches a
+        # backend's GGUF-filename id back to the config name) rather than the raw
+        # backend-reported ids — otherwise every llama.cpp/GGUF backend is dropped
+        # here (the id isn't a config key). Unordered -> _rank sorts by preference.
+        live = [
+            name for name in self.config.models.models
+            if _is_available(self.discovery.get_model_state(name))
+        ]
+        return live, False
 
     def _apply_constraints(
         self, ctx: RoutingContext, candidates: list[str], *, ignore_context: bool = False

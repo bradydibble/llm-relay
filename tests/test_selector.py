@@ -644,6 +644,24 @@ def test_explicit_model_does_not_fall_through_to_fleet():
     assert pick is None, "explicit/strict requests must not fall through to the fleet"
 
 
+def test_unknown_model_routes_over_gguf_reported_fleet():
+    """The unknown-model fallback (an unrecognized id -> best available live model)
+    must include GGUF-reported (llama.cpp) backends — the same fix as the fallthrough
+    tail. The backend reports 'Trinity-Mini-...gguf'; an unknown request must resolve
+    to trinity-mini (matched to the config name via get_model_state), not None."""
+    c = _load()
+    disc = DiscoveryManager()
+    state = EndpointState(
+        provider="local-llm", status=EndpointStatus.healthy,
+        models=["Trinity-Mini-UD-Q4_K_XL.gguf"],  # GGUF filename, not the config name
+    )
+    disc.clients["k::t"] = EndpointClient(provider_name="local-llm", base_url="x", state=state)
+    disc.model_to_client["trinity-mini"] = "k::t"
+    sel = ModelSelector(c, disc)
+    assert sel.select_best(RoutingContext(requested_model="some-unrecognized-model-xyz")) == "trinity-mini", \
+        "unknown-model fallback must reach GGUF-reported backends (matched by config name)"
+
+
 # ---------------------------------------------------------------------------
 # Context-fit contract: when a request can't fit ANY live model, the relay
 # distinguishes oversize-for-now (a big-enough model exists in the catalog but is
