@@ -18,6 +18,7 @@ from ..config.types import SaturationError
 from ..discovery.manager import DiscoveryManager
 from ..routing.keys import compose_backend_key, compose_model_id, resolve_model_id
 from ..routing.router import RequestRouter
+from ..routing.selector import ModelSelector, RoutingContext
 from .instrumentation import (
     _classify_stream_outcome,
     emit_chat_completion,
@@ -41,20 +42,38 @@ def _resolve_config_dir(config_dir: str | Path | None) -> Path:
     return Path(__file__).resolve().parents[2] / "config"
 
 
+def _alias_servable_ceiling(cfg: ConfigLoader, disc: DiscoveryManager, alias: str) -> int | None:
+    """Largest context window the alias can SERVE right now: the max live window
+    among the candidates ``select_chain`` currently yields (named members + open
+    fallthrough, already filtered to available + locally-admissible). ``None`` when
+    nothing servable is live.
+
+    This drives the honest context advertisement — a client can size a request up
+    to this number and the context-fit gate guarantees it routes to a model that
+    holds it, instead of being told a down primary's nominal window it can't get.
+    """
+    sel = ModelSelector(cfg, disc)
+    windows = [
+        disc.get_live_context_window(c.model) or (cfg.models.models[c.model].context_window or 0)
+        for c in sel.select_chain(RoutingContext(requested_model=alias))
+    ]
+    windows = [w for w in windows if w]
+    return max(windows) if windows else None
+
+
 def _resolve_context_window(cfg: ConfigLoader, disc: DiscoveryManager, name: str) -> int | None:
     """Context window for a model or alias `name`.
 
     Concrete model: the backend's live ``max_model_len`` (authoritative) when it
     reports one, else the static models.yaml value.
 
-    Alias: the context of its PRIMARY (first-declared, config-present) member —
-    stable regardless of which member is momentarily serving, so a
-    context-gating client sees the alias's intended capability rather than a
-    smaller fallback's when the primary backend is briefly down. (Under load the
-    selector may still route an individual request to a lower-context member;
-    that is a request-time concern, not this init-time capability gate. The
-    durable ceiling fix is curating sub-floor models out of high-context aliases
-    / context-aware routing.)
+    Alias: the largest context it can SERVE right now — the max live window among
+    the models it currently routes to (named members + open fallthrough), via
+    ``_alias_servable_ceiling``. This is the honest "size a request up to here"
+    number; advertising a down primary's nominal window while a smaller model
+    actually serves is the "sized it right, still 503'd" lie. Falls back to the
+    primary (first-declared) member's window when nothing servable is live, so the
+    advertised capability survives a full-fleet outage.
 
     Returns None when `name` is neither a known model nor a resolvable alias.
     """
@@ -64,6 +83,9 @@ def _resolve_context_window(cfg: ConfigLoader, disc: DiscoveryManager, name: str
         return live if live is not None else models[name].context_window
     members = cfg.models.aliases.get(name)
     if members:
+        ceiling = _alias_servable_ceiling(cfg, disc, name)
+        if ceiling is not None:
+            return ceiling
         for member in members:
             if member in models:
                 return _resolve_context_window(cfg, disc, member)
@@ -175,12 +197,13 @@ def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[
                 if member in cfg.models.models:
                     current = member
                     break
-        # `context_window` reports the alias's PRIMARY (first-declared) member's
-        # context via _resolve_context_window — stable regardless of which member
-        # `current` resolves to. `current` (above) tracks the live-serving member
-        # for display, so the two intentionally diverge when the primary backend
-        # is down and a fallback is serving: this keeps a context-gating client
-        # from seeing a smaller fallback's window when the primary briefly blips.
+        # `context_window` is the live-servable CEILING (max live window among the
+        # alias's currently-routable candidates, via _resolve_context_window ->
+        # _alias_servable_ceiling) — the number a client can safely size a request
+        # up to. It tracks the live fleet rather than a down primary's nominal
+        # window, so a client never sizes to context the alias cannot actually hold
+        # (the "sized it right, still 503'd" lie). Size as: chars/3 + max_tokens <=
+        # context_window (the relay's own conservative estimate; see _estimate_request_min_context).
         alias_info[alias] = {
             "members": members_list,
             "current": current,

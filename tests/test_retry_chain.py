@@ -784,6 +784,54 @@ async def test_route_and_forward_503_when_request_exceeds_all_backend_contexts(t
     assert ei.value.status_code == 503
 
 
+async def test_503_oversize_period_carries_context_diagnosis(tmp_path, monkeypatch):
+    """A request larger than EVERY catalog window 503s with an 'oversize_period'
+    context diagnosis: resize/defer is the only path, waiting cannot help."""
+    app = _make_ctx_app(tmp_path)
+    router = app.state.router
+
+    async def _fake_forward(*args, **kwargs):  # pragma: no cover - must not forward
+        raise AssertionError("must not forward when nothing fits")
+    monkeypatch.setattr(router, "forward_request", _fake_forward)
+
+    huge = "x" * 900000  # ~300000 tokens > 200000 (largest catalog window)
+    with pytest.raises(HTTPException) as ei:
+        await router.route_and_forward(
+            request_data={"model": "main", "messages": [{"role": "user", "content": huge}]},
+            stream=False,
+        )
+    assert ei.value.status_code == 503
+    info = ei.value.detail["context"]
+    assert info["classification"] == "oversize_period"
+    assert info["max_in_catalog"] == 200000
+    assert info["max_available_now"] == 200000  # model-big is live but still too small
+
+
+async def test_503_oversize_for_now_when_big_backend_down(tmp_path, monkeypatch):
+    """A mid-size request no LIVE model can hold, but a DOWN catalog model could ->
+    'oversize_for_now': waiting for the big backend to return is viable."""
+    app = _make_ctx_app(tmp_path)
+    router = app.state.router
+    # Take the big-context backend down; only model-small (8192) stays live.
+    app.state.discovery.clients["local-llm:8081"].state.status = EndpointStatus.unavailable
+
+    async def _fake_forward(*args, **kwargs):  # pragma: no cover - must not forward
+        raise AssertionError("must not forward when nothing fits")
+    monkeypatch.setattr(router, "forward_request", _fake_forward)
+
+    mid = "x" * 150000  # ~50000 tokens: > model-small (8192), <= model-big catalog (200000)
+    with pytest.raises(HTTPException) as ei:
+        await router.route_and_forward(
+            request_data={"model": "main", "messages": [{"role": "user", "content": mid}]},
+            stream=False,
+        )
+    assert ei.value.status_code == 503
+    info = ei.value.detail["context"]
+    assert info["classification"] == "oversize_for_now"
+    assert info["max_available_now"] == 8192
+    assert info["max_in_catalog"] == 200000
+
+
 async def test_route_and_forward_small_request_still_uses_priority_backend(tmp_path, monkeypatch):
     """A small request imposes no implicit floor, so normal alias priority /
     spillover is unchanged (model-small, first in the alias, still serves)."""

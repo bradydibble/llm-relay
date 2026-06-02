@@ -217,17 +217,22 @@ class RequestRouter:
 
         candidates = self.selector.select_chain(ctx)
         if not candidates:
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "error": "No model matches constraints",
-                    "decision": {
-                        "requested": ctx.requested_model,
-                        "candidates": ctx.candidates,
-                        "filtered": ctx.filtered,
-                    },
+            detail = {
+                "error": "No model matches constraints",
+                "decision": {
+                    "requested": ctx.requested_model,
+                    "candidates": ctx.candidates,
+                    "filtered": ctx.filtered,
                 },
-            )
+            }
+            # When the binding constraint is context (the request can't fit any live
+            # model), attach an actionable signal: oversize_for_now (wait for a
+            # big-enough model to return) vs oversize_period (resize / defer). The
+            # client adapts deterministically; the relay never silently truncates.
+            shortfall = self.selector.diagnose_context_shortfall(ctx)
+            if shortfall is not None:
+                detail["context"] = shortfall
+            raise HTTPException(status_code=503, detail=detail)
 
         # "connection_error" in retry_on means network exceptions; HTTP codes
         # are matched as strings against str(resp.status_code).

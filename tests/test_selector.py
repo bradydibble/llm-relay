@@ -493,3 +493,54 @@ def test_explicit_model_does_not_fall_through_to_fleet():
     sel = ModelSelector(c, disc)
     pick = sel.select_best(RoutingContext(requested_model="qwen3.5-9b"))
     assert pick is None, "explicit/strict requests must not fall through to the fleet"
+
+
+# ---------------------------------------------------------------------------
+# Context-fit contract: when a request can't fit ANY live model, the relay
+# distinguishes oversize-for-now (a big-enough model exists in the catalog but is
+# down -> wait) from oversize-period (nothing in the fleet is big enough -> resize
+# or defer). The relay knows every model's window, so it can compute which.
+# ---------------------------------------------------------------------------
+
+def test_diagnose_context_shortfall_oversize_for_now():
+    """Request needs 100k; only qwen3.5-9b (32768) is live, but qwen3.5-35b (262144)
+    exists in the catalog (just down) -> 'oversize_for_now' (waiting for a big-enough
+    model to return is viable)."""
+    c = _load()
+    disc = _disc_serving("qwen3.5-9b")
+    sel = ModelSelector(c, disc)
+    diag = sel.diagnose_context_shortfall(RoutingContext(requested_model="main", min_context=100000))
+    assert diag is not None
+    assert diag["classification"] == "oversize_for_now"
+    assert diag["max_available_now"] == 32768
+    assert diag["max_in_catalog"] == 262144
+    assert diag["estimated_tokens"] == 100000
+
+
+def test_diagnose_context_shortfall_oversize_period():
+    """Request needs 300k, beyond EVERY catalog model's window (max local 262144)
+    -> 'oversize_period': waiting cannot help; the client must resize or defer."""
+    c = _load()
+    disc = _disc_serving("qwen3.5-9b")
+    sel = ModelSelector(c, disc)
+    diag = sel.diagnose_context_shortfall(RoutingContext(requested_model="main", min_context=300000))
+    assert diag is not None
+    assert diag["classification"] == "oversize_period"
+
+
+def test_diagnose_context_shortfall_none_when_a_live_model_fits():
+    """A live model can hold the request -> no shortfall. qwen3.5-9b (32768) is live
+    and the request needs only 20k."""
+    c = _load()
+    disc = _disc_serving("qwen3.5-9b")
+    sel = ModelSelector(c, disc)
+    assert sel.diagnose_context_shortfall(RoutingContext(requested_model="main", min_context=20000)) is None
+
+
+def test_diagnose_context_shortfall_none_when_nothing_live():
+    """Nothing live at all -> an availability problem, not a context one; the
+    diagnosis is None and the generic 503 stands."""
+    c = _load()
+    disc = DiscoveryManager()
+    sel = ModelSelector(c, disc)
+    assert sel.diagnose_context_shortfall(RoutingContext(requested_model="main", min_context=100000)) is None

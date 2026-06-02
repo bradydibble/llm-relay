@@ -194,7 +194,9 @@ class ModelSelector:
             return list(self.config.policy.fallback.graph[req]), True
         return list(self.discovery.get_available_models().keys()), False
 
-    def _apply_constraints(self, ctx: RoutingContext, candidates: list[str]) -> list[str]:
+    def _apply_constraints(
+        self, ctx: RoutingContext, candidates: list[str], *, ignore_context: bool = False
+    ) -> list[str]:
         out: list[str] = []
         for name in candidates:
             cfg = self.config.models.models.get(name)
@@ -208,8 +210,10 @@ class ModelSelector:
             # routing never admits a request larger than what /v1/models
             # advertised (which is also live-preferred). Fall back to the static
             # config value only when no backend currently reports max_model_len.
+            # `ignore_context` skips this gate so callers can ask "what passes the
+            # NON-context constraints?" (used to diagnose a context shortfall).
             ctx_window = self.discovery.get_live_context_window(name) or cfg.context_window
-            if ctx.min_context and ctx_window and ctx_window < ctx.min_context:
+            if not ignore_context and ctx.min_context and ctx_window and ctx_window < ctx.min_context:
                 continue
             out.append(name)
         return out
@@ -240,6 +244,49 @@ class ModelSelector:
         """
         excluded = set(exclude)
         return self._rank([m for m in self.discovery.get_available_models() if m not in excluded])
+
+    def _window_of(self, name: str) -> int:
+        """Effective context window for `name`: live max_model_len when a backend
+        reports one, else the static config window (0 if unknown)."""
+        cfg = self.config.models.models.get(name)
+        if cfg is None:
+            return 0
+        return self.discovery.get_live_context_window(name) or (cfg.context_window or 0)
+
+    def diagnose_context_shortfall(self, ctx: RoutingContext) -> dict | None:
+        """Explain a no-candidate outcome when the binding constraint is context.
+
+        Returns a structured, actionable diagnosis when the request's estimated
+        context exceeds every admissible LIVE model's window, distinguishing:
+
+          * ``oversize_for_now`` — a big-enough model exists in the catalog but is
+            currently down, so waiting (back off + retry) can succeed; vs.
+          * ``oversize_period`` — nothing in the whole admissible catalog is big
+            enough, so only resizing or deferring the request can.
+
+        Returns ``None`` when context is NOT the binding constraint: the request
+        fits some live model, or nothing is live at all (a plain availability
+        outage the generic 503 already covers). The relay routes, it does not
+        chunk — this lets a deterministic client size down or wait without any
+        model-side (LLM) decision.
+        """
+        if not ctx.min_context:
+            return None
+        admissible = self._apply_constraints(ctx, list(self.config.models.models), ignore_context=True)
+        max_live = max(
+            (self._window_of(m) for m in admissible if _is_available(self.discovery.get_model_state(m))),
+            default=0,
+        )
+        if max_live == 0 or ctx.min_context <= max_live:
+            return None
+        max_catalog = max((self.config.models.models[m].context_window or 0 for m in admissible), default=0)
+        return {
+            "reason": "request_exceeds_live_context",
+            "estimated_tokens": ctx.min_context,
+            "max_available_now": max_live,
+            "max_in_catalog": max_catalog,
+            "classification": "oversize_for_now" if ctx.min_context <= max_catalog else "oversize_period",
+        }
 
     def get_fallback_chain(self, model_name: str) -> list[str]:
         for chain in self.config.policy.fallback.graph.values():
