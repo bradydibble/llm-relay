@@ -386,7 +386,7 @@ def test_strict_single_candidate_skips_load_sort(monkeypatch):
 
     calls: list[list[str]] = []
     orig = sel._sort_by_load
-    monkeypatch.setattr(sel, "_sort_by_load", lambda ranked: calls.append(list(ranked)) or orig(ranked))
+    monkeypatch.setattr(sel, "_sort_by_load", lambda ranked, *a, **k: calls.append(list(ranked)) or orig(ranked, *a, **k))
 
     ctx = RoutingContext(requested_model="qwen3.5-9b")
     ranked = sel._prepare_ranked(ctx)
@@ -579,6 +579,38 @@ def test_named_members_take_priority_over_fleet_tail_when_idle():
     sel = ModelSelector(c, disc)
     pick = sel.select_best(RoutingContext(requested_model="subagent"))
     assert pick == "qwen3.5-9b", "named members are the priority prefix; the tail follows them"
+
+
+def test_member_not_displaced_by_idle_tail_under_mild_load():
+    """Cross-tier spill happens only on saturation/unavailability, NOT on mild load.
+    A lightly-loaded NAMED member must beat an idle NON-MEMBER fallthrough model:
+    load-aware spill stays *within* the named members; the open-fallthrough tail is
+    a fallback tier, not a load-spill peer. (Brady approved saturation-spill, not
+    any-load cross-tier spill — dumping high-quality work onto a 9B because the 35B
+    has one in-flight request is a quality regression.)
+
+    subagent member qwen3.5-9b is live at 1/3 slots; trinity-mini (tail) is live and
+    idle; qwen3.5-35b is down -> must pick the loaded member 9b, not the idle tail.
+    """
+    from llm_relay.routing.keys import compose_backend_key
+    c = _load()
+    disc = DiscoveryManager()
+    # qwen3.5-9b: a NAMED subagent member, live, lightly loaded (1 of 3 slots).
+    k9 = compose_backend_key("local-llm", 8080, "")
+    s9 = EndpointState(provider="local-llm", status=EndpointStatus.healthy, models=["qwen3.5-9b"])
+    c9 = EndpointClient(provider_name="local-llm", base_url="x", state=s9, max_concurrent=3)
+    c9.inflight_used = 1
+    disc.clients[k9] = c9
+    disc.model_to_client["qwen3.5-9b"] = k9
+    # trinity-mini: NOT a subagent member (open-fallthrough tail), live, idle.
+    disc.clients["k::trinity"] = EndpointClient(
+        provider_name="local-llm", base_url="x",
+        state=EndpointState(provider="local-llm", status=EndpointStatus.healthy, models=["trinity-mini"]))
+    disc.model_to_client["trinity-mini"] = "k::trinity"
+
+    sel = ModelSelector(c, disc)
+    assert sel.select_best(RoutingContext(requested_model="subagent")) == "qwen3.5-9b", \
+        "a lightly-loaded named member must beat an idle non-member tail (no mild-load cross-tier spill)"
 
 
 def test_explicit_model_does_not_fall_through_to_fleet():

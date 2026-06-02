@@ -90,23 +90,40 @@ class ModelSelector:
         # this keeps a corrupt inflight counter on the lone backend from ever
         # perturbing the routing decision.
         if len(ranked) > 1:
-            ranked = self._sort_by_load(ranked)
+            # Named members are the priority tier; the open-fallthrough tail is a
+            # fallback tier. Load-aware spill happens WITHIN a tier only, so a
+            # lightly-loaded member is never displaced by an idle tail model — the
+            # tail is reached on unavailability/saturation, which route_and_forward
+            # walks via has_free_slot. For non-aliases there is no tail, so every
+            # candidate is tier 0 (unchanged behaviour).
+            tier0 = (
+                set(self.resolve_alias(ctx.requested_model))
+                if self.is_alias(ctx.requested_model)
+                else set(ranked)
+            )
+            ranked = self._sort_by_load(ranked, tier0)
         ctx.ranked = ranked
         return ranked
 
-    def _sort_by_load(self, ranked: list[str]) -> list[str]:
-        """Re-order *ranked* so least-loaded candidates win; preserve original
-        priority on ties.
+    def _sort_by_load(self, ranked: list[str], tier0: set[str]) -> list[str]:
+        """Re-order *ranked* so least-loaded candidates win WITHIN their tier;
+        preserve original priority on ties.
 
-        Sort key per candidate: ``(load_ratio, original_index)``. A candidate
-        with no backend client or no semaphore (unbounded) scores ``load_ratio
-        = 0.0`` — treated as fully idle.
+        Sort key per candidate: ``(tier, load_ratio, original_index)`` where tier is
+        0 for named members (``tier0``) and 1 for the open-fallthrough tail. Tier is
+        the PRIMARY key, so an idle tail model never jumps ahead of a (possibly
+        loaded) named member — cross-tier spill is reserved for unavailability /
+        saturation, not mild load. Within a tier, ``load_ratio`` drives the TTFT
+        spill and ``original_index`` breaks ties on the original priority order. A
+        candidate with no backend client or no semaphore (unbounded) scores
+        ``load_ratio = 0.0`` — treated as fully idle.
         """
-        scored: list[tuple[float, int, str]] = [
-            (self._load_ratio(name), idx, name) for idx, name in enumerate(ranked)
+        scored: list[tuple[int, float, int, str]] = [
+            (0 if name in tier0 else 1, self._load_ratio(name), idx, name)
+            for idx, name in enumerate(ranked)
         ]
         scored.sort()
-        return [name for _, _, name in scored]
+        return [name for _, _, _, name in scored]
 
     def _load_ratio(self, model_name: str) -> float:
         """Current in-flight ratio for the backend serving *model_name*.
