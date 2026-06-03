@@ -45,5 +45,8 @@ GOOSE.md
 # OS
 .DS_Store
 
-# Local working drafts — not for publication
-docs/design/2026-05-30-architecture-simplification.md
+# Design notes / working drafts — dev process, not for publication.
+# Reference + operator docs (docs/routing-algorithm.md, docs/operations.md) stay
+# tracked; design ADRs and roadmaps are local-only.
+docs/design/
+docs/v2-features.md

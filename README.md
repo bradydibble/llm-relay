@@ -5,9 +5,9 @@ Lightweight routing control plane for homelab + cloud LLM backends.
 > **Heads up:** I wrote this for my own homelab as I was getting tired of
 > manually switching out the models used across my agents. I am switching
 > models constantly for tweaking and benchmarking, and it started to become
-> a problem. Exising tools like llm router were just too heavy for my needs.
+> a problem. Existing tools like llm router were just too heavy for my needs.
 > It is published in case the design is useful, not as a polished general-purpose
-> product. Configs in `config/` are generic placeholders. real values (hostnames,
+> product. Configs in `config/` are generic placeholders. Real values (hostnames,
 > IPs, systemd service names, model registry) belong in a private override directory.
 > See [Configuration overrides](#configuration-overrides) below.
 
@@ -44,7 +44,7 @@ pip install -e .
 llm-relay run
 
 # CLI introspection
-llm-relay models --available
+llm-relay models
 llm-relay resolve high-quality
 llm-relay route qwen3.5-35b --privacy cloud_ok
 ```
@@ -156,6 +156,12 @@ curl -X POST http://127.0.0.1:8090/v1/chat/completions \
   }'
 ```
 
+Add `"stream": true` for an SSE token stream — the relay proxies it and records
+how it ended (clean finish vs. mid-stream error). If no live model can hold the
+request the relay returns 503 with an `oversize_for_now` / `oversize_period`
+signal rather than truncating; size requests against the live ceiling reported by
+`/v1/available-models`.
+
 ### Routing hints (headers)
 
 | Header | Values | Description |
@@ -168,9 +174,11 @@ curl -X POST http://127.0.0.1:8090/v1/chat/completions \
 
 ```bash
 GET /health                       # Endpoint health status
+GET /status                       # Live routing state: active mode, alias resolutions, backend health
 GET /v1/available-models          # All models with rich metadata + aliases (canonical)
 GET /available-models             # Deprecated alias of the above (same payload)
 GET /v1/models                    # OpenAI-compatible model list (concrete + aliases)
+GET /v1/models/{model}            # Model card; resolves a bare or provider:model id
 GET /routing-table                # Fallback graphs
 GET /routing-table/qwen3.5-35b    # Fallback chain for a model
 ```
@@ -196,10 +204,23 @@ export PHOENIX_PROJECT_NAME=llm-relay                            # default
 Metrics and tracing are independent: tracing being disabled or unreachable
 never affects metrics or request handling.
 
+## MCP server
+
+With the `mcp` extra installed (`pip install -e .[mcp]`), the relay mounts a
+Model Context Protocol server at `/mcp/mcp` (Streamable HTTP transport) so an
+agent can inspect routing state before it picks a model:
+
+- `relay_status` — active mode, alias resolutions, backend health
+- `list_models` — every configured model with current availability
+- `describe_alias` — a category's resolved model, context window, members, and
+  saturation flag
+- `select_for_capability` — models matching context / capability / privacy
+  constraints, ranked by preference
+
 ## CLI
 
 ```bash
-llm-relay models --available       # List models
+llm-relay models                   # List configured models + aliases
 llm-relay resolve high-quality     # Resolve alias
 llm-relay health                   # Check endpoints
 llm-relay route qwen3.5-35b        # Simulate routing decision
@@ -208,25 +229,26 @@ llm-relay config                   # Print config
 
 ## Routing algorithm
 
-1. **Build candidates**: If the requested model is an alias, an explicit model
-   with a fallback chain, or a fallback graph key, the candidate list is
-   **ordered** (the user/config specified the priority). If the requested name
-   is unknown, candidates are drawn from currently-discovered models.
-2. **Filter**: Apply hard constraints (privacy, tools, context).
-3. **Order**: For ordered candidates the configured order *is* the priority
-   (never reranked by preference), with load-aware spill to a free/less-loaded
-   backend among equal priority. For the unknown case, candidates are sorted by
-   `preference` (descending), ties broken by name.
-4. **Select**: Walk the ordered (or ranked) list and return the first candidate
-   the discovery layer currently reports as available.
-5. **Fallback**: On backend HTTP 5xx the router moves on to the next available
-   candidate in the same list.
+`build → filter → order → select → forward`, fully deterministic — no LLM in the
+routing path. A request's `model` may be a **category** (use-case alias), an
+**explicit model**, a host-qualified **`provider:model`** id, or an unknown name.
 
-## Fallback semantics
+- **Open by default** — a category is a *priority order over the live fleet*, not a
+  whitelist: it prefers its tagged members, then falls through to any other live
+  model that fits, degrading to whatever is up instead of dead-ending in a 503.
+- **Two floors** gate each candidate: **context-fit** (hard — the model must be
+  able to hold the request) and an optional **reasoning floor** (off by default).
+  When nothing live can hold the request, the 503 carries an `oversize_for_now`
+  vs `oversize_period` signal so a client can back off, resize, or defer.
+- **Order** — configured/derived priority wins, with load-aware spill to a free
+  backend among equal-priority candidates; unknown names rank by `preference`.
+- **Fallback** — on a retryable upstream status (502/503/504) the router walks to
+  the next candidate (pre-first-byte for streams); a tripped circuit breaker skips
+  a backend entirely; the `local_only` privacy default is never crossed to cloud.
 
-- **On HTTP 5xx**: Retry next candidate in fallback chain
-- **On circuit breaker**: Skip unavailable endpoints entirely
-- **Privacy boundaries**: Never cross `local_only` → cloud
+See **[docs/routing-algorithm.md](docs/routing-algorithm.md)** for the full
+algorithm — the alias-vs-`fallback.graph` precedence, the context-fit contract,
+and worked examples.
 
 ## Configuration overrides
 
@@ -269,15 +291,15 @@ export LLM_MODE_HOST=...
 ## v1 scope
 
 **Included:**
-- OpenAI-compatible endpoint polling
-- Model discovery and health tracking
-- Policy-based routing (privacy, quality, latency)
-- Fallback chain execution
-- Introspection API and CLI
+- OpenAI-compatible endpoint polling, model discovery, and health tracking
+- Deterministic policy-based routing (privacy, capability, context-fit, load-aware spill)
+- Open-by-default category aliases with per-model fallback chains
+- Streaming (SSE) pass-through with pre-first-byte failover
+- Introspection API + CLI, Prometheus metrics, and an optional MCP server / OTel tracing
 
-**Not included (v2):**
+**Not included (planned):**
 - Automatic mode switching via `llm-mode`
-- Tool/function call routing
+- Prompt-intent tool routing (capability *filtering* via headers is supported)
 - Cost tracking and budgeting
 - A/B testing between models
 - Custom provider adapters beyond OpenAI/Anthropic
