@@ -21,7 +21,7 @@ def _shared_upstream_bearer() -> str | None:
     llama-server `--api-key`) shares one key. Relay reads that key from the
     env so discovery probes authenticate. Set via the systemd unit using
     LLM_RELAY_UPSTREAM_API_KEY (preferred) or LLM_API_KEY (fallback) — both
-    refer to the same /home/admin/.config/llm-relay-api-key file content.
+    refer to the same ~/.config/llm-relay-api-key file content.
     """
     return os.environ.get("LLM_RELAY_UPSTREAM_API_KEY") or os.environ.get("LLM_API_KEY")
 
