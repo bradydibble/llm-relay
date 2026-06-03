@@ -202,8 +202,10 @@ def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[
         # _alias_servable_ceiling) — the number a client can safely size a request
         # up to. It tracks the live fleet rather than a down primary's nominal
         # window, so a client never sizes to context the alias cannot actually hold
-        # (the "sized it right, still 503'd" lie). Size as: chars/3 + max_tokens <=
-        # context_window (the relay's own conservative estimate; see _estimate_request_min_context).
+        # (the "sized it right, still 503'd" lie). Size the PROMPT as chars/3 <=
+        # context_window; max_tokens is an output ceiling, clamped to the chosen
+        # model's headroom at forward time (see _clamp_max_tokens), not counted
+        # toward eligibility (see _estimate_prompt_tokens).
         alias_info[alias] = {
             "members": members_list,
             "current": current,

@@ -17,6 +17,14 @@ from .keys import compose_backend_key, compose_backend_url
 from .selector import ChainCandidate, ModelSelector, RoutingContext
 
 
+# A model is eligible for a request when it can hold the PROMPT plus this much
+# output headroom. The client's max_tokens (an output ceiling) is NOT added to
+# the eligibility floor — it is clamped to the chosen model's headroom at forward
+# time (see _clamp_max_tokens). So a generous max_tokens neither widens nor pins
+# routing; only a prompt that genuinely fits nothing live is refused (oversize).
+MIN_OUTPUT_HEADROOM = 1024
+
+
 @dataclass
 class RouteResult:
     success: bool
@@ -202,12 +210,15 @@ class RequestRouter:
         privacy = Privacy(privacy_str if privacy_str in ("local_only", "cloud_ok") else "local_only")
 
         # Context-aware routing: an explicit X-Llm-Relay-Min-Context header is a
-        # floor the caller asserts; we also estimate the request's own context
-        # need from its body and take the larger. The selector drops candidates
-        # whose context_window is below min_context, so a large request is never
-        # routed to a backend too small to hold it (which would fail mid-stream).
+        # floor the caller asserts; we also size the request from its PROMPT and
+        # take the larger. The selector drops candidates whose window is below this
+        # floor, so the prompt is never routed to a backend too small to hold it.
+        # max_tokens is NOT in the floor (adding it pins every generous request to
+        # the single largest backend); the output ceiling is fitted per-candidate
+        # by _clamp_max_tokens at forward time.
         explicit_min = int(headers.get("X-Llm-Relay-Min-Context", "0") or 0)
-        estimated_min = _estimate_request_min_context(request_data) or 0
+        prompt_est = _estimate_prompt_tokens(request_data)
+        estimated_min = (prompt_est + MIN_OUTPUT_HEADROOM) if prompt_est else 0
         ctx = RoutingContext(
             requested_model=request_data.get("model", "") or "",
             privacy=privacy,
@@ -270,8 +281,9 @@ class RequestRouter:
                         )
                     continue
                 try:
+                    fwd = _clamp_max_tokens(request_data, prompt_est, candidate.context_window)
                     upstream, body_iter, cleanup = await self.stream_request(
-                        candidate.backend_url, candidate.model, request_data,
+                        candidate.backend_url, candidate.model, fwd,
                         headers=headers,
                         backend_key=candidate.backend_key,
                         slot_wait_timeout=candidate.slot_wait_timeout,
@@ -342,8 +354,9 @@ class RequestRouter:
                     )
                 continue
             try:
+                fwd = _clamp_max_tokens(request_data, prompt_est, candidate.context_window)
                 resp = await self.forward_request(
-                    candidate.backend_url, candidate.model, request_data,
+                    candidate.backend_url, candidate.model, fwd,
                     headers=headers,
                     backend_key=candidate.backend_key,
                     slot_wait_timeout=candidate.slot_wait_timeout,
@@ -406,18 +419,24 @@ def _candidate_to_route_result(candidate: ChainCandidate, ctx: RoutingContext) -
     )
 
 
-def _estimate_request_min_context(request_data: dict) -> int | None:
-    """Conservatively estimate the context window a chat request needs.
+def _estimate_prompt_tokens(request_data: dict) -> int | None:
+    """Conservatively estimate the PROMPT's token count for a chat request.
 
     The relay is provider-agnostic and has no tokenizer, so this approximates
-    from character counts and deliberately OVER-estimates: under-estimating
-    would route a request to a backend too small to hold it (a mid-stream
-    failure), whereas over-estimating only forgoes spilling to a smaller, faster
+    from character counts and deliberately OVER-estimates: under-counting would
+    route a request to a backend too small to hold the prompt (a mid-stream
+    failure), whereas over-counting only forgoes spilling to a smaller, faster
     backend. ~3 chars/token over-counts vs. the typical ~3.5-4 for English text.
 
-    Returns the estimated token budget (prompt chars / 3, plus any requested
-    ``max_tokens``), or None when the request is trivially small or unparseable —
-    in which case no implicit floor is imposed and normal routing applies.
+    Counts message content plus tool/function schemas. ``max_tokens`` is
+    deliberately EXCLUDED: it is an output ceiling, not context the model must
+    reserve, so it must not gate routing (that conflation pins every request with
+    a generous max_tokens to the single largest-context backend). The output is
+    fitted separately, per-candidate, by ``_clamp_max_tokens``.
+
+    Returns the estimated prompt tokens (chars / 3), or None when the request is
+    trivially small or unparseable — in which case no implicit floor is imposed
+    and normal routing applies.
     """
     try:
         messages = request_data.get("messages") or []
@@ -433,7 +452,7 @@ def _estimate_request_min_context(request_data: dict) -> int | None:
                         chars += len(part["text"])
         # Tool/function schemas are top-level and frequently large (full JSON
         # parameter schemas); tool-using agents are a primary workload, so the
-        # definitions must count toward the floor. Omitting them under-counts —
+        # definitions must count toward the prompt. Omitting them under-counts —
         # the unsafe direction. Serialize per-spec so a single unserializable
         # entry can't void the message-based estimate.
         for key in ("tools", "functions"):
@@ -444,10 +463,35 @@ def _estimate_request_min_context(request_data: dict) -> int | None:
                 chars += len(json.dumps(spec))
             except (TypeError, ValueError):
                 pass
-        est = chars // 3
-        max_tokens = request_data.get("max_tokens")
-        if isinstance(max_tokens, int) and max_tokens > 0:
-            est += max_tokens
-        return est or None
+        return (chars // 3) or None
     except Exception:
         return None
+
+
+def _clamp_max_tokens(request_data: dict, prompt_est: int | None, window: int) -> dict:
+    """Cap a request's ``max_tokens`` to the chosen model's remaining headroom.
+
+    ``max_tokens`` is an output ceiling, not a context reservation, so it never
+    gates routing (see ``_estimate_prompt_tokens``). But once a model is chosen
+    the output still has to fit its window: a request whose ``prompt + max_tokens``
+    exceeds the window would overflow it — silently truncated by llama.cpp, hard
+    400-rejected by vLLM. So clamp the forwarded ceiling to ``window - prompt``.
+
+    ``prompt_est = chars // 3`` over-counts real tokens, so ``window - prompt_est``
+    sits conservatively below the true headroom (the safe direction — no fudge
+    factor needed). Returns the request unchanged (same object) when there is
+    nothing to clamp; otherwise a shallow copy with the lowered ``max_tokens`` —
+    never mutating the caller's dict, which is shared across the candidate chain.
+    A clamp can yield a shorter completion than asked (``finish_reason=length``):
+    that is honest graceful degradation, far better than excluding the model and
+    dead-ending the open-fallthrough in a 503.
+    """
+    if not prompt_est or not window:
+        return request_data
+    max_tokens = request_data.get("max_tokens")
+    if not isinstance(max_tokens, int) or max_tokens <= 0:
+        return request_data
+    headroom = window - prompt_est
+    if max_tokens <= headroom:
+        return request_data
+    return {**request_data, "max_tokens": headroom}

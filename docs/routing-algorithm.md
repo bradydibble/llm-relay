@@ -59,9 +59,11 @@ entirely:
   `X-Llm-Relay-Privacy: cloud_ok` header.
 - **Tool requirement**: with `X-Llm-Relay-Require-Tools: true`, models without
   `tool_use` in their capabilities are dropped.
-- **Context window**: with `X-Llm-Relay-Min-Context: N` (or the relay's own
-  conservative estimate of the request when no header is sent), models whose
-  **live** `context_window < N` are dropped — see the context-fit contract below.
+- **Context window**: models whose **live** `context_window` cannot hold the
+  request's *prompt* are dropped. The floor is `max(X-Llm-Relay-Min-Context,
+  prompt estimate + small output headroom)`; `max_tokens` is *not* part of it (it
+  is clamped to the chosen model's headroom at forward time) — see the context-fit
+  contract below.
 - **Reasoning floor** (opt-in, off by default): a category may declare
   `categories.<name>.reasoning_floor`, a minimum `preference`; models below it are
   dropped for that category — including the open-fallthrough tail — so a
@@ -86,8 +88,8 @@ Walk the ordered (or ranked) list and return the first candidate whose discovery
 state is `available` (or `degraded`). Open fallthrough makes "no candidate" rare —
 it happens only when nothing live survives the filters. When it does, return 503
 with the decision trace in the error body. If the binding constraint was
-**context** (no live model is big enough for the request), the 503 body also
-carries a structured `context` diagnosis distinguishing **`oversize_for_now`** (a
+**context** (no live model is big enough for the request's prompt), the 503 body
+also carries a structured `context` diagnosis distinguishing **`oversize_for_now`** (a
 big-enough model exists in the catalog but is currently down → back off and retry)
 from **`oversize_period`** (nothing in the fleet is big enough → resize or defer),
 with the estimated tokens, the max available now, and the max in catalog.
@@ -102,20 +104,31 @@ with the estimated tokens, the max available now, and the max in catalog.
 
 ## Context-fit contract
 
-The relay routes; it does not chunk or truncate. Two pieces let a client size
+The relay routes; it does not chunk or truncate. The contract lets a client size
 requests correctly and adapt deterministically (no model-side decision):
 
 - **Advertise the live-servable ceiling.** `/v1/available-models` (`alias_info`)
   and `/v1/models` report, per category, the *largest context the category can
   serve right now* — the max live window among the models it would actually route
-  to (members + open fallthrough), not a down primary's nominal window. Size a
-  request so that `chars/3 + max_tokens <= context_window`; the relay estimates
-  the same way (a deliberate over-count, `~3 chars/token`), so the two agree by
-  construction and "sized it right, still 503'd" can't happen.
-- **Refuse informatively.** When no live model can hold the request, the 503
+  to (members + open fallthrough), not a down primary's nominal window.
+- **Size on the prompt.** Eligibility is gated on the request's **prompt**
+  (`chars/3` — a deliberate over-count at `~3 chars/token` — plus a small output
+  floor), *not* on `max_tokens`. So size a prompt to `chars/3 <= context_window`
+  and it routes; the relay estimates the same way, so "sized it right, still
+  503'd" can't happen. `max_tokens` is an output *ceiling*, not context the model
+  must reserve: counting it toward eligibility would pin every request carrying a
+  generous `max_tokens` to the single largest-context backend, defeating open
+  fallthrough.
+- **Clamp the output, don't exclude the model.** At forward time the relay caps
+  `max_tokens` to the chosen model's remaining headroom (`window - prompt`), so
+  the output never overflows the window it was routed to (llama.cpp truncates
+  silently; vLLM hard-rejects `prompt + max_tokens > max_model_len` with a 400). A
+  clamp can return a shorter completion than requested (`finish_reason=length`) —
+  honest graceful degradation, not a failure.
+- **Refuse informatively.** When no live model can hold the **prompt**, the 503
   carries the `oversize_for_now` vs `oversize_period` signal (see Step 4). The
-  relay never silently truncates; the client waits, resizes, or defers — all
-  deterministic arithmetic, no second LLM call.
+  relay never silently truncates the prompt; the client waits, resizes, or
+  defers — all deterministic arithmetic, no second LLM call.
 
 ## Circuit breaker
 

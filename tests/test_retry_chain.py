@@ -11,7 +11,7 @@ from llm_relay.api.app import create_app
 from llm_relay.config.types import CircuitBreaker, EndpointState, EndpointStatus, SaturationError
 from llm_relay.discovery.endpoint import EndpointClient
 from llm_relay.discovery.manager import DiscoveryManager
-from llm_relay.routing.router import RequestRouter, _estimate_request_min_context
+from llm_relay.routing.router import RequestRouter, _estimate_prompt_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -667,36 +667,40 @@ async def test_route_and_forward_exhausted_chain_reports_correct_candidate(tmp_p
 # it (makes an alias's advertised context window honorable under load).
 # ---------------------------------------------------------------------------
 
-def test_estimate_request_min_context_scales_with_message_size():
-    # ~3 chars/token (conservative over-count); no max_tokens => input only.
-    assert _estimate_request_min_context(
+def test_estimate_prompt_tokens_scales_with_message_size():
+    # ~3 chars/token (conservative over-count) of the PROMPT only.
+    assert _estimate_prompt_tokens(
         {"messages": [{"role": "user", "content": "x" * 30000}]}
     ) == 10000
     # A trivially small request rounds to nothing -> no implicit floor.
-    assert _estimate_request_min_context(
+    assert _estimate_prompt_tokens(
         {"messages": [{"role": "user", "content": "hi"}]}
     ) is None
 
 
-def test_estimate_request_min_context_reserves_max_tokens():
-    est = _estimate_request_min_context(
-        {"messages": [{"role": "user", "content": "x" * 3000}], "max_tokens": 5000}
+def test_estimate_prompt_tokens_ignores_max_tokens():
+    # max_tokens is an OUTPUT ceiling, not context the model must reserve, so it
+    # must NOT lift the prompt estimate (that conflation pins a generous request
+    # to the largest backend). It is clamped to the chosen model's headroom at
+    # forward time instead -- see _clamp_max_tokens / test_context_clamp.py.
+    est = _estimate_prompt_tokens(
+        {"messages": [{"role": "user", "content": "x" * 3000}], "max_tokens": 50000}
     )
-    assert est == 1000 + 5000  # 3000//3 input tokens + reserved output
+    assert est == 1000  # 3000//3 prompt tokens; max_tokens excluded
 
 
-def test_estimate_request_min_context_handles_malformed_body():
-    assert _estimate_request_min_context({}) is None
-    assert _estimate_request_min_context({"messages": "not-a-list"}) is None
-    assert _estimate_request_min_context({"messages": [{"role": "user"}]}) is None
+def test_estimate_prompt_tokens_handles_malformed_body():
+    assert _estimate_prompt_tokens({}) is None
+    assert _estimate_prompt_tokens({"messages": "not-a-list"}) is None
+    assert _estimate_prompt_tokens({"messages": [{"role": "user"}]}) is None
 
 
-def test_estimate_request_min_context_counts_tool_definitions():
+def test_estimate_prompt_tokens_counts_tool_definitions():
     """Tool schemas are top-level and often large; tool-using agents are the
-    target workload, so they must count toward the estimate. Omitting them
+    target workload, so they must count toward the prompt. Omitting them
     under-counts -- the unsafe direction."""
-    assert _estimate_request_min_context({"messages": [{"role": "user", "content": "hi"}]}) is None
-    est = _estimate_request_min_context({
+    assert _estimate_prompt_tokens({"messages": [{"role": "user", "content": "hi"}]}) is None
+    est = _estimate_prompt_tokens({
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [{"type": "function", "function": {"name": "f", "parameters": {"blob": "y" * 30000}}}],
     })

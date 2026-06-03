@@ -27,6 +27,11 @@ class ChainCandidate:
     backend_key: str
     slot_wait_timeout: float
     provider_name: str
+    # Effective context window (live max_model_len when a backend reports one,
+    # else the static config window). The forward path clamps a request's
+    # max_tokens to this model's headroom so the output never overflows the
+    # window it was actually routed to.
+    context_window: int = 0
 
 
 @dataclass
@@ -181,6 +186,7 @@ class ModelSelector:
                 backend_key=backend_key,
                 slot_wait_timeout=slot_wait_timeout,
                 provider_name=cfg.provider,
+                context_window=self._window_of(name),
             ))
         return out
 

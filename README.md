@@ -157,10 +157,12 @@ curl -X POST http://127.0.0.1:8090/v1/chat/completions \
 ```
 
 Add `"stream": true` for an SSE token stream — the relay proxies it and records
-how it ended (clean finish vs. mid-stream error). If no live model can hold the
-request the relay returns 503 with an `oversize_for_now` / `oversize_period`
-signal rather than truncating; size requests against the live ceiling reported by
-`/v1/available-models`.
+how it ended (clean finish vs. mid-stream error). Routing fits a request by its
+**prompt**: size the prompt against the live ceiling reported by
+`/v1/available-models`; `max_tokens` is an output ceiling, clamped to the chosen
+model's remaining headroom (never counted against routing). If the prompt itself
+fits no live model the relay returns 503 with an `oversize_for_now` /
+`oversize_period` signal rather than truncating.
 
 ### Routing hints (headers)
 
@@ -236,9 +238,10 @@ routing path. A request's `model` may be a **category** (use-case alias), an
 - **Open by default** — a category is a *priority order over the live fleet*, not a
   whitelist: it prefers its tagged members, then falls through to any other live
   model that fits, degrading to whatever is up instead of dead-ending in a 503.
-- **Two floors** gate each candidate: **context-fit** (hard — the model must be
-  able to hold the request) and an optional **reasoning floor** (off by default).
-  When nothing live can hold the request, the 503 carries an `oversize_for_now`
+- **Two floors** gate each candidate: **context-fit** (hard — the model must hold
+  the request's *prompt*; `max_tokens` is clamped to the model's headroom, not
+  counted toward eligibility) and an optional **reasoning floor** (off by default).
+  When nothing live can hold the prompt, the 503 carries an `oversize_for_now`
   vs `oversize_period` signal so a client can back off, resize, or defer.
 - **Order** — configured/derived priority wins, with load-aware spill to a free
   backend among equal-priority candidates; unknown names rank by `preference`.
