@@ -5,6 +5,11 @@ from typing import Any
 
 import pytest
 
+# The MCP SDK is an optional extra (install with `.[mcp]`). When it isn't
+# present, skip this whole module instead of erroring — the relay degrades
+# the same way (app.py guards `from ..mcp import build_mcp_server`).
+pytest.importorskip("mcp")
+
 
 def _stub_payloads() -> dict[str, Any]:
     """Two-route response: '/v1/available-models' and '/status'."""

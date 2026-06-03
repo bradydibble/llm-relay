@@ -13,8 +13,13 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
+        # Run the suite both without the MCP extra (the MCP tests skip via
+        # importorskip) and with it (they run) — exercises the optional-dep
+        # contract in both directions.
+        extras: ["dev", "dev,mcp"]
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}
@@ -22,7 +27,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - name: Install package + dev deps
-        run: pip install -e ".[dev]"
+      - name: Install package + deps
+        run: pip install -e ".[${{ matrix.extras }}]"
       - name: Run tests
         run: pytest tests/ -v
