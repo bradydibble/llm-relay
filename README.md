@@ -49,6 +49,12 @@ llm-relay resolve high-quality
 llm-relay route qwen3.5-35b --privacy cloud_ok
 ```
 
+## Security model
+
+llm-relay has **no inbound authentication** and binds to **`127.0.0.1`** by default (override with `--host` / `LLM_RELAY_HOST`). It is built for a trusted local network: any client that can reach the port can call `/v1/chat/completions` (proxying your backends and the shared upstream key the relay holds), and can read your backend topology through `/status`, `/metrics`, and `/v1/available-models`.
+
+If you bind it to a routable interface, put authentication in front of it — a reverse proxy, network policy, or firewall. Otherwise you have published an open proxy to your models and a map of your backends.
+
 ## Configuration
 
 ### `config/providers.yaml`
