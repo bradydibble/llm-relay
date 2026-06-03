@@ -125,3 +125,48 @@ async def test_big_max_tokens_degrades_to_smaller_model_with_clamp(tmp_path, mon
     assert captured["model"] == "small-model", "request must degrade to the live small model"
     assert captured["max_tokens"] == 6000, "output clamped to small-model headroom (16000 - 10000)"
     assert MIN_OUTPUT_HEADROOM > 0
+
+
+async def test_big_max_tokens_degrades_with_clamp_streaming(tmp_path, monkeypatch):
+    """Same degrade-and-clamp on the SSE path: the streaming loop clamps the
+    forwarded max_tokens to the chosen model's headroom too (a primary workload,
+    and a separate code path from the non-streaming loop above)."""
+    cfg_dir = _make_cfg(tmp_path)
+    app = create_app(config_dir=cfg_dir)
+    disc = app.state.discovery
+    disc.clients["local-llm:8081"] = EndpointClient(
+        provider_name="local-llm", base_url="http://127.0.0.1:8081",
+        state=EndpointState(provider="local-llm", status=EndpointStatus.healthy, models=["small-model"]),
+        circuit_breaker=CircuitBreaker(),
+    )
+    disc.model_to_client["small-model"] = "local-llm:8081"
+    router = app.state.router
+
+    captured: dict = {}
+
+    async def _fake_body_iter():
+        yield b"data: {}\n\ndata: [DONE]\n\n"
+
+    async def _fake_cleanup():
+        return None
+
+    async def _fake_stream(backend_url, model_name, request_data, *args, **kwargs):
+        captured["model"] = model_name
+        captured["max_tokens"] = request_data.get("max_tokens")
+        return httpx.Response(200, content=b""), _fake_body_iter(), _fake_cleanup
+
+    monkeypatch.setattr(router, "stream_request", _fake_stream)
+
+    upstream, body_iter, result, cleanup = await router.route_and_forward(
+        request_data={
+            "model": "main",
+            "messages": [{"role": "user", "content": "x" * 30000}],  # 10000 est tokens
+            "max_tokens": 32768,
+            "stream": True,
+        },
+        stream=True,
+    )
+
+    assert upstream.status_code == 200
+    assert captured["model"] == "small-model"
+    assert captured["max_tokens"] == 6000, "output clamped on the streaming path too"
