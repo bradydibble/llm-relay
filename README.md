@@ -116,8 +116,7 @@ models:
 A category is a **priority order over the live fleet, not a whitelist**: the
 relay prefers the tagged models in order, then falls through to any *other* live
 model that fits the request, so traffic is served whenever anything live can hold
-it (context permitting). An explicit `aliases:` block still works as a deprecated
-override (it wins per-category and logs a warning).
+it (context permitting).
 
 ### `config/policy.yaml`
 
@@ -296,19 +295,3 @@ export LLM_MODE_HOST=...
 - **Auditable**: All decisions logged, YAML config is human-readable
 - **Deterministic**: No AI deciding routing, just rules
 - **Separate concerns**: `llm-mode` handles capacity, `llm-relay` handles routing
-
-## v1 scope
-
-**Included:**
-- OpenAI-compatible endpoint polling, model discovery, and health tracking
-- Deterministic policy-based routing (privacy, capability, context-fit, load-aware spill)
-- Open-by-default category aliases with per-model fallback chains
-- Streaming (SSE) pass-through with pre-first-byte failover
-- Introspection API + CLI, Prometheus metrics, and an optional MCP server / OTel tracing
-
-**Not included (planned):**
-- Automatic mode switching via `llm-mode`
-- Prompt-intent tool routing (capability *filtering* via headers is supported)
-- Cost tracking and budgeting
-- A/B testing between models
-- Custom provider adapters beyond OpenAI/Anthropic
