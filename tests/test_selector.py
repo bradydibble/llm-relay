@@ -29,10 +29,9 @@ def test_aliases_loaded():
 
 
 def test_public_config_aliases_match_canonical_lists():
-    """Round-trip guard for the list->tags transpose: the loaded alias map (derived
-    from per-model use_cases) must EXACTLY equal the canonical ordered lists. Passes
-    both before the migration (explicit lists) and after (tag-derived), so it catches
-    a priority-encoding typo during the migration."""
+    """Round-trip guard for the tag transpose: the loaded alias map (derived from
+    per-model use_cases) must EXACTLY equal the canonical ordered lists, so a
+    priority-encoding typo in the tags is caught."""
     c = _load()
     expected = {
         "main": ["qwen3.5-35b", "deepseek-r1-70b", "llama-3.3-70b", "qwen3.5-9b"],
@@ -452,8 +451,8 @@ def test_rank_sorts_by_preference_then_name_only(tmp_path):
 # Tag transpose: aliases (categories) are DERIVED from per-model use_cases tags
 # at load — `aliases[uc] = models tagged uc, sorted by (uc-priority desc,
 # preference desc, name asc)`. Model-major config: a model's whole story lives in
-# one place. Explicit `aliases:` still works as a deprecation shim (wins on
-# conflict, with a warning).
+# one place. A static `aliases:` block is no longer supported — it is ignored at
+# load with a warning; categories come only from tags.
 # ---------------------------------------------------------------------------
 
 def test_aliases_derived_from_model_use_cases(tmp_path):
@@ -472,9 +471,11 @@ def test_aliases_derived_from_model_use_cases(tmp_path):
     assert c.models.aliases["fast"] == ["small"]
 
 
-def test_explicit_alias_overrides_derived_and_warns(tmp_path, caplog):
-    """An explicit `aliases:` entry wins over the tag-derived one (deprecation
-    shim) and emits a warning so the config can migrate to tags."""
+def test_explicit_aliases_block_is_ignored_in_favor_of_tags(tmp_path, caplog):
+    """Static `aliases:` blocks are sunset: a nested `aliases:` block is ignored
+    at load (with a warning), and the category is derived purely from per-model
+    `use_cases` tags. Here `aliases: {chat: [a]}` is dropped, so `chat` follows the
+    tags — b (priority 5) before a (priority 1)."""
     import logging
     (tmp_path / "models.yaml").write_text(
         "models:\n"
@@ -485,8 +486,9 @@ def test_explicit_alias_overrides_derived_and_warns(tmp_path, caplog):
     c = ConfigLoader(config_dir=tmp_path)
     with caplog.at_level(logging.WARNING):
         c.load()
-    assert c.models.aliases["chat"] == ["a"], "explicit alias must win over the tag-derived list"
-    assert any("chat" in r.getMessage() for r in caplog.records), "overlap must warn"
+    assert c.models.aliases["chat"] == ["b", "a"], "explicit aliases block must be ignored; tags win"
+    assert any("aliases" in r.getMessage().lower() for r in caplog.records), \
+        "an ignored aliases block must warn so a legacy config can migrate"
 
 
 def test_reasoning_floor_refuses_sub_floor_models(tmp_path):

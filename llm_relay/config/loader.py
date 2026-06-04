@@ -94,8 +94,11 @@ class ConfigLoader:
         models_data = data.get("models") or {}
         for name, cfg in models_data.items():
             if name == "aliases":
-                for alias_name, members in (cfg or {}).items():
-                    self._models.aliases[alias_name] = list(members)
+                logger.warning(
+                    "an explicit `aliases:` block in models.yaml is no longer supported "
+                    "and was ignored; categories are derived from per-model `use_cases` "
+                    "tags. Remove the block and tag the models instead."
+                )
                 continue
             if name == "categories":
                 for cat_name, meta in (cfg or {}).items():
@@ -125,9 +128,8 @@ class ConfigLoader:
         preference desc, name asc)`` — the same ordering the selector and MCP
         ``select_for_capability`` use, so the surfaces never disagree.
 
-        Explicit ``models.aliases`` entries win on conflict (a deprecation shim so
-        a live list-form config keeps working) and emit a warning, so migrating to
-        tags is just deleting the explicit list.
+        Categories are derived purely from tags — there is no static ``aliases:``
+        block any more (an explicit block is ignored at load; see ``_load_models``).
         """
         derived: dict[str, list[str]] = {}
         for mname, mcfg in self._models.models.items():
@@ -139,13 +141,6 @@ class ConfigLoader:
                 -(self._models.models[n].preference or 0.0),
                 n,
             ))
-            if uc in self._models.aliases:
-                logger.warning(
-                    "use-case %r is defined both explicitly under models.aliases and via "
-                    "per-model use_cases tags; the explicit list wins. Remove the explicit "
-                    "alias to activate the tag-derived list.", uc,
-                )
-                continue
             self._models.aliases[uc] = names
 
     def _load_modes(self) -> None:

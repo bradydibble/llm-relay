@@ -33,21 +33,21 @@ def _make_config(tmp_path: Path) -> Path:
     }))
     (cfg_dir / "models.yaml").write_text(yaml.safe_dump({
         "models": {
+            # `main` is derived from use_cases tags: model-a preferred, model-b fallback.
             "model-a": {
                 "provider": "local-llm",
                 "class": "unknown",
                 "privacy": "local_only",
                 "port": 8080,
+                "use_cases": {"main": 2},
             },
             "model-b": {
                 "provider": "local-llm",
                 "class": "unknown",
                 "privacy": "local_only",
                 "port": 8081,
+                "use_cases": {"main": 1},
             },
-        },
-        "aliases": {
-            "main": ["model-a", "model-b"],
         },
     }))
     # Minimal policy — no fallback graph, default retry_on
@@ -718,13 +718,12 @@ def _make_ctx_app(tmp_path: Path):
     }))
     (cfg_dir / "models.yaml").write_text(yaml.safe_dump({
         "models": {
-            "model-small": {"provider": "local-llm", "port": 8080, "context_window": 8192, "privacy": "local_only"},
-            "model-big": {"provider": "local-llm", "port": 8081, "context_window": 200000, "privacy": "local_only"},
-            # aliases nest UNDER models -- the loader reads data["models"]["aliases"]
-            # (ConfigLoader._load_models). A top-level sibling is silently ignored,
-            # which would drop 'main' to the unknown-model branch instead of an
-            # ordered alias.
-            "aliases": {"main": ["model-small", "model-big"]},
+            # `main` is derived from use_cases tags: model-small is the higher-priority
+            # (preferred) member, model-big the fallback.
+            "model-small": {"provider": "local-llm", "port": 8080, "context_window": 8192, "privacy": "local_only",
+                            "use_cases": {"main": 2}},
+            "model-big": {"provider": "local-llm", "port": 8081, "context_window": 200000, "privacy": "local_only",
+                          "use_cases": {"main": 1}},
         },
     }))
     (cfg_dir / "policy.yaml").write_text(yaml.safe_dump({

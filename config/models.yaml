@@ -119,6 +119,5 @@ models:
   #   high-quality:
   #     reasoning_floor: 0.85
 
-  # Categories are DERIVED from the per-model `use_cases` tags above. An explicit
-  # `aliases:` block still works as a deprecated override (it wins per-category and
-  # logs a warning at load), but the tag form is the supported way.
+  # Categories are DERIVED from the per-model `use_cases` tags above. There is no
+  # static `aliases:` block — one is ignored at load with a warning; tag the models.

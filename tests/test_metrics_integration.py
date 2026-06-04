@@ -26,10 +26,11 @@ def _make_app(tmp_path: Path):
     }))
     (cfg_dir / "models.yaml").write_text(yaml.safe_dump({
         "models": {
-            "model-a": {"provider": "local-llm", "privacy": "local_only", "port": 8080},
-            "model-b": {"provider": "local-llm", "privacy": "local_only", "port": 8081},
-            # ConfigLoader reads aliases from a nested `aliases:` key under `models:`.
-            "aliases": {"main": ["model-a", "model-b"]},
+            # `main` is derived from use_cases tags: model-a higher priority -> preferred.
+            "model-a": {"provider": "local-llm", "privacy": "local_only", "port": 8080,
+                        "use_cases": {"main": 2}},
+            "model-b": {"provider": "local-llm", "privacy": "local_only", "port": 8081,
+                        "use_cases": {"main": 1}},
         },
     }))
     (cfg_dir / "policy.yaml").write_text(yaml.safe_dump({

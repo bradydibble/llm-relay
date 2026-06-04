@@ -9,7 +9,7 @@ each operational change is a single edit in a single file.
 | File | What it owns |
 |---|---|
 | `config/providers.yaml` | Backend hosts (`base_url`, polling cadence, circuit breaker). |
-| `config/models.yaml` | Concrete model definitions and **aliases**. For local models, the `port` and `service` fields are read by both llm-relay (for routing) and `llm-mode` (for systemd lifecycle). |
+| `config/models.yaml` | Concrete model definitions and the per-model `use_cases` tags the **categories** are derived from. For local models, the `port` and `service` fields are read by both llm-relay (for routing) and `llm-mode` (for systemd lifecycle). |
 | `config/modes.yaml` | `llm-mode` profiles. Lists the *models* a mode should run; ports and units are derived from `models.yaml`. |
 | `config/policy.yaml` | Routing policy: privacy defaults, fallback graph, `llm-mode` hint messages. |
 
@@ -38,8 +38,7 @@ listening on port 8084.
    ```
    The relay derives the category map from these tags at load, so the model is
    immediately a ranked member of `main`, `high-quality`, and `code_medium` with
-   no separate alias list to keep in sync. (An explicit `aliases:` block still
-   works as a deprecated override.)
+   no separate alias list to keep in sync.
 2. **(Optional) Tune priorities or add a quality gate** — adjust the `use_cases`
    priorities above, or set a `categories.<name>.reasoning_floor` (a minimum
    `preference`) to refuse models below a quality bar for that category.
@@ -69,12 +68,10 @@ model on their next `/v1/models` refresh.
 
 1. Remove (or rename) the entry in `config/models.yaml`. Its `use_cases` tags go
    with it, so it drops from every category automatically — nothing else to edit.
-2. Remove any reference in an explicit `aliases:` block, if you use that
-   deprecated form.
-3. Remove from any mode in `config/modes.yaml` (or leave — `llm-mode` will
+2. Remove from any mode in `config/modes.yaml` (or leave — `llm-mode` will
    error helpfully if a mode references an unknown model).
-4. Remove from `config/policy.yaml` fallback graphs if present.
-5. `systemctl --user restart llm-relay.service`.
+3. Remove from `config/policy.yaml` fallback graphs if present.
+4. `systemctl --user restart llm-relay.service`.
 
 ## Change which mode is active on the LLM host
 
@@ -87,9 +84,9 @@ llm-mode set-default qwen3.5-9b  # change the Caddy default without changing ser
 ```
 
 When you switch modes, the relay sees the change on the next 15s discovery
-poll. Aliases that include both the old default and the new one (e.g.
-`high-quality: [qwen3.5-35b, llama-3.3-70b]`) keep routing correctly with no
-intervention: `llm-mode big` makes 35B unavailable and 70B available, and
+poll. A category that includes both the old default and the new one (e.g.
+`high-quality`, with both the 35B and 70B tagged into it) keeps routing correctly
+with no intervention: `llm-mode big` makes 35B unavailable and 70B available, and
 `high-quality` requests start hitting 70B automatically.
 
 ## Change which service is running, ad-hoc
@@ -109,9 +106,9 @@ default upstream may break. Prefer `llm-mode <mode>` or `llm-mode set-default`.
    ```
 2. Add or amend models in `config/models.yaml` (cloud models need
    `privacy: cloud_ok`).
-3. Decide which aliases should fall through to cloud. Cross-tier aliases are
-   ordered just like local ones; e.g. `fast: [qwen3.5-9b, claude-3-5-haiku]`
-   keeps local first.
+3. Decide which categories should fall through to cloud. Tag the cloud model
+   into a category (e.g. `fast`) at a lower `use_cases` priority than the local
+   members, so local stays first.
 4. Cross the privacy boundary explicitly on a per-request basis via
    `X-Llm-Relay-Privacy: cloud_ok`. The default is `local_only` and cloud
    models are filtered out otherwise — that is intentional.

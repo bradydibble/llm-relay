@@ -70,12 +70,14 @@ def _make_cfg(tmp_path: Path) -> Path:
     }))
     (cfg_dir / "models.yaml").write_text(yaml.safe_dump({
         "models": {
+            # `main` is derived from use_cases tags: big-model preferred, small-model fallback.
             "big-model": {"provider": "local-llm", "class": "unknown",
-                          "privacy": "local_only", "port": 8080, "context_window": 100000},
+                          "privacy": "local_only", "port": 8080, "context_window": 100000,
+                          "use_cases": {"main": 2}},
             "small-model": {"provider": "local-llm", "class": "unknown",
-                            "privacy": "local_only", "port": 8081, "context_window": 16000},
+                            "privacy": "local_only", "port": 8081, "context_window": 16000,
+                            "use_cases": {"main": 1}},
         },
-        "aliases": {"main": ["big-model", "small-model"]},
     }))
     (cfg_dir / "policy.yaml").write_text(yaml.safe_dump({
         "policy": {"fallback": {"retry_on": ["502", "503", "504", "connection_error"]}}

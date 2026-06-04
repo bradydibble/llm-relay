@@ -11,8 +11,7 @@ deterministic and rule-based — there is no LLM in the routing path.
 
 Categories (aliases) are **derived from per-model `use_cases` tags** at load:
 `aliases[category] = models tagged with it, ordered by priority desc, then
-preference desc, then name` (an explicit `aliases:` block still works as a
-deprecated override that wins per-category and logs a warning). The `model` field
+preference desc, then name`. The `model` field
 in the incoming request can be one of four things; each produces a candidate list,
 and each tells us whether that list is **ordered** (the caller chose the priority)
 or **unordered** (we have to pick).
@@ -75,9 +74,10 @@ entirely:
   order *is* the priority — llm-relay never reranks by preference. It does
   apply **load-aware spill**: among candidates of equal priority the
   least-loaded backend wins, and a saturated backend (no free slot) is skipped
-  in favour of a free one. So `subagent: [qwen3.5-9b, qwen3.5-35b]` picks
-  `qwen3.5-9b` while it has capacity, but spills to `qwen3.5-35b` when the 9B
-  backend is busy — preferring an available alternate over a slot wait.
+  in favour of a free one. So the `subagent` category (tag-derived order
+  `qwen3.5-9b` then `qwen3.5-35b`) picks `qwen3.5-9b` while it has a free slot, but
+  spills to `qwen3.5-35b` when the 9B backend has none — preferring an available
+  alternate over a slot wait.
 - **Unordered candidates** (unknown model): sorted by `preference`
   (descending), ties broken by name — the same ordering the MCP
   `select_for_capability` tool returns, so the two surfaces never disagree.
@@ -150,9 +150,9 @@ probe fails again, the breaker re-trips immediately.
 `llm-mode` switches services on the LLM host. llm-relay does *not* invoke
 `llm-mode`. The interaction is one-way: when `llm-mode big` stops the 35B
 service and starts the 70B service, the per-port discovery polls notice on the
-next 15s tick. Aliases that include both models (e.g.
-`high-quality: [qwen3.5-35b, llama-3.3-70b]`) will route to whichever is
-available at request time, with no human intervention.
+next 15s tick. A category that includes both models (e.g. `high-quality`, with
+both the 35B and the 70B tagged into it) routes to whichever is available at
+request time, with no human intervention.
 
 ## Examples
 
