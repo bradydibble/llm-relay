@@ -214,6 +214,42 @@ def emit_chat_completion(
     try:
         span = tracer.start_span("chat_completion", start_time=start_ns)
         try:
+            # Attribute ORDER matters. OpenTelemetry caps a span at
+            # SpanLimits.max_attributes (default 128) and, when full, evicts the
+            # OLDEST attribute. The per-message breakdown below is unbounded (two
+            # attributes per chat message), so on a long conversation it would push
+            # whatever was set first off the span. We therefore set the
+            # high-cardinality, lower-value per-message attributes FIRST and the
+            # critical, low-cardinality routing attributes (model / provider /
+            # outcome / span.kind) LAST, so the latter always survive — otherwise a
+            # 60-message request silently loses its model and provider and renders as
+            # an untyped "unknown" span. The full prompt and response are also kept
+            # verbatim in input.value / output.value, which never depend on the
+            # per-message keys.
+            for i, msg in enumerate(request_body.get("messages") or []):
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    content = json.dumps(content)
+                span.set_attribute(f"llm.input_messages.{i}.message.role", str(role))
+                span.set_attribute(f"llm.input_messages.{i}.message.content", _redact(str(content))[:32000])
+
+            out_usage = usage or {}
+            output_value = None
+            if response_body and isinstance(response_body, dict):
+                for i, ch in enumerate(response_body.get("choices") or []):
+                    m = ch.get("message") or {}
+                    span.set_attribute(f"llm.output_messages.{i}.message.role", str(m.get("role", "assistant")))
+                    span.set_attribute(f"llm.output_messages.{i}.message.content", _redact(str(m.get("content", "")))[:32000])
+                out_usage = response_body.get("usage") or out_usage
+                output_value = _redact(json.dumps(response_body))[:64000]
+            elif response_text is not None:
+                span.set_attribute("llm.output_messages.0.message.role", "assistant")
+                span.set_attribute("llm.output_messages.0.message.content", _redact(response_text)[:32000])
+                output_value = _redact(response_text)[:64000]
+
+            # --- critical, low-cardinality attributes: set LAST so eviction can
+            # never drop them, regardless of how long the conversation is ---
             span.set_attribute("openinference.span.kind", "LLM")
             span.set_attribute("llm.relay.outcome", outcome)
             if model_resolved:
@@ -229,30 +265,10 @@ def emit_chat_completion(
             }
             span.set_attribute("llm.invocation_parameters", json.dumps(invocation))
 
-            for i, msg in enumerate(request_body.get("messages") or []):
-                role = msg.get("role", "")
-                content = msg.get("content", "")
-                if isinstance(content, list):
-                    content = json.dumps(content)
-                span.set_attribute(f"llm.input_messages.{i}.message.role", str(role))
-                span.set_attribute(f"llm.input_messages.{i}.message.content", _redact(str(content))[:32000])
-
-            out_usage = usage or {}
-            if response_body and isinstance(response_body, dict):
-                for i, ch in enumerate(response_body.get("choices") or []):
-                    m = ch.get("message") or {}
-                    span.set_attribute(f"llm.output_messages.{i}.message.role", str(m.get("role", "assistant")))
-                    span.set_attribute(f"llm.output_messages.{i}.message.content", _redact(str(m.get("content", "")))[:32000])
-                out_usage = response_body.get("usage") or out_usage
-                span.set_attribute("output.value", _redact(json.dumps(response_body))[:64000])
-            elif response_text is not None:
-                span.set_attribute("llm.output_messages.0.message.role", "assistant")
-                span.set_attribute("llm.output_messages.0.message.content", _redact(response_text)[:32000])
-                span.set_attribute("output.value", _redact(response_text)[:64000])
-
+            if output_value is not None:
+                span.set_attribute("output.value", output_value)
             if out_usage.get("_reasoning_content"):
                 span.set_attribute("llm.reasoning_content", _redact(str(out_usage["_reasoning_content"]))[:32000])
-
             if "prompt_tokens" in out_usage:
                 span.set_attribute("llm.token_count.prompt", int(out_usage["prompt_tokens"]))
             if "completion_tokens" in out_usage:
