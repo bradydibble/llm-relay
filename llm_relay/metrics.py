@@ -8,7 +8,8 @@ enabled or reachable.
 Design notes:
 - Recording is best-effort and must never raise into the request path. The
   caller wraps ``record_request`` in try/except; label values are coerced to
-  safe, bounded strings here (None -> "none", unknown clients -> "other").
+  safe, bounded strings here (None -> "none"/"unknown"; self-declared client
+  names are honored but sanitized and cardinality-capped).
 - Backend health gauges are *pull-based*: ``DiscoveryCollector`` reads live
   state off the ``DiscoveryManager`` at scrape time, so the discovery poll loop
   is never touched.
@@ -16,25 +17,54 @@ Design notes:
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Iterable
 
 from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, CollectorRegistry, Counter, Histogram, disable_created_metrics, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
-# Calling agents we attribute traffic to: bounds the `client` metric label so a
-# malformed or novel header value can't explode cardinality (anything else
-# buckets to "other"). The repo ships only the generic default below; real
-# deployments add their own labels via LLM_RELAY_KNOWN_CLIENTS (see
+# Always-honored client labels (cap-exempt): never displaced by the cardinality
+# cap below, even past the dynamic limit. The repo ships only the generic default
+# here; real deployments add their own via LLM_RELAY_KNOWN_CLIENTS (see
 # configure_clients_from_env), so no deployment's agent names live in version
-# control.
+# control. This is no longer an allowlist gate — self-identification is honored
+# generally (see normalize_client) — it just guarantees these labels a slot.
 _DEFAULT_KNOWN_CLIENTS = {"claude-code"}
 _KNOWN_CLIENTS = set(_DEFAULT_KNOWN_CLIENTS)
 
+# Cardinality bound for self-declared client labels. Agents identify themselves
+# via X-Llm-Relay-Client and the relay records whatever they send (sanitized),
+# name-agnostic. To keep the Prometheus `client` series bounded WITHOUT an
+# allowlist of names, novel labels are honored only up to this many distinct
+# values; beyond it, further new names bucket to "other" so a buggy or hostile
+# client cannot explode cardinality. Always-known labels are exempt.
+_MAX_DYNAMIC_CLIENTS = 50
+_seen_clients: set[str] = set()
+
+# Conservative metric-label charset: a self-declared name is lower-cased and any
+# run of other characters collapses to a single '-'.
+_CLIENT_SANITIZE_RE = re.compile(r"[^a-z0-9_-]+")
+
 
 def set_known_clients(names: set[str]) -> None:
-    """Replace the bounded set of known client labels (used by normalize_client)."""
+    """Replace the set of always-honored (cap-exempt) client labels."""
     _KNOWN_CLIENTS.clear()
     _KNOWN_CLIENTS.update(names)
+
+
+def reset_dynamic_clients() -> None:
+    """Clear the runtime set of seen self-declared client labels.
+
+    Production never needs this (the set is bounded by _MAX_DYNAMIC_CLIENTS); it
+    exists so tests can assert the cap deterministically without cross-test
+    pollution of the module-global cardinality state."""
+    _seen_clients.clear()
+
+
+def _sanitize_client(raw: str) -> str:
+    """Lower-case, collapse disallowed chars to '-', trim, and length-bound a
+    self-declared client label so the metric series stays well-formed."""
+    return _CLIENT_SANITIZE_RE.sub("-", raw.strip().lower()).strip("-")[:32]
 
 # End-to-end latency buckets (seconds): sub-second routing overhead through
 # multi-minute large-model generations on the local fleet.
@@ -69,13 +99,24 @@ def metrics_enabled() -> bool:
 
 
 def normalize_client(raw: str | None) -> str:
-    """Bucket the X-Llm-Relay-Client header to a bounded label set."""
+    """Resolve the X-Llm-Relay-Client header to a bounded metric label.
+
+    Self-identification is honored as the agent declares it (sanitized), so no
+    agent names live in the relay — agents tell the relay who they are. Cardinality
+    is bounded generically rather than by an allowlist: always-known labels are
+    honored unconditionally, novel labels are honored up to _MAX_DYNAMIC_CLIENTS
+    distinct values, and further new names bucket to "other" so a misbehaving
+    client cannot explode the series. None / empty / the "unknown" sentinel map to
+    "unknown"."""
     if not raw:
         return "unknown"
-    v = raw.strip().lower()
+    v = _sanitize_client(raw)
     if not v or v == "unknown":
         return "unknown"
-    if v in _KNOWN_CLIENTS:
+    if v in _KNOWN_CLIENTS or v in _seen_clients:
+        return v
+    if len(_seen_clients) < _MAX_DYNAMIC_CLIENTS:
+        _seen_clients.add(v)
         return v
     return "other"
 
@@ -114,8 +155,9 @@ def resolve_client(header_value: str | None, user_agent: str | None) -> str:
     """Resolve the calling-agent label for the ``client`` metric dimension.
 
     An explicit ``X-Llm-Relay-Client`` header wins (intentional
-    self-identification, honored even when unrecognized -> "other"); otherwise
-    fall back to a distinctive ``User-Agent``; otherwise "unknown"."""
+    self-identification, honored as the sanitized value the agent declares, not
+    gated by an allowlist); otherwise fall back to a distinctive ``User-Agent``;
+    otherwise "unknown"."""
     explicit = normalize_client(header_value)
     if explicit != "unknown":
         return explicit
@@ -130,8 +172,10 @@ def configure_clients_from_env() -> None:
     control. Operators add their own in the (off-repo) service environment:
 
       ``LLM_RELAY_KNOWN_CLIENTS="claude-code,agent-a,agent-b"``
-          comma-separated labels that bound the ``client`` metric dimension;
-          merged with the built-in default so ``claude-code`` stays known.
+          comma-separated labels that are always honored (exempt from the
+          self-declared cardinality cap); merged with the built-in default so
+          ``claude-code`` stays known. Optional — agents are recorded by their
+          self-declared header regardless; this only guarantees a slot.
       ``LLM_RELAY_CLIENT_UA_PATTERNS="agent-a-cli=agent-a,agent-b=agent-b"``
           comma-separated ``<ua-substring>=<label>`` pairs; a request with no
           explicit ``X-Llm-Relay-Client`` header whose User-Agent contains the

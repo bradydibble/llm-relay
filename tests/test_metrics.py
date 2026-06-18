@@ -20,6 +20,7 @@ from llm_relay.metrics import (
     did_fall_back,
     resolve_client,
     client_from_user_agent,
+    reset_dynamic_clients,
 )
 
 
@@ -82,12 +83,14 @@ def test_resolve_client_unknown_when_neither_identifies():
     assert resolve_client(None, None) == "unknown"
 
 
-def test_resolve_client_honors_explicit_other_value_over_ua_sniffing():
-    # An intentional but unrecognized header value is honored as "other", not
-    # silently overridden by User-Agent sniffing.
+def test_resolve_client_honors_self_declared_header_over_ua_sniffing():
+    # An explicit header is self-identification: honored as the (sanitized) value
+    # the agent declares, never overridden by User-Agent sniffing. No allowlist —
+    # a novel name is recorded as itself, not collapsed to "other".
+    reset_dynamic_clients()
     set_ua_client_patterns((("agent-b-cli", "agent-b"),))
     try:
-        assert resolve_client("some-new-agent", "agent-b-cli") == "other"
+        assert resolve_client("some-new-agent", "agent-b-cli") == "some-new-agent"
     finally:
         set_ua_client_patterns(())
 
@@ -326,12 +329,41 @@ def test_none_provider_and_model_coerced_to_label_safe_string():
     assert v == 1.0
 
 
-def test_normalize_client_buckets_to_known_or_other_or_unknown():
+def test_normalize_client_honors_sanitized_self_declared_values():
+    reset_dynamic_clients()
     assert normalize_client("claude-code") == "claude-code"
     assert normalize_client("Claude-Code") == "claude-code"  # case-insensitive
     assert normalize_client(None) == "unknown"
     assert normalize_client("") == "unknown"
-    assert normalize_client("some-random-script") == "other"  # cardinality guard
+    assert normalize_client("unknown") == "unknown"  # reserved sentinel
+    # A novel self-declared name is honored as itself (no allowlist), not "other".
+    assert normalize_client("some-random-script") == "some-random-script"
+
+
+def test_normalize_client_sanitizes_to_a_safe_label_charset():
+    reset_dynamic_clients()
+    # Spaces / punctuation collapse to '-', edges trimmed, lower-cased.
+    assert normalize_client("My Agent!! v2") == "my-agent-v2"
+    assert normalize_client("  weird@@name  ") == "weird-name"
+    # All-punctuation sanitizes to empty -> unknown, never a bare "-" label.
+    assert normalize_client("@@@") == "unknown"
+    # Over-long names are truncated so a single value can't blow up the label.
+    assert len(normalize_client("x" * 200)) <= 32
+
+
+def test_normalize_client_caps_distinct_values_to_protect_cardinality(monkeypatch):
+    # Cardinality is bounded WITHOUT a name allowlist: novel labels are honored
+    # only up to the cap; beyond it, further new names bucket to "other". An
+    # already-seen value and an always-known label stay honored past the cap.
+    import llm_relay.metrics as metrics_mod
+    reset_dynamic_clients()
+    monkeypatch.setattr(metrics_mod, "_MAX_DYNAMIC_CLIENTS", 2)
+    assert normalize_client("agent-1") == "agent-1"
+    assert normalize_client("agent-2") == "agent-2"
+    assert normalize_client("agent-3") == "other"     # cap reached
+    assert normalize_client("agent-1") == "agent-1"   # already seen -> still honored
+    assert normalize_client("claude-code") == "claude-code"  # known -> cap-exempt
+    reset_dynamic_clients()
 
 
 class _FakeState:
@@ -428,8 +460,12 @@ def test_configure_clients_from_env_no_env_keeps_generic_defaults(monkeypatch):
     monkeypatch.delenv("LLM_RELAY_CLIENT_UA_PATTERNS", raising=False)
     set_known_clients({"claude-code"})
     set_ua_client_patterns(())
+    reset_dynamic_clients()
     configure_clients_from_env()
-    # The committed default: only claude-code is known, no UA attribution.
+    # The committed default: claude-code is the only always-known label and there
+    # is no UA attribution. A name like agent-a isn't pre-registered, but self-
+    # identification is still honored generically (bounded by the cardinality cap)
+    # rather than gated by an allowlist of deployment names.
     assert normalize_client("claude-code") == "claude-code"
-    assert normalize_client("agent-a") == "other"
+    assert normalize_client("agent-a") == "agent-a"
     assert client_from_user_agent("agent-a-cli") is None

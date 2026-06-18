@@ -158,10 +158,14 @@ with `LLM_RELAY_METRICS=0`.
 | `llm_relay_tokens_total` | counter | provider, model, direction, client | Tokens, `direction` ∈ prompt / completion. |
 | `llm_relay_fallbacks_total` | counter | alias, model, client | Requests served by a non-preferred candidate (router fell back). |
 | `llm_relay_request_duration_seconds` | histogram | provider, model | End-to-end relay request duration. |
+| `llm_relay_ttft_seconds` | histogram | provider, model | Time to first token. Measured end-to-end for streamed responses; derived from the backend's prefill time (llama.cpp `timings.prompt_ms`) for non-streamed. Backends that report neither are not observed. |
 
 The `client` label is the calling agent, resolved from the `X-Llm-Relay-Client`
-header (falling back to a distinctive `User-Agent`); unknown values bucket to
-`other` so the label can't explode cardinality.
+header (falling back to a distinctive `User-Agent`). Agents self-identify: the
+relay records whatever name the header declares, sanitized to a safe label
+charset — no agent names live in the relay. Cardinality is bounded without an
+allowlist: novel names are honored up to a fixed number of distinct values, after
+which further new names bucket to `other`. Absent/blank → `unknown`.
 
 ### Backend metrics (pull-based, read off discovery at scrape time)
 
