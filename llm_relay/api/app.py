@@ -175,6 +175,13 @@ def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[
             "port": m.port,
             "path": m.path,
         }
+        # A deliberately-paused provider reads "paused" (not its discovered
+        # status) so clients see it's intentionally out of rotation, not down.
+        if disc.is_provider_paused(m.provider):
+            out[name]["status"] = "paused"
+            client = disc.get_client_for_model(name)
+            if client is not None and client.state.paused_until is not None:
+                out[name]["paused_until"] = client.state.paused_until
     out["aliases"] = dict(cfg.models.aliases)
     # Enriched per-alias metadata so clients can show context_window etc. for
     # aliases (which are otherwise just names). `current` is a display
@@ -280,6 +287,11 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                         timeout=provider.health_check_timeout,
                         max_concurrent=provider.max_concurrent,
                     )
+            # Restore any persisted maintenance pauses now that every backend is
+            # registered (discovery.clients is populated). Doing this at
+            # create_app time would be a no-op -- clients are empty there.
+            for _prov, _info in config.load_paused_providers().items():
+                discovery.pause_provider(_prov, _info.get("until"), _info.get("reason"))
             yield
         await discovery.shutdown()
 
@@ -412,17 +424,24 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                     break
             alias_info[alias] = resolved
 
-        # Backend status
-        backends: dict[str, Any] = {
-            key: {
+        # Backend status. Surface the maintenance "paused" flag -- routed through
+        # is_provider_paused so an expired pause is honored (and healed) here too,
+        # not just on /v1/available-models -- so operators and the mi100 watchdog
+        # can tell a deliberate pause from a real outage.
+        backends: dict[str, Any] = {}
+        for key, c in disc.clients.items():
+            entry: dict[str, Any] = {
                 "status": c.state.status.value,
                 "models": c.state.models,
                 "last_poll": c.state.last_poll,
                 "inflight_used": c.inflight_used,
                 "inflight_capacity": c.max_concurrent,
             }
-            for key, c in disc.clients.items()
-        }
+            if disc.is_provider_paused(c.provider_name):
+                entry["paused"] = True
+                entry["paused_until"] = c.state.paused_until
+                entry["paused_reason"] = c.state.paused_reason
+            backends[key] = entry
 
         return {
             "mode": matched_modes,
@@ -430,6 +449,43 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
             "aliases": alias_info,
             "backends": backends,
         }
+
+    @app.post("/admin/pause")
+    async def admin_pause(request: Request) -> dict[str, Any]:
+        """Put a provider into maintenance ("paused"): the selector skips its
+        backends without tripping the circuit breaker, and it reads "paused"
+        (not "down"). Body: {"provider": str, "until": ISO8601|null, "reason":
+        str|null}. Persisted (paused-providers.json) so it survives a restart.
+        404 if the provider is not configured. Used by the Reno fleet dashboard
+        scheduler; the dashboard web app never calls this."""
+        cfg = request.app.state.config
+        disc = request.app.state.discovery
+        body = await request.json()
+        provider = body.get("provider")
+        if provider not in cfg.providers:
+            raise HTTPException(404, detail=f"Unknown provider: {provider}")
+        until, reason = body.get("until"), body.get("reason")
+        disc.pause_provider(provider, until, reason)
+        persisted = cfg.load_paused_providers()
+        persisted[provider] = {"until": until, "reason": reason}
+        cfg.save_paused_providers(persisted)
+        return {"ok": True, "provider": provider, "paused": disc.is_provider_paused(provider)}
+
+    @app.post("/admin/resume")
+    async def admin_resume(request: Request) -> dict[str, Any]:
+        """Take a provider out of maintenance. Body: {"provider": str}. Clears
+        the persisted pause too. 404 if the provider is not configured."""
+        cfg = request.app.state.config
+        disc = request.app.state.discovery
+        body = await request.json()
+        provider = body.get("provider")
+        if provider not in cfg.providers:
+            raise HTTPException(404, detail=f"Unknown provider: {provider}")
+        disc.resume_provider(provider)
+        persisted = cfg.load_paused_providers()
+        persisted.pop(provider, None)
+        cfg.save_paused_providers(persisted)
+        return {"ok": True, "provider": provider, "paused": disc.is_provider_paused(provider)}
 
     @app.get("/routing-table")
     async def routing_table(request: Request) -> dict[str, list[str]]:

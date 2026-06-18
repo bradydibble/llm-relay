@@ -1,7 +1,9 @@
 """YAML configuration loader for llm-relay."""
 from __future__ import annotations
 
+import json
 import logging
+import os
 from pathlib import Path
 
 import yaml
@@ -59,6 +61,27 @@ class ConfigLoader:
         self._load_models()
         self._load_modes()
         self._load_policy()
+
+    # --- Maintenance-pause persistence (so a paused provider survives a relay
+    # restart). {provider: {"until": str|null, "reason": str|null}} in
+    # paused-providers.json under the config dir. ---
+    def load_paused_providers(self) -> dict:
+        path = self.config_dir / "paused-providers.json"
+        try:
+            with open(path) as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def save_paused_providers(self, paused: dict) -> None:
+        path = self.config_dir / "paused-providers.json"
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(paused, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
 
     def _load_providers(self) -> None:
         path = self.config_dir / "providers.yaml"

@@ -322,6 +322,46 @@ class DiscoveryManager:
         c = self.clients.get(key)
         return c.state if c else None
 
+    # --- Maintenance pause (set via the relay's /admin/pause; used by the Reno
+    # fleet dashboard scheduler). A paused provider is skipped by the selector
+    # like a down backend, reported as "paused", and the mi100 watchdog stands
+    # down -- so a deliberate take-down isn't fought or alarmed. ---
+    def pause_provider(self, provider: str, until: str | None = None, reason: str | None = None) -> None:
+        for c in self.clients.values():
+            if c.provider_name == provider:
+                c.state.paused = True
+                c.state.paused_until = until
+                c.state.paused_reason = reason
+
+    def resume_provider(self, provider: str) -> None:
+        for c in self.clients.values():
+            if c.provider_name == provider:
+                c.state.paused = False
+                c.state.paused_until = None
+                c.state.paused_reason = None
+
+    def is_provider_paused(self, provider: str) -> bool:
+        """True iff `provider` has a live (non-expired) maintenance pause. An
+        expired `paused_until` auto-resumes (heals state) and returns False."""
+        live = False
+        for c in self.clients.values():
+            if c.provider_name != provider or not c.state.paused:
+                continue
+            until = c.state.paused_until
+            if until:
+                try:
+                    dt = datetime.fromisoformat(until)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    if datetime.now(timezone.utc) >= dt:
+                        continue  # expired
+                except ValueError:
+                    pass  # unparseable -> treat as no expiry (stays paused)
+            live = True
+        if not live:
+            self.resume_provider(provider)  # heal an expired/stale pause
+        return live
+
     async def shutdown(self) -> None:
         for task in self._tasks:
             task.cancel()

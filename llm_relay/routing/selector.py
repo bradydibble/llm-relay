@@ -150,6 +150,9 @@ class ModelSelector:
         ranked = self._prepare_ranked(ctx)
         # Walk in priority order and return the first that is currently up.
         for name in ranked:
+            cfg = self.config.models.models.get(name)
+            if cfg and self.discovery.is_provider_paused(cfg.provider):
+                continue  # deliberate maintenance pause: skip like a down backend
             if _is_available(self.discovery.get_model_state(name)):
                 return name
         return None
@@ -177,6 +180,8 @@ class ModelSelector:
             provider = self.config.providers.get(cfg.provider)
             if not provider:
                 continue
+            if self.discovery.is_provider_paused(cfg.provider):
+                continue  # deliberate maintenance pause: skip like a down backend
             backend_url = compose_backend_url(provider.base_url, cfg.port, cfg.path)
             backend_key = compose_backend_key(cfg.provider, cfg.port, cfg.path or "")
             slot_wait_timeout = provider.slot_wait_timeout

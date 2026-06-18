@@ -134,6 +134,13 @@ class EndpointState:
     consecutive_failures: int = 0
     circuit_open: bool = False
     circuit_opened_at: float | None = None
+    # Deliberate maintenance pause (set via the relay's /admin/pause; used by the
+    # Reno fleet dashboard scheduler). A paused provider is skipped by the router
+    # like a down backend but reported as "paused" (not "down"). paused_until is
+    # an ISO8601 string or None (indefinite).
+    paused: bool = False
+    paused_until: str | None = None
+    paused_reason: str | None = None
 
 
 @dataclass
