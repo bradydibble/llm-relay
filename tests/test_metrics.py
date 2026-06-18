@@ -197,8 +197,9 @@ def test_records_ttft_observation_when_provided():
 
 
 def test_ttft_not_observed_when_none():
-    # Non-streaming (or zero-chunk) requests pass ttft_s=None -> no observation,
-    # so the series is never created (TTFT only meaningful for streamed tokens).
+    # record_request only observes the ttft it is handed: ttft_s=None -> no
+    # observation, so the series is never created. (emit_chat_completion derives
+    # a non-streamed ttft from llama.cpp timings upstream of this call.)
     rm = _rm()
     rm.record_request(
         alias="a", model="m", provider="prov-a", outcome="success",
@@ -232,6 +233,60 @@ def test_emit_chat_completion_threads_ttft_ns_to_histogram(monkeypatch):
         "llm_relay_ttft_seconds_sum", {"provider": "prov-a", "model": "m"})
     assert count == 1.0
     assert abs(s - 0.25) < 1e-9
+
+
+def test_emit_chat_completion_derives_ttft_from_timings_when_not_provided(monkeypatch):
+    """A non-streamed llama.cpp response carries server-side prefill time in
+    timings.prompt_ms. When the caller doesn't measure an end-to-end ttft_ns (the
+    non-streaming path never does), emit_chat_completion derives TTFT from
+    prompt_ms so the aggregate histogram isn't streaming-only."""
+    from llm_relay.api.instrumentation import emit_chat_completion
+    from llm_relay import metrics as metrics_mod
+
+    rm = RelayMetrics(registry=CollectorRegistry())
+    monkeypatch.setattr(metrics_mod, "get_metrics", lambda: rm)
+
+    emit_chat_completion(
+        request_body={"model": "main"},
+        response_body={"choices": [], "timings": {"prompt_ms": 1500.0}},
+        response_text=None, usage=None,
+        model_resolved="m", provider_name="prov-a",
+        user_agent="ua", start_ns=0, end_ns=2_000_000_000,
+        status_code=200, streamed=False, outcome="success",
+        # ttft_ns omitted -> must be derived from timings.prompt_ms
+    )
+
+    count = rm.registry.get_sample_value(
+        "llm_relay_ttft_seconds_count", {"provider": "prov-a", "model": "m"})
+    s = rm.registry.get_sample_value(
+        "llm_relay_ttft_seconds_sum", {"provider": "prov-a", "model": "m"})
+    assert count == 1.0
+    assert abs(s - 1.5) < 1e-9  # 1500 ms -> 1.5 s
+
+
+def test_explicit_ttft_ns_wins_over_timings(monkeypatch):
+    """The streaming path passes a true end-to-end ttft_ns; it must take
+    precedence over any timings.prompt_ms in the body — the measured value is
+    better than the prefill proxy, and we never double-count."""
+    from llm_relay.api.instrumentation import emit_chat_completion
+    from llm_relay import metrics as metrics_mod
+
+    rm = RelayMetrics(registry=CollectorRegistry())
+    monkeypatch.setattr(metrics_mod, "get_metrics", lambda: rm)
+
+    emit_chat_completion(
+        request_body={"model": "main"},
+        response_body={"choices": [], "timings": {"prompt_ms": 9000.0}},
+        response_text=None, usage=None,
+        model_resolved="m", provider_name="prov-a",
+        user_agent="ua", start_ns=0, end_ns=2_000_000_000,
+        status_code=200, streamed=True, outcome="success",
+        ttft_ns=250_000_000,  # explicit end-to-end measurement wins
+    )
+
+    s = rm.registry.get_sample_value(
+        "llm_relay_ttft_seconds_sum", {"provider": "prov-a", "model": "m"})
+    assert abs(s - 0.25) < 1e-9  # 0.25 s, NOT 9.0 s from prompt_ms
 
 
 def test_fallback_increments_fallbacks_total_only_when_fell_back():

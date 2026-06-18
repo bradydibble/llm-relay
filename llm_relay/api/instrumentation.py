@@ -190,6 +190,18 @@ def emit_chat_completion(
     """Emit telemetry for one chat completion: Prometheus metrics (always) and,
     when LLM_RELAY_TELEMETRY is enabled, an OpenInference span. Best-effort;
     never raises into the request path."""
+    # A non-streamed llama.cpp response carries server-side prefill time in
+    # `timings.prompt_ms`. When the caller didn't measure an end-to-end value (the
+    # streaming path passes a real first-chunk ttft_ns; the non-streaming path
+    # passes none), fall back to prompt_ms as the TTFT proxy: prefill dominates
+    # TTFT on this fleet, so it's a faithful stand-in and it keeps the aggregate
+    # ttft histogram from being streaming-only. Flows to both the Prometheus
+    # histogram and the span's TTFT attribute below. Backends that don't report
+    # timings (e.g. vLLM) leave ttft_ns None — no fabricated value.
+    if ttft_ns is None and isinstance(response_body, dict):
+        _pm = (response_body.get("timings") or {}).get("prompt_ms")
+        if isinstance(_pm, (int, float)) and _pm >= 0:
+            ttft_ns = int(_pm * 1e6)
     # Metrics first, independent of the OTLP tracer (Phoenix may be down).
     try:
         duration_s = max(0.0, (end_ns - start_ns) / 1e9)
