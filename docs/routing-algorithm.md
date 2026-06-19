@@ -94,6 +94,15 @@ big-enough model exists in the catalog but is currently down → back off and re
 from **`oversize_period`** (nothing in the fleet is big enough → resize or defer),
 with the estimated tokens, the max available now, and the max in catalog.
 
+If context is **not** the binding constraint, the relay still distinguishes a
+*transient* shortage from a genuine one. When the constraints would be satisfied by
+a configured model that is merely down or paused right now (a discovery blip or a
+maintenance pause), the 503 carries a `Retry-After` header and the `no_backend`
+outcome, so a batch caller waits and retries rather than failing hard. Only a
+genuine mismatch — no configured model can ever satisfy the constraints (e.g. tools
+required but none is tool-capable, or a privacy / reasoning floor that nothing
+meets) — is terminal (`no_candidate`), since retrying cannot help.
+
 ## Step 5 — Forward
 
 - Compute the backend URL from the chosen model's `provider`, `port`, and

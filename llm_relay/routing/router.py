@@ -10,7 +10,7 @@ import httpx
 from fastapi import HTTPException
 
 from ..config.loader import ConfigLoader
-from ..config.types import Privacy, SaturationError
+from ..config.types import NoBackendAvailableError, Privacy, SaturationError
 from ..discovery.endpoint import _shared_upstream_bearer
 from ..discovery.manager import DiscoveryManager
 from .keys import compose_backend_key, compose_backend_url
@@ -23,6 +23,13 @@ from .selector import ChainCandidate, ModelSelector, RoutingContext
 # time (see _clamp_max_tokens). So a generous max_tokens neither widens nor pins
 # routing; only a prompt that genuinely fits nothing live is refused (oversize).
 MIN_OUTPUT_HEADROOM = 1024
+
+# Retry-After hint (seconds) for a TRANSIENT no-candidate: the constraints are
+# satisfiable but every matching backend is momentarily down/paused. Sized to the
+# ~15s discovery poll cadence, so a recovered/unpaused backend is re-detected
+# within roughly one retry. The caller backs off and retries instead of treating
+# the empty chain as terminal.
+NO_BACKEND_RETRY_AFTER = 15.0
 
 
 @dataclass
@@ -243,6 +250,15 @@ class RequestRouter:
             shortfall = self.selector.diagnose_context_shortfall(ctx)
             if shortfall is not None:
                 detail["context"] = shortfall
+                raise HTTPException(status_code=503, detail=detail)
+            # Not a context shortfall: if the constraints WOULD be met by a
+            # configured model that's merely down/paused right now (a discovery
+            # blip or a maintenance pause), the empty chain is a TRANSIENT
+            # availability gap — answer with Retry-After backpressure so batch
+            # callers wait and retry, instead of a terminal "No model matches
+            # constraints". A genuine mismatch (nothing can ever match) stays terminal.
+            if self.selector.is_transient_no_candidate(ctx):
+                raise NoBackendAvailableError(retry_after_seconds=NO_BACKEND_RETRY_AFTER)
             raise HTTPException(status_code=503, detail=detail)
 
         # "connection_error" in retry_on means network exceptions; HTTP codes

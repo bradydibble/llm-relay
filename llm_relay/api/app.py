@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from ..config.loader import ConfigLoader
-from ..config.types import SaturationError
+from ..config.types import NoBackendAvailableError, SaturationError
 from ..discovery.manager import DiscoveryManager
 from ..routing.keys import compose_backend_key, compose_model_id, resolve_model_id
 from ..routing.router import RequestRouter
@@ -552,6 +552,23 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=503,
                 detail={"error": "backend saturated", "backend": e.backend_key,
+                        "retry_after_seconds": e.retry_after_seconds},
+                headers={"Retry-After": str(max(1, int(e.retry_after_seconds)))},
+            )
+        except NoBackendAvailableError as e:
+            # Transient availability gap (constraints satisfiable, every match
+            # momentarily down/paused): 503 + Retry-After backpressure, a distinct
+            # outcome from saturation (slots full) and from a genuine no-candidate.
+            emit_chat_completion(
+                request_body=body, response_body=None, response_text=None, usage=None,
+                model_resolved=None, provider_name=None,
+                user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
+                status_code=503, streamed=is_stream, error=str(e),
+                outcome="no_backend", client=client,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "no backend available",
                         "retry_after_seconds": e.retry_after_seconds},
                 headers={"Retry-After": str(max(1, int(e.retry_after_seconds)))},
             )

@@ -759,3 +759,37 @@ def test_diagnose_context_shortfall_none_when_nothing_live():
     disc = DiscoveryManager()
     sel = ModelSelector(c, disc)
     assert sel.diagnose_context_shortfall(RoutingContext(requested_model="main", min_context=100000)) is None
+
+
+# ---------------------------------------------------------------------------
+# Transient availability gap vs genuine no-match. When select_chain is empty and
+# it is NOT a context shortfall, distinguish "constraints are satisfiable by a
+# configured model that's just down/paused right now" (transient -> the API
+# answers with Retry-After backpressure) from "nothing could ever match"
+# (genuine -> terminal 503). Batch crons hitting `main` during a brief discovery
+# gap previously got a terminal "No model matches constraints" instead of a
+# retryable signal.
+# ---------------------------------------------------------------------------
+
+def test_transient_no_candidate_true_when_constraints_met_but_all_down():
+    """The whole fleet is DOWN -> select_chain is empty, but main's members satisfy
+    the constraints (they're just unavailable), so it's a transient availability
+    gap, not a genuine mismatch. (Contrast diagnose_context_shortfall above, which
+    returns None for this same 'nothing live' case.)"""
+    c = _load()
+    disc = DiscoveryManager()  # nothing live
+    sel = ModelSelector(c, disc)
+    ctx = RoutingContext(requested_model="main")
+    assert sel.select_chain(ctx) == []
+    assert sel.is_transient_no_candidate(ctx) is True
+
+
+def test_transient_no_candidate_false_when_no_model_meets_constraints():
+    """A reasoning floor nothing can meet -> even with every backend up, no model
+    matches. Genuine mismatch: retrying can't help, so NOT transient."""
+    c = _load()
+    disc = _disc_serving("qwen3.5-9b", "qwen3.5-35b")  # live, but floored out below
+    sel = ModelSelector(c, disc)
+    ctx = RoutingContext(requested_model="main", min_preference=99.0)
+    assert sel.select_chain(ctx) == []
+    assert sel.is_transient_no_candidate(ctx) is False

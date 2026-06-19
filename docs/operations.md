@@ -154,7 +154,7 @@ with `LLM_RELAY_METRICS=0`.
 
 | Series | Type | Labels | Meaning |
 |---|---|---|---|
-| `llm_relay_requests_total` | counter | provider, model, alias, outcome, client | Routed requests. `outcome` ∈ success / upstream_error / saturated / network_error / no_candidate / backend_error. |
+| `llm_relay_requests_total` | counter | provider, model, alias, outcome, client | Routed requests. `outcome` ∈ success / upstream_error / saturated / network_error / no_candidate / no_backend / backend_error. `no_backend` is a *transient* no-candidate (the constraints are satisfiable, but every matching backend is momentarily down or paused) and is returned with a `Retry-After` header so batch callers wait and retry; `no_candidate` is the genuine case (nothing can ever match) and is terminal; `saturated` is slots-full backpressure. |
 | `llm_relay_tokens_total` | counter | provider, model, direction, client | Tokens, `direction` ∈ prompt / completion. |
 | `llm_relay_fallbacks_total` | counter | alias, model, client | Requests served by a non-preferred candidate (router fell back). |
 | `llm_relay_request_duration_seconds` | histogram | provider, model | End-to-end relay request duration. |

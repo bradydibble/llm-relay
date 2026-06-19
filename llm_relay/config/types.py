@@ -174,3 +174,20 @@ class SaturationError(Exception):
         super().__init__(f"backend {backend_key} saturated; retry after {retry_after_seconds:.1f}s")
         self.backend_key = backend_key
         self.retry_after_seconds = retry_after_seconds
+
+
+class NoBackendAvailableError(Exception):
+    """Raised when no candidate is currently available but the request's
+    constraints WOULD be satisfied by a configured model that is merely down or
+    paused right now — a transient availability gap, not a genuine mismatch.
+
+    Carries retry_after_seconds so the API can emit a Retry-After header, letting
+    batch callers wait and retry through a brief discovery gap or maintenance
+    pause instead of treating "No model matches constraints" as terminal.
+    Distinct from SaturationError (slots full on a REACHABLE backend) and from a
+    genuine no-candidate 503 (no configured model can ever match the constraints).
+    """
+
+    def __init__(self, retry_after_seconds: float):
+        super().__init__(f"no backend available; retry after {retry_after_seconds:.1f}s")
+        self.retry_after_seconds = retry_after_seconds

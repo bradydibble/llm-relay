@@ -354,6 +354,29 @@ class ModelSelector:
             "classification": "oversize_for_now" if ctx.min_context <= max_catalog else "oversize_period",
         }
 
+    def is_transient_no_candidate(self, ctx: RoutingContext) -> bool:
+        """True when an empty candidate chain is a transient availability gap, not
+        a genuine constraint mismatch.
+
+        Call when ``select_chain(ctx)`` returned nothing AND it is not a context
+        shortfall (``diagnose_context_shortfall`` is None). Re-applies the request's
+        NON-availability constraints (privacy, require_tools, reasoning floor,
+        context) to its candidate set while ignoring availability: if some
+        configured model WOULD serve once it is back up, then an empty chain means
+        every match is currently down or paused → transient, so the API answers
+        with Retry-After backpressure and the caller waits and retries. If nothing
+        satisfies the constraints at all (require_tools with no tool-capable model,
+        privacy with no local model, a floor nothing meets) it is genuine →
+        terminal, because retrying cannot help.
+
+        Mirrors ``diagnose_context_shortfall``'s oversize_for_now logic (a model
+        exists but is down → wait) for the plain-availability case that method
+        returns None for. Availability is deliberately NOT applied here: a
+        constraint-satisfying model that is merely down is exactly what to wait on.
+        """
+        candidates, _ = self._build_candidates(ctx)
+        return bool(self._apply_constraints(ctx, candidates))
+
     def get_fallback_chain(self, model_name: str) -> list[str]:
         for chain in self.config.policy.fallback.graph.values():
             if model_name in chain:

@@ -575,3 +575,41 @@ async def test_brief_blip_below_threshold_does_not_wipe(monkeypatch):
     assert models == ["m1"]
     assert client.inflight_used == 1
     assert client.backend_resets == 0
+
+
+# ---------------------------------------------------------------------------
+# API-layer: a TRANSIENT no-candidate (constraints satisfiable but every matching
+# backend is momentarily down/paused) returns 503 + Retry-After, distinct from a
+# genuine no-match (terminal). Lets batch callers wait+retry through a brief
+# discovery gap instead of hard-failing on "No model matches constraints".
+# ---------------------------------------------------------------------------
+
+async def test_chat_completions_returns_503_retry_after_on_transient_no_backend(tmp_path, monkeypatch):
+    """When route_and_forward raises NoBackendAvailableError, /v1/chat/completions
+    returns 503 with a Retry-After header (backpressure), not the terminal
+    no-candidate 503."""
+    import httpx
+    from httpx import ASGITransport
+
+    from llm_relay.api.app import create_app
+    from llm_relay.config.types import NoBackendAvailableError
+
+    cfg_dir = _make_minimal_config(tmp_path)
+    app = create_app(config_dir=cfg_dir)
+
+    async def _fake_route_and_forward(request_data, headers=None, stream=False):
+        raise NoBackendAvailableError(retry_after_seconds=15.0)
+
+    monkeypatch.setattr(app.state.router, "route_and_forward", _fake_route_and_forward)
+
+    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"model": "test-model", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert resp.status_code == 503
+    assert "Retry-After" in resp.headers
+    assert int(resp.headers["Retry-After"]) >= 1
+    body = resp.json()
+    assert body["detail"]["error"] == "no backend available"
