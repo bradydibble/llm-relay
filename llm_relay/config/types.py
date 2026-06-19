@@ -68,6 +68,13 @@ class ModelConfig:
     # (aliases[uc] = models tagged uc, sorted by priority desc, then preference,
     # then name). Higher priority = preferred earlier in that category's chain.
     use_cases: dict[str, float] = field(default_factory=dict)
+    # Isolation flag. When True the model is reachable ONLY by its exact name
+    # (explicit strict request); it is held out of every auto-selection surface
+    # (alias open-fallthrough tail and the unknown-id open ranking). Pair with an
+    # empty `use_cases` so it is also not a named member of any category. Used for
+    # backends an agent must never reach by accident (e.g. a costly/experimental
+    # model wired into the relay but gated to manual use).
+    manual_only: bool = False
 
 
 @dataclass

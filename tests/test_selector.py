@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from llm_relay.config.loader import ConfigLoader
-from llm_relay.config.types import CircuitBreaker, EndpointState, EndpointStatus, ModelStatus
+from llm_relay.config.types import CircuitBreaker, EndpointState, EndpointStatus, ModelConfig, ModelStatus
 from llm_relay.discovery.endpoint import EndpointClient
 from llm_relay.discovery.manager import DiscoveryManager
 from llm_relay.routing.selector import ModelSelector, RoutingContext
@@ -87,6 +87,52 @@ def test_alias_skips_unavailable():
     sel = ModelSelector(c, disc)
     pick = sel.select_best(RoutingContext(requested_model="subagent"))
     assert pick == "qwen3.5-35b"
+
+
+def _mark_available(disc, name):
+    """Mark `name` available on a healthy backend (mirrors the fixtures above)."""
+    key = f"k_{name}"
+    disc.clients[key] = EndpointClient(
+        provider_name="p", base_url="x",
+        state=EndpointState(provider="p", status=EndpointStatus.healthy, models=[name]),
+    )
+    disc.model_to_client[name] = key
+
+
+def test_manual_only_is_isolated_from_autoselection():
+    """A manual_only model is reachable ONLY by exact name: it must never appear in
+    the alias open-fallthrough tail or the unknown-id open ranking, even when live
+    with top preference. (Hard requirement: agents on aliases must not accidentally
+    route to the isolated GLM backend.) Exact-name strict requests still return it."""
+    c = _load()
+    disc = DiscoveryManager()
+    # An isolated model and a normal model, both live, both top-preference.
+    c.models.models["iso-model"] = ModelConfig(
+        provider="p", preference=0.99, capabilities=["tool_use"], manual_only=True
+    )
+    c.models.models["open-model"] = ModelConfig(
+        provider="p", preference=0.99, capabilities=["tool_use"], manual_only=False
+    )
+    _mark_available(disc, "iso-model")
+    _mark_available(disc, "open-model")
+    sel = ModelSelector(c, disc)
+
+    # 1. Alias request: the normal live model joins the open-fallthrough tail; the
+    #    manual_only model does NOT, despite identical (top) preference.
+    cands, _ = sel._build_candidates(RoutingContext(requested_model="main"))
+    assert "open-model" in cands, "a normal live model should reach the alias tail"
+    assert "iso-model" not in cands, "manual_only must be held out of the alias tail"
+
+    # 2. Unknown bare name -> open ranking over the live fleet excludes manual_only.
+    cands_u, ordered_u = sel._build_candidates(RoutingContext(requested_model="totally-unknown-zzz"))
+    assert ordered_u is False
+    assert "open-model" in cands_u
+    assert "iso-model" not in cands_u
+
+    # 3. Explicit exact name under strict pinning -> returns ONLY that model.
+    c.policy.explicit.strict = True
+    cands_e, ordered_e = sel._build_candidates(RoutingContext(requested_model="iso-model"))
+    assert cands_e == ["iso-model"] and ordered_e is True
 
 
 def test_get_model_state_unavailable_when_backend_healthy_but_not_serving_model():

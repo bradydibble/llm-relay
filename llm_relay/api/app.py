@@ -174,6 +174,10 @@ def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[
             "privacy": m.privacy.value,
             "port": m.port,
             "path": m.path,
+            # Isolated backend: reachable only by exact name, never via alias /
+            # category fallthrough / open ranking (see selector manual_only). The
+            # cockpit shows it; well-behaved auto-pickers should skip it.
+            "manual_only": m.manual_only,
         }
         # A deliberately-paused provider reads "paused" (not its discovered
         # status) so clients see it's intentionally out of rotation, not down.

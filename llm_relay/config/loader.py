@@ -142,6 +142,7 @@ class ConfigLoader:
                 preference=cfg.get("preference", 0.5),
                 privacy=Privacy(cfg.get("privacy", "local_only")),
                 use_cases={k: float(v) for k, v in (cfg.get("use_cases") or {}).items()},
+                manual_only=bool(cfg.get("manual_only", False)),
             )
         self._derive_aliases_from_use_cases()
 

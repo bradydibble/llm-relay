@@ -235,7 +235,8 @@ class ModelSelector:
         # here (the id isn't a config key). Unordered -> _rank sorts by preference.
         live = [
             name for name in self.config.models.models
-            if _is_available(self.discovery.get_model_state(name))
+            if not self.config.models.models[name].manual_only
+            and _is_available(self.discovery.get_model_state(name))
         ]
         return live, False
 
@@ -298,7 +299,9 @@ class ModelSelector:
         excluded = set(exclude)
         live = [
             name for name in self.config.models.models
-            if name not in excluded and _is_available(self.discovery.get_model_state(name))
+            if name not in excluded
+            and not self.config.models.models[name].manual_only
+            and _is_available(self.discovery.get_model_state(name))
         ]
         return self._rank(live)
 
