@@ -77,9 +77,18 @@ class RequestRouter:
         bearer = _shared_upstream_bearer()
         if bearer and "Authorization" not in merged_headers:
             merged_headers["Authorization"] = f"Bearer {bearer}"
+        # Structured timeout, mirroring the streaming path (see stream_request): a
+        # GENEROUS read window so a slow large completion runs to completion on the
+        # local 35B (a ~70k prompt prefills 100-250s+ before the first byte), but a
+        # SHORT connect so a genuinely dead backend fails fast instead of holding the
+        # slot for the whole window. The old flat 300s TOTAL cap silently overrode a
+        # caller's longer client timeout (the wiki engine sets 900s) and killed any
+        # non-stream completion past five minutes — an arbitrary cutoff on hardware
+        # that is idle most of the day. The read window matches the engine's 900s.
+        timeout = httpx.Timeout(connect=10.0, read=900.0, write=10.0, pool=10.0)
         # backend_key="" / None → acquire_slot is a no-op (no semaphore registered).
         async with self.discovery.acquire_slot(backend_key or "", wait_timeout=slot_wait_timeout):
-            async with httpx.AsyncClient(timeout=300.0) as client:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 return await client.post(
                     f"{backend_url}/chat/completions",
                     json=body,
