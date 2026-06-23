@@ -28,6 +28,7 @@ from .instrumentation import (
 )
 from ..metrics import configure_clients_from_env, did_fall_back, metrics_enabled, register_discovery_collector, render_exposition, resolve_client, set_known_routable
 from ..logbuffer import install_log_buffer
+from ..scheduler import AdmissionController
 
 
 def _resolve_base_url() -> str:
@@ -441,6 +442,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
     app.state.config = config
     app.state.discovery = discovery
     app.state.router = router
+    app.state.admission = AdmissionController()
 
     # Per-user API-key auth (a no-op when disabled). Installed here so it wraps
     # every route, including the MCP mount.
@@ -680,6 +682,24 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
         client = resolve_client(request.headers.get("X-Llm-Relay-Client"), user_agent)
         start_ns = time.time_ns()
         is_stream = body.get("stream") is True
+
+        # QoS admission (plan 4, slice 1): shed explicitly low-urgency work under
+        # fleet contention so high-urgency / interactive work keeps flowing.
+        if request.app.state.admission.should_shed(
+            request.headers.get("X-Llm-Relay-Urgency"), request.app.state.discovery
+        ):
+            emit_chat_completion(
+                request_body=body, response_body=None, response_text=None, usage=None,
+                model_resolved=None, provider_name=None,
+                user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
+                status_code=429, streamed=is_stream, error="shed: low urgency under contention",
+                outcome="shed", client=client,
+            )
+            raise HTTPException(
+                status_code=429,
+                detail={"error": "shed under contention (low urgency); retry shortly"},
+                headers={"Retry-After": "5"},
+            )
 
         try:
             if is_stream:
