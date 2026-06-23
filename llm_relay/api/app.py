@@ -29,6 +29,8 @@ from .instrumentation import (
 from ..metrics import configure_clients_from_env, did_fall_back, metrics_enabled, register_discovery_collector, render_exposition, resolve_client, set_known_routable
 from ..logbuffer import install_log_buffer
 from ..scheduler import AdmissionController
+from ..jobs import JobStore
+from ..jobworker import run_worker
 
 
 def _resolve_base_url() -> str:
@@ -426,7 +428,19 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                         _reconcile_discovered(config, discovery, discover_keys, key_meta)
 
                 discovery._tasks.append(asyncio.create_task(_reconcile_loop()))
-            yield
+            # Async job worker (plan 4 slice 2): reconcile any jobs left running by
+            # a crash (-> interrupted, never silently re-run), then run until shutdown.
+            app.state.job_store.reconcile_on_start()
+            _job_stop = asyncio.Event()
+            _job_task = asyncio.create_task(run_worker(app.state.job_store, router, _job_stop))
+            try:
+                yield
+            finally:
+                _job_stop.set()
+                try:
+                    await asyncio.wait_for(_job_task, timeout=10)
+                except Exception:
+                    pass
         await discovery.shutdown()
 
     # --- MCP sub-app (optional dep) -----------------------------------
@@ -443,6 +457,8 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
     app.state.discovery = discovery
     app.state.router = router
     app.state.admission = AdmissionController()
+    # Durable async job store (plan 4 slice 2); the worker is started in lifespan.
+    app.state.job_store = JobStore(cfg_path / "jobs.json")
 
     # Per-user API-key auth (a no-op when disabled). Installed here so it wraps
     # every route, including the MCP mount.
@@ -938,6 +954,41 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
         return StreamingResponse(
             gen(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no"}
         )
+
+    @app.post("/v1/jobs")
+    async def submit_job(request: Request):
+        """Submit an agentic chat job to the async lane (plan 4 slice 2). Returns a
+        job id; poll GET /v1/jobs/{id} for status and result. The job survives a
+        relay restart (durable store)."""
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, detail="Invalid JSON")
+        principal = getattr(request.state, "principal", None)
+        job = request.app.state.job_store.create(
+            principal=getattr(principal, "id", "anonymous"),
+            body=body,
+            sla_class=request.headers.get("X-Llm-Relay-SLA-Class"),
+            urgency=request.headers.get("X-Llm-Relay-Urgency"),
+            priority_weight=getattr(principal, "priority_weight", 1.0),
+            created_ts=time.time(),
+        )
+        return JSONResponse(status_code=202, content={"job_id": job.id, "status": job.status})
+
+    @app.get("/v1/jobs/{job_id}")
+    async def get_job(job_id: str, request: Request) -> dict[str, Any]:
+        job = request.app.state.job_store.get(job_id)
+        if job is None:
+            raise HTTPException(404, detail=f"Unknown job: {job_id}")
+        return job.public()
+
+    @app.post("/v1/jobs/{job_id}/cancel")
+    async def cancel_job(job_id: str, request: Request) -> dict[str, Any]:
+        store = request.app.state.job_store
+        if store.get(job_id) is None:
+            raise HTTPException(404, detail=f"Unknown job: {job_id}")
+        cancelled = store.cancel(job_id)
+        return {"job_id": job_id, "cancelled": cancelled, "status": store.get(job_id).status}
 
     # Mount MCP at /mcp
     if _mcp_app is not None:
