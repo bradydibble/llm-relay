@@ -91,6 +91,11 @@ class ModelConfig:
     # the dispatcher (plan 3) consumes logical models.
     logical: str | None = None
     quant: str | None = None
+    # Request filters (plan 5): keys to strip from, and key/values to set on, the
+    # request before it is forwarded to this model's upstream (normalize sampling
+    # defaults, drop fields a backend rejects). Empty = no rewrite.
+    strip_params: list[str] = field(default_factory=list)
+    set_params: dict = field(default_factory=dict)
 
 
 @dataclass

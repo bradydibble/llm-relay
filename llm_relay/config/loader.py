@@ -191,6 +191,8 @@ class ConfigLoader:
                 manual_only=bool(cfg.get("manual_only", False)),
                 logical=cfg.get("logical"),
                 quant=cfg.get("quant"),
+                strip_params=cfg.get("strip_params", []) or [],
+                set_params=cfg.get("set_params", {}) or {},
             )
         self._derive_aliases_from_use_cases()
         self._derive_logical_models()

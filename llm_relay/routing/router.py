@@ -59,6 +59,29 @@ class RequestRouter:
             return None
         return compose_backend_url(provider.base_url, cfg.port, cfg.path)
 
+    def _apply_filters(self, body: dict[str, Any], model_name: str) -> dict[str, Any]:
+        """Strip/override request params per the model's configured filters
+        (plan 5), before the request hits the upstream. Returns a new dict and
+        never mutates the caller's body; returns the same object when there is
+        nothing to do. Applied before ``model`` is set, so a filter cannot drop
+        or rewrite the routed model id."""
+        # None-safe: stream_request is exercised with config=None in tests (its
+        # slot/stream logic must not depend on config), so a missing config simply
+        # means no filters.
+        config = self.config
+        if config is None:
+            return body
+        cfg = config.models.models.get(model_name)
+        if not cfg:
+            return body
+        strip = cfg.strip_params or []
+        setp = cfg.set_params or {}
+        if not strip and not setp:
+            return body
+        out = {k: v for k, v in body.items() if k not in strip}
+        out.update(setp)
+        return out
+
     async def forward_request(
         self,
         backend_url: str,
@@ -67,8 +90,9 @@ class RequestRouter:
         headers: dict[str, str] | None = None,
         backend_key: str | None = None,
         slot_wait_timeout: float = 30.0,
+        upstream_path: str = "chat/completions",
     ) -> httpx.Response:
-        body = dict(request_data)
+        body = self._apply_filters(dict(request_data), model_name)
         body["model"] = model_name
         merged_headers = {"Content-Type": "application/json", **(headers or {})}
         # Authenticate to api-key'd upstreams using the shared homelab bearer
@@ -90,7 +114,7 @@ class RequestRouter:
         async with self.discovery.acquire_slot(backend_key or "", wait_timeout=slot_wait_timeout):
             async with httpx.AsyncClient(timeout=timeout) as client:
                 return await client.post(
-                    f"{backend_url}/chat/completions",
+                    f"{backend_url}/{upstream_path}",
                     json=body,
                     headers=merged_headers,
                 )
@@ -121,7 +145,7 @@ class RequestRouter:
         ``await`` can be preempted by that cancellation — which is exactly how
         the slot used to leak.
         """
-        body = dict(request_data)
+        body = self._apply_filters(dict(request_data), model_name)
         body["model"] = model_name
         # Ask the upstream to include token usage in the final SSE event. Standard
         # OpenAI streaming omits usage; this opts back in so cross-provider captures
@@ -438,6 +462,70 @@ class RequestRouter:
                 },
             },
         )
+
+    async def route_simple(
+        self,
+        request_data: dict[str, Any],
+        headers: dict[str, str] | None = None,
+        upstream_path: str = "embeddings",
+    ):
+        """Minimal non-streaming proxy for simple endpoints (embeddings, rerank,
+        and future audio/images). Routes by the requested model/alias/logical id,
+        forwards to ``upstream_path``, and retries on retry_on statuses. No prompt
+        sizing or max_tokens clamp (those are chat-specific). Returns
+        ``(httpx.Response, RouteResult)``; raises HTTPException(503) when no
+        candidate, SaturationError when the whole chain is full."""
+        headers = headers or {}
+        privacy_str = headers.get("X-Llm-Relay-Privacy", "local_only")
+        privacy = Privacy(privacy_str if privacy_str in ("local_only", "cloud_ok") else "local_only")
+        ctx = RoutingContext(requested_model=request_data.get("model", "") or "", privacy=privacy)
+        candidates = self.selector.select_chain(ctx)
+        if not candidates:
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "No model matches constraints",
+                        "decision": {"requested": ctx.requested_model}},
+            )
+        retry_codes = {c for c in self.config.policy.fallback.retry_on if c != "connection_error"}
+        retry_exceptions = (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError)
+        last_response: httpx.Response | None = None
+        last_response_candidate: ChainCandidate | None = None
+        last_error: Exception | None = None
+        saturation_error: SaturationError | None = None
+        for candidate in candidates:
+            route_result = _candidate_to_route_result(candidate, ctx)
+            if not self.discovery.has_free_slot(candidate.backend_key):
+                if saturation_error is None:
+                    saturation_error = SaturationError(
+                        backend_key=candidate.backend_key,
+                        retry_after_seconds=candidate.slot_wait_timeout,
+                    )
+                continue
+            try:
+                resp = await self.forward_request(
+                    candidate.backend_url, candidate.model, request_data,
+                    headers=headers, backend_key=candidate.backend_key,
+                    slot_wait_timeout=candidate.slot_wait_timeout,
+                    upstream_path=upstream_path,
+                )
+                if str(resp.status_code) in retry_codes:
+                    last_response = resp
+                    last_response_candidate = candidate
+                    continue
+                return resp, route_result
+            except SaturationError as exc:
+                saturation_error = saturation_error or exc
+                continue
+            except retry_exceptions as exc:
+                last_error = exc
+                continue
+        if last_response is not None:
+            return last_response, _candidate_to_route_result(last_response_candidate, ctx)  # type: ignore[arg-type]
+        if last_error is not None:
+            raise last_error
+        if saturation_error is not None:
+            raise saturation_error
+        raise HTTPException(status_code=503, detail={"error": "No model matches constraints"})
 
 
 def _candidate_to_route_result(candidate: ChainCandidate, ctx: RoutingContext) -> RouteResult:

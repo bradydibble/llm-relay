@@ -27,6 +27,7 @@ from .instrumentation import (
     sse_finished,
 )
 from ..metrics import configure_clients_from_env, did_fall_back, metrics_enabled, register_discovery_collector, render_exposition, resolve_client, set_known_routable
+from ..logbuffer import install_log_buffer
 
 
 def _resolve_base_url() -> str:
@@ -446,6 +447,9 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
     from .middleware import install_auth_middleware
     install_auth_middleware(app)
 
+    # In-memory log buffer for /logs and /logs/stream (plan 7), tailed by the cockpit.
+    app.state.log_buffer = install_log_buffer()
+
     async def _available(request: Request) -> dict[str, Any]:
         return _build_available_payload(
             request.app.state.config, request.app.state.discovery
@@ -836,6 +840,84 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
             fell_back=did_fall_back(result.selected_model, (result.decision or {}).get("ranked") or []),
         )
         return JSONResponse(status_code=upstream.status_code, content=content, headers=relay_headers)
+
+    async def _simple_proxy(request: Request, upstream_path: str):
+        """Shared handler for simple non-streaming endpoints (embeddings, rerank).
+        Routes by the requested model and forwards to ``upstream_path`` (plan 6)."""
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, detail="Invalid JSON")
+        hint_headers = {
+            k: request.headers[k] for k in ("X-Llm-Relay-Privacy",) if k in request.headers
+        }
+        try:
+            upstream, result = await request.app.state.router.route_simple(
+                body, headers=hint_headers, upstream_path=upstream_path,
+            )
+        except SaturationError as e:
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "backend saturated", "retry_after_seconds": e.retry_after_seconds},
+                headers={"Retry-After": str(max(1, int(e.retry_after_seconds)))},
+            )
+        except NoBackendAvailableError as e:
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "no backend available", "retry_after_seconds": e.retry_after_seconds},
+                headers={"Retry-After": str(max(1, int(e.retry_after_seconds)))},
+            )
+        except httpx.RequestError as e:
+            raise HTTPException(502, detail=f"Backend network error: {e}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(502, detail=f"Backend error: {e}")
+        try:
+            content = upstream.json()
+        except Exception:
+            content = {"raw": upstream.text}
+        return JSONResponse(
+            status_code=upstream.status_code, content=content,
+            headers={"X-Llm-Relay-Selected-Model": result.selected_model or ""},
+        )
+
+    @app.post("/v1/embeddings")
+    async def embeddings(request: Request):
+        return await _simple_proxy(request, "embeddings")
+
+    @app.post("/v1/rerank")
+    async def rerank(request: Request):
+        return await _simple_proxy(request, "rerank")
+
+    @app.get("/logs")
+    async def logs(request: Request) -> Response:
+        """Recent buffered relay log lines (plain text), for the cockpit (plan 7)."""
+        buf = request.app.state.log_buffer
+        return Response(content="\n".join(buf.recent(limit=500)), media_type="text/plain")
+
+    @app.get("/logs/stream")
+    async def logs_stream(request: Request) -> StreamingResponse:
+        """SSE of relay log lines: recent history first, then new lines as they
+        arrive (poll-based over a monotonic sequence). Stops on client disconnect."""
+        buf = request.app.state.log_buffer
+
+        async def gen():
+            last = 0
+            for s, line in buf.since(0)[-200:]:
+                yield f"data: {line}\n\n"
+                last = max(last, s)
+            while True:
+                if await request.is_disconnected():
+                    break
+                for s, line in buf.since(last):
+                    yield f"data: {line}\n\n"
+                    last = s
+                await asyncio.sleep(1.0)
+
+        return StreamingResponse(
+            gen(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no"}
+        )
 
     # Mount MCP at /mcp
     if _mcp_app is not None:
