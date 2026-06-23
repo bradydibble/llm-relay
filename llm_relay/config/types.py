@@ -84,6 +84,13 @@ class ModelConfig:
     # in models.yaml). Name-routable only (carries manual_only=True), never
     # persisted, and dropped from the registry when its port stops reporting it.
     discovered: bool = False
+    # Variant grouping (plan 2): the logical model this entry is one variant of
+    # (e.g. `qwen3-14b` for an AWQ-on-L4 and a Q4-on-MI100 entry), and this
+    # variant's precision. Both optional; an entry with no `logical` is a
+    # standalone model. Additive: routing still keys on the concrete entry until
+    # the dispatcher (plan 3) consumes logical models.
+    logical: str | None = None
+    quant: str | None = None
 
 
 @dataclass

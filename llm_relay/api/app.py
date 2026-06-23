@@ -189,6 +189,11 @@ def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[
         # additive flag so the cockpit can distinguish ad-hoc bake-off models.
         if m.discovered:
             out[name]["discovered"] = True
+        # Variant grouping (plan 2): additive, present only when declared.
+        if m.logical:
+            out[name]["logical"] = m.logical
+        if m.quant:
+            out[name]["quant"] = m.quant
         # A deliberately-paused provider reads "paused" (not its discovered
         # status) so clients see it's intentionally out of rotation, not down.
         if disc.is_provider_paused(m.provider):
@@ -197,6 +202,10 @@ def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[
             if client is not None and client.state.paused_until is not None:
                 out[name]["paused_until"] = client.state.paused_until
     out["aliases"] = dict(cfg.models.aliases)
+    # Variant registry (plan 2): logical models -> their variant names, and the
+    # mutually-exclusive groups (models sharing a served provider+port). Additive.
+    out["logical_models"] = {k: list(v) for k, v in cfg.models.logical_models.items()}
+    out["exclusivity_groups"] = [list(g) for g in cfg.models.exclusivity_groups]
     # Enriched per-alias metadata so clients can show context_window etc. for
     # aliases (which are otherwise just names). `current` is a display
     # approximation: the first member that discovery reports as available /

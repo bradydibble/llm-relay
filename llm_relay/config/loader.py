@@ -47,6 +47,29 @@ class ModelRegistry:
         self.models: dict[str, ModelConfig] = {}
         self.aliases: dict[str, list[str]] = {}
         self.categories: dict[str, CategoryConfig] = {}
+        # Variant grouping (plan 2): logical_models[L] = [variant config names],
+        # derived from each model's optional `logical` field at load.
+        self.logical_models: dict[str, list[str]] = {}
+        # Per-host exclusivity (plan 2): groups of model names that cannot be hot
+        # at once because they share a served (provider, port). Derived at load.
+        self.exclusivity_groups: list[list[str]] = []
+
+    def variants_of(self, logical: str) -> list[str]:
+        """Variant config names grouped under a logical model (empty if none)."""
+        return list(self.logical_models.get(logical, []))
+
+    def logical_of(self, name: str) -> str | None:
+        """The logical model a config entry is a variant of, or None."""
+        m = self.models.get(name)
+        return m.logical if m else None
+
+    def exclusive_with(self, name: str) -> list[str]:
+        """Model names mutually exclusive with ``name`` (they share its served
+        provider+port), excluding itself. Empty when ``name`` shares no port."""
+        for group in self.exclusivity_groups:
+            if name in group:
+                return [n for n in group if n != name]
+        return []
 
 
 class ConfigLoader:
@@ -166,8 +189,12 @@ class ConfigLoader:
                 privacy=Privacy(cfg.get("privacy", "local_only")),
                 use_cases={k: float(v) for k, v in (cfg.get("use_cases") or {}).items()},
                 manual_only=bool(cfg.get("manual_only", False)),
+                logical=cfg.get("logical"),
+                quant=cfg.get("quant"),
             )
         self._derive_aliases_from_use_cases()
+        self._derive_logical_models()
+        self._derive_exclusivity()
 
     def _derive_aliases_from_use_cases(self) -> None:
         """Transpose per-model ``use_cases`` tags into the alias map: for each
@@ -189,6 +216,33 @@ class ConfigLoader:
                 n,
             ))
             self._models.aliases[uc] = names
+
+    def _derive_logical_models(self) -> None:
+        """Group variants by their ``logical`` field:
+        ``logical_models[L] = sorted [variant config names]``. Entries with no
+        ``logical`` are standalone models and are not grouped. Additive: the flat
+        ``models`` dict is unchanged, so existing routing is unaffected."""
+        derived: dict[str, list[str]] = {}
+        for name, m in self._models.models.items():
+            if m.logical:
+                derived.setdefault(m.logical, []).append(name)
+        for names in derived.values():
+            names.sort()
+        self._models.logical_models = derived
+
+    def _derive_exclusivity(self) -> None:
+        """Models sharing the same served ``(provider, port)`` are mutually
+        exclusive: one served instance per port. Derive groups of size > 1.
+        ``port=None`` entries (e.g. cloud) are never grouped, since they serve
+        concurrently rather than swapping on a physical port."""
+        by_port: dict[tuple[str, int], list[str]] = {}
+        for name, m in self._models.models.items():
+            if m.port is None:
+                continue
+            by_port.setdefault((m.provider, m.port), []).append(name)
+        self._models.exclusivity_groups = [
+            sorted(names) for names in by_port.values() if len(names) > 1
+        ]
 
     def _load_modes(self) -> None:
         path = self.config_dir / "modes.yaml"
