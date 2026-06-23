@@ -131,6 +131,11 @@ def write_keys(path: Path, principals_by_hash: dict[str, Principal]) -> None:
         }
     }
     path.write_text(yaml.safe_dump(doc, sort_keys=True))
+    # Owner-only: the file holds key hashes plus principal/priority data.
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
 
 
 def revoke_id(path: Path, id: str) -> int:

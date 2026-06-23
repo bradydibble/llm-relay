@@ -105,6 +105,8 @@ def test_mint_and_roundtrip(tmp_path):
     assert loaded[hash_key(plaintext)].priority_weight == 3.0
     # The plaintext key is never written to disk, only its hash.
     assert plaintext not in path.read_text()
+    # Owner-only permissions on the key store.
+    assert (path.stat().st_mode & 0o777) == 0o600
 
 
 def test_revoke_removes_id(tmp_path):
@@ -218,3 +220,15 @@ def test_keys_cli_add_then_revoke(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["llm-relay", "keys", "revoke", "frank"])
     assert main() == 0
     assert load_keys(tmp_path / "api_keys.yaml") == {}
+
+
+def test_insecure_bind_warning():
+    from llm_relay.cli import _insecure_bind_warning
+
+    # Loopback or auth-on: no warning.
+    assert _insecure_bind_warning("127.0.0.1", auth_enabled=False) is None
+    assert _insecure_bind_warning("localhost", auth_enabled=False) is None
+    assert _insecure_bind_warning("0.0.0.0", auth_enabled=True) is None
+    # Routable bind with auth off: warn.
+    w = _insecure_bind_warning("0.0.0.0", auth_enabled=False)
+    assert w is not None and "auth" in w.lower()

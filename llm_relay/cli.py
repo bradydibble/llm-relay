@@ -21,11 +21,31 @@ def _load_config() -> ConfigLoader:
     return config
 
 
+def _insecure_bind_warning(host: str, auth_enabled: bool) -> str | None:
+    """Warn when binding to a non-loopback interface with auth disabled (an open
+    proxy to your models and backend topology). None when the bind is safe."""
+    loopback = {"127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"}
+    if host not in loopback and not auth_enabled:
+        return (
+            f"binding to {host} with auth DISABLED: anyone who can reach this port "
+            "has an open proxy to your models and your backend topology. Set "
+            "LLM_RELAY_AUTH=1 and mint keys with `llm-relay keys add` before exposing it."
+        )
+    return None
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     import uvicorn
 
     port = args.port or int(os.environ.get("LLM_RELAY_PORT", 8090))
     host = args.host or os.environ.get("LLM_RELAY_HOST", "127.0.0.1")
+    try:
+        auth_enabled = _load_config().auth.enabled
+    except Exception:
+        auth_enabled = False
+    warning = _insecure_bind_warning(host, auth_enabled)
+    if warning:
+        Console(stderr=True).print(f"[bold red]WARNING:[/bold red] {warning}")
     uvicorn.run(
         "llm_relay.api.app:create_app",
         host=host,
