@@ -432,6 +432,11 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
     app.state.discovery = discovery
     app.state.router = router
 
+    # Per-user API-key auth (a no-op when disabled). Installed here so it wraps
+    # every route, including the MCP mount.
+    from .middleware import install_auth_middleware
+    install_auth_middleware(app)
+
     async def _available(request: Request) -> dict[str, Any]:
         return _build_available_payload(
             request.app.state.config, request.app.state.discovery
@@ -440,6 +445,10 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
     @app.get("/health")
     async def health(request: Request) -> dict[str, Any]:
         disc = request.app.state.discovery
+        # /health is auth-exempt (liveness probes). When auth is on, return a
+        # minimal body so a keyless caller cannot read backend topology here.
+        if request.app.state.config.auth.enabled:
+            return {"status": "ok"}
         return {
             "status": "ok",
             "endpoints": {

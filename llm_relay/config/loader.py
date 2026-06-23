@@ -22,6 +22,7 @@ from .types import (
     ProviderConfig,
     ProviderType,
 )
+from ..auth import AuthConfig, load_keys
 
 logger = logging.getLogger(__name__)
 
@@ -55,12 +56,33 @@ class ConfigLoader:
         self._models = ModelRegistry()
         self._modes: dict[str, ModeConfig] = {}
         self._policy: PolicyConfig | None = None
+        # Always present so middleware reading config.auth never hits an
+        # AttributeError before load() runs; load() overwrites it.
+        self.auth: AuthConfig = AuthConfig()
 
     def load(self) -> None:
         self._load_providers()
         self._load_models()
         self._load_modes()
         self._load_policy()
+        self._load_auth()
+
+    def _load_auth(self) -> None:
+        """Load the per-user API-key store into ``self.auth``. Enabled by the
+        ``LLM_RELAY_AUTH=1`` env flag or an ``auth.enabled: true`` block in an
+        optional ``auth.yaml``; principals come from ``api_keys.yaml`` (kept
+        off-repo in the config dir, never committed)."""
+        auth_file = self.config_dir / "api_keys.yaml"
+        auth_block: dict = {}
+        auth_yaml = self.config_dir / "auth.yaml"
+        if auth_yaml.exists():
+            auth_block = (yaml.safe_load(auth_yaml.read_text()) or {}).get("auth", {}) or {}
+        enabled = os.environ.get("LLM_RELAY_AUTH") == "1" or bool(auth_block.get("enabled", False))
+        self.auth = AuthConfig(
+            enabled=enabled,
+            exempt_paths=list(auth_block.get("exempt_paths", ["/health", "/metrics"])),
+            principals_by_hash=load_keys(auth_file),
+        )
 
     # --- Maintenance-pause persistence (so a paused provider survives a relay
     # restart). {provider: {"until": str|null, "reason": str|null}} in
