@@ -51,9 +51,29 @@ llm-relay route qwen3.5-35b --privacy cloud_ok
 
 ## Security model
 
-llm-relay has **no inbound authentication** and binds to **`127.0.0.1`** by default (override with `--host` / `LLM_RELAY_HOST`). It is built for a trusted local network: any client that can reach the port can call `/v1/chat/completions` (proxying your backends and the shared upstream key the relay holds), and can read your backend topology through `/status`, `/metrics`, and `/v1/available-models`.
+llm-relay supports per-user **API-key authentication**, off by default. Enable it
+with `LLM_RELAY_AUTH=1` (or an `auth.enabled: true` block in `auth.yaml`). When
+enabled, every request to a non-exempt path must present a key via
+`Authorization: Bearer <key>` or `X-API-Key: <key>`. `/health` and `/metrics` are
+exempt by default (configurable via `auth.exempt_paths`), and `/health` returns a
+minimal body so it leaks no topology. Mint and manage keys with `llm-relay keys
+add|list|revoke`; keys are stored **hashed** (sha256) in `api_keys.yaml` in your
+config dir, which should live outside the repo and never be committed (the repo
+ships only `config/api_keys.example.yaml`). Each key maps to a principal carrying a
+priority weight (used by the scheduler) and reserved scopes.
 
-If you bind it to a routable interface, put authentication in front of it — a reverse proxy, network policy, or firewall. Otherwise you have published an open proxy to your models and a map of your backends.
+Enforcement is **key-based, not host-based**: the relay typically runs behind a
+loopback reverse proxy, so trusting the peer address would bypass auth for all
+proxied traffic. Give your local tooling (the dashboard, the CLI, a remote
+Prometheus) a key rather than relying on a loopback exemption.
+
+With auth **disabled** (the default), llm-relay has no inbound authentication and
+binds to `127.0.0.1` (override with `--host` / `LLM_RELAY_HOST`). In that mode any
+client that can reach the port can call `/v1/chat/completions` (proxying your
+backends and the shared upstream key the relay holds) and read your backend
+topology through `/status` and `/v1/available-models`. If you bind it to a routable
+interface, enable auth or put authentication in front of it (a reverse proxy,
+network policy, or firewall).
 
 ## Configuration
 

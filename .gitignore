@@ -50,3 +50,6 @@ GOOSE.md
 # tracked; design ADRs and roadmaps are local-only.
 docs/design/
 docs/v2-features.md
+
+# Real API keys live off-repo (LLM_RELAY_CONFIG_DIR); never commit the local copy.
+config/api_keys.yaml

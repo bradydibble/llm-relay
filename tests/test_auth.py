@@ -1,6 +1,8 @@
 """Auth + identity: principal model, key store, and resolution."""
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from llm_relay.auth import (
@@ -197,3 +199,22 @@ def test_health_full_when_auth_disabled(tmp_path, monkeypatch):
     monkeypatch.delenv("LLM_RELAY_AUTH", raising=False)
     client = TestClient(create_app(config_dir=tmp_path))
     assert "endpoints" in client.get("/health").json()
+
+
+# --- Task 6: keys CLI (add / list / revoke) --------------------------------
+
+def test_keys_cli_add_then_revoke(tmp_path, monkeypatch):
+    monkeypatch.setenv("LLM_RELAY_CONFIG_DIR", str(tmp_path))
+    from llm_relay.cli import main
+
+    monkeypatch.setattr(sys, "argv", ["llm-relay", "keys", "add", "frank", "--priority", "2"])
+    assert main() == 0
+    principals = load_keys(tmp_path / "api_keys.yaml")
+    assert any(p.id == "frank" and p.priority_weight == 2.0 for p in principals.values())
+
+    monkeypatch.setattr(sys, "argv", ["llm-relay", "keys", "list"])
+    assert main() == 0
+
+    monkeypatch.setattr(sys, "argv", ["llm-relay", "keys", "revoke", "frank"])
+    assert main() == 0
+    assert load_keys(tmp_path / "api_keys.yaml") == {}

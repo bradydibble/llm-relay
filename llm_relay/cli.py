@@ -122,6 +122,44 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_keys(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from .auth import hash_key, load_keys, mint_key, revoke_id, write_keys
+
+    config_dir = Path(os.environ.get("LLM_RELAY_CONFIG_DIR", "config"))
+    path = config_dir / "api_keys.yaml"
+    console = Console()
+    action = getattr(args, "keys_action", None)
+    if action == "add":
+        principals = load_keys(path)
+        plaintext, principal = mint_key(args.id, priority_weight=args.priority, scopes=args.scopes)
+        principals[hash_key(plaintext)] = principal
+        config_dir.mkdir(parents=True, exist_ok=True)
+        write_keys(path, principals)
+        console.print(
+            f"[green]Key for {args.id}[/green] (store securely, shown once): [bold]{plaintext}[/bold]"
+        )
+        return 0
+    if action == "list":
+        principals = load_keys(path)
+        table = Table(title="API key principals")
+        table.add_column("id", style="cyan")
+        table.add_column("priority")
+        table.add_column("scopes")
+        table.add_column("enabled")
+        for p in principals.values():
+            table.add_row(p.id, str(p.priority_weight), ", ".join(p.scopes) or "-", str(p.enabled))
+        console.print(table)
+        return 0
+    if action == "revoke":
+        removed = revoke_id(path, args.id)
+        console.print(f"[yellow]Revoked {removed} key(s) for {args.id}[/yellow]")
+        return 0
+    console.print("[red]Usage: llm-relay keys {add|list|revoke}[/red]")
+    return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="llm-relay", description="LLM relay routing control plane")
     subparsers = parser.add_subparsers(dest="command")
@@ -145,6 +183,16 @@ def main() -> int:
 
     subparsers.add_parser("config", help="Print loaded configuration")
 
+    p_keys = subparsers.add_parser("keys", help="Manage per-user API keys")
+    keys_sub = p_keys.add_subparsers(dest="keys_action")
+    k_add = keys_sub.add_parser("add", help="Mint a new key for a user/agent")
+    k_add.add_argument("id")
+    k_add.add_argument("--priority", type=float, default=1.0)
+    k_add.add_argument("--scope", action="append", default=[], dest="scopes")
+    keys_sub.add_parser("list", help="List key principals (never prints keys)")
+    k_rev = keys_sub.add_parser("revoke", help="Revoke all keys for a user/agent")
+    k_rev.add_argument("id")
+
     args = parser.parse_args()
     if args.command == "run":
         return cmd_run(args)
@@ -158,6 +206,8 @@ def main() -> int:
         return cmd_route(args)
     if args.command == "config":
         return cmd_config(args)
+    if args.command == "keys":
+        return cmd_keys(args)
     parser.print_help()
     return 1
 

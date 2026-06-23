@@ -1,0 +1,5 @@
+# Example API key store. Copy to your off-repo LLM_RELAY_CONFIG_DIR as
+# api_keys.yaml and mint entries with `llm-relay keys add <id>`. NEVER commit a
+# real api_keys.yaml: entries are keyed by sha256(key), and the plaintext key is
+# shown only once at mint time.
+keys: {}
