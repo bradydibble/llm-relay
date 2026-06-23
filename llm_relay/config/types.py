@@ -48,6 +48,11 @@ class ProviderConfig:
     model_overrides: list[str] = field(default_factory=list)
     max_concurrent: int | None = None
     slot_wait_timeout: float = 30.0
+    # Extra ports to poll for models that have NO models.yaml entry. Anything a
+    # backend on one of these ports reports in /v1/models is auto-discovered and
+    # made name-routable (see api.app._reconcile_discovered) — for ad-hoc / bake-off
+    # models on unmanaged ports that would otherwise make the host read "down".
+    discover_ports: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -75,6 +80,10 @@ class ModelConfig:
     # backends an agent must never reach by accident (e.g. a costly/experimental
     # model wired into the relay but gated to manual use).
     manual_only: bool = False
+    # Set on a runtime-discovered model (found on a provider's discover_ports, not
+    # in models.yaml). Name-routable only (carries manual_only=True), never
+    # persisted, and dropped from the registry when its port stops reporting it.
+    discovered: bool = False
 
 
 @dataclass

@@ -106,6 +106,7 @@ class ConfigLoader:
                 model_overrides=cfg.get("model_overrides", []) or [],
                 max_concurrent=cfg.get("max_concurrent"),
                 slot_wait_timeout=float(cfg.get("slot_wait_timeout", 30.0)),
+                discover_ports=cfg.get("discover_ports", []) or [],
             )
 
     def _load_models(self) -> None:

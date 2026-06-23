@@ -1,6 +1,7 @@
 """FastAPI application for llm-relay."""
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from contextlib import asynccontextmanager
@@ -14,7 +15,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from ..config.loader import ConfigLoader
-from ..config.types import NoBackendAvailableError, SaturationError
+from ..config.types import ModelConfig, NoBackendAvailableError, Privacy, SaturationError
 from ..discovery.manager import DiscoveryManager
 from ..routing.keys import compose_backend_key, compose_model_id, resolve_model_id
 from ..routing.router import RequestRouter
@@ -149,7 +150,12 @@ def _build_model_card(cfg: ConfigLoader, disc: DiscoveryManager, model: str) -> 
     # validated). Echo the id the caller asked for; resolve context by bare name.
     bare = resolve_model_id(cfg.models.models, model)
     if bare is not None:
-        return _model_entry(cfg, disc, model, cfg.models.models[bare].provider, lookup_name=bare)
+        entry = _model_entry(cfg, disc, model, cfg.models.models[bare].provider, lookup_name=bare)
+        # Flag runtime-discovered models so a client can tell an unmanaged
+        # bake-off model from a configured one (additive; absent otherwise).
+        if cfg.models.models[bare].discovered:
+            entry["discovered"] = True
+        return entry
     if model in cfg.models.aliases:
         return _model_entry(cfg, disc, model, "llm-relay-alias")
     return None
@@ -179,6 +185,10 @@ def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[
             # cockpit shows it; well-behaved auto-pickers should skip it.
             "manual_only": m.manual_only,
         }
+        # Runtime-discovered (found on a provider's discover_ports, not configured):
+        # additive flag so the cockpit can distinguish ad-hoc bake-off models.
+        if m.discovered:
+            out[name]["discovered"] = True
         # A deliberately-paused provider reads "paused" (not its discovered
         # status) so clients see it's intentionally out of rotation, not down.
         if disc.is_provider_paused(m.provider):
@@ -224,6 +234,71 @@ def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[
         }
     out["alias_info"] = alias_info
     return out
+
+
+def _reconcile_discovered(
+    config: ConfigLoader,
+    discovery: DiscoveryManager,
+    discover_keys: set[str],
+    key_meta: dict[str, tuple[str, int]],
+) -> None:
+    """Sync the runtime-discovered model registry with what the discover-port
+    backends currently report.
+
+    ``discover_keys`` are the discovery-client keys registered for the providers'
+    ``discover_ports``; ``key_meta`` maps each to its ``(provider_name, port)``.
+
+    For every model id a discover-port backend reports in ``/v1/models`` that is
+    NOT already a statically-configured model, register a ``ModelConfig`` for it
+    so the selector can route to it by exact name (it carries ``manual_only`` /
+    ``discovered`` so it never joins an alias tail or open ranking). Models that
+    stop being reported are dropped. Synchronous and side-effecting on
+    ``config``/``discovery`` so the lifespan reconcile task — and unit tests —
+    can call it directly.
+    """
+    # 1. What the discover ports currently serve, keyed served_name -> backend key.
+    #    A served id that collides with a STATIC model is left to that model
+    #    (never shadow a configured entry); a previously-discovered id is fair game.
+    seen: dict[str, str] = {}
+    for key in discover_keys:
+        client = discovery.clients.get(key)
+        if client is None:
+            continue
+        for sid in client.state.models:
+            existing = config.models.models.get(sid)
+            if existing is not None and not existing.discovered:
+                continue  # static model takes precedence — don't shadow it
+            seen[sid] = key
+
+    # 2. Register anything newly seen as a discovered, name-only-routable model.
+    #    provider/port are set so compose_backend_key(provider, port, "") resolves
+    #    back to the discover key the model is served on (the selector keys off it).
+    for sid, key in seen.items():
+        provider_name, port = key_meta[key]
+        if sid not in config.models.models:
+            config.models.models[sid] = ModelConfig(
+                provider=provider_name,
+                port=port,
+                served_model_name=sid,
+                context_window=None,
+                capabilities=[],
+                tags=["discovered"],
+                use_cases={},
+                manual_only=True,
+                discovered=True,
+                privacy=Privacy.local_only,
+            )
+        # Point availability / routing at the discover backend serving it.
+        discovery.model_to_client[sid] = key
+        discovery.served_names.setdefault(sid, sid)
+
+    # 3. Drop discovered models whose port no longer reports them.
+    for name in [
+        n for n, m in config.models.models.items() if m.discovered and n not in seen
+    ]:
+        config.models.models.pop(name, None)
+        discovery.model_to_client.pop(name, None)
+        discovery.served_names.pop(name, None)
 
 
 def create_app(config_dir: str | Path | None = None) -> FastAPI:
@@ -291,11 +366,55 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                         timeout=provider.health_check_timeout,
                         max_concurrent=provider.max_concurrent,
                     )
+            # Register a bare polling client for each provider discover_port that
+            # isn't already a configured model's port. These ports carry no
+            # models_hint -- whatever they report in /v1/models is reconciled into
+            # the registry (as discovered, name-only-routable models) by the task
+            # below, so an ad-hoc / bake-off model on an unmanaged port is picked
+            # up automatically instead of making the host read "down".
+            discover_keys: set[str] = set()
+            key_meta: dict[str, tuple[str, int]] = {}
+            discover_poll_intervals: list[int] = []
+            for provider_name, provider in config.providers.items():
+                if not provider.enabled or not provider.discover_ports:
+                    continue
+                discover_poll_intervals.append(provider.poll_interval)
+                for port in provider.discover_ports:
+                    key = compose_backend_key(provider_name, port, "")
+                    if key in discovery.clients:
+                        continue  # a static model already polls this port
+                    await discovery.register_backend(
+                        key=key,
+                        provider_name=provider_name,
+                        base_url=f"{provider.base_url.rstrip('/')}:{port}",
+                        models_hint=[],
+                        health_endpoint=provider.health_endpoint,
+                        poll_interval=provider.poll_interval,
+                        circuit_breaker=provider.circuit_breaker,
+                        timeout=provider.health_check_timeout,
+                        max_concurrent=provider.max_concurrent,
+                    )
+                    discover_keys.add(key)
+                    key_meta[key] = (provider_name, port)
             # Restore any persisted maintenance pauses now that every backend is
             # registered (discovery.clients is populated). Doing this at
             # create_app time would be a no-op -- clients are empty there.
             for _prov, _info in config.load_paused_providers().items():
                 discovery.pause_provider(_prov, _info.get("until"), _info.get("reason"))
+            # Run the discover-port reconcile on the same cadence as polling so a
+            # model appearing/disappearing on a discover port is reflected within a
+            # poll cycle. The first poll hasn't happened yet, so the loop sleeps
+            # before its first pass. Appended to discovery._tasks so the existing
+            # shutdown cancels it with the poll loops.
+            if discover_keys:
+                interval = max(5, min(discover_poll_intervals))
+
+                async def _reconcile_loop() -> None:
+                    while True:
+                        await asyncio.sleep(interval)
+                        _reconcile_discovered(config, discovery, discover_keys, key_meta)
+
+                discovery._tasks.append(asyncio.create_task(_reconcile_loop()))
             yield
         await discovery.shutdown()
 
@@ -447,9 +566,17 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 entry["paused_reason"] = c.state.paused_reason
             backends[key] = entry
 
+        # Runtime-discovered models (found on a provider's discover_ports, not in
+        # models.yaml). Surfaced as a distinct list so an operator can tell an
+        # ad-hoc bake-off model from a configured one; additive (empty when none).
+        discovered_models = sorted(
+            name for name, m in cfg.models.models.items() if m.discovered
+        )
+
         return {
             "mode": matched_modes,
             "available_local_models": sorted(available_local),
+            "discovered_models": discovered_models,
             "aliases": alias_info,
             "backends": backends,
         }
