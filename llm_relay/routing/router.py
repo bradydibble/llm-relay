@@ -14,7 +14,7 @@ from ..config.types import NoBackendAvailableError, Privacy, SaturationError
 from ..discovery.endpoint import _shared_upstream_bearer
 from ..discovery.manager import DiscoveryManager
 from .keys import compose_backend_key, compose_backend_url
-from .selector import ChainCandidate, ModelSelector, RoutingContext
+from .selector import ChainCandidate, ModelSelector, RoutingContext, batch_policy_for
 
 
 # A model is eligible for a request when it can hold the PROMPT plus this much
@@ -235,11 +235,26 @@ class RequestRouter:
         explicit_min = int(headers.get("X-Llm-Relay-Min-Context", "0") or 0)
         prompt_est = _estimate_prompt_tokens(request_data)
         estimated_min = (prompt_est + MIN_OUTPUT_HEADROOM) if prompt_est else 0
+        # Client-declared intent (plan 3): SLA class + urgency (recorded, used by
+        # the scheduler in plan 4) and an optional quality floor (parsed into
+        # min_preference; combined with any category floor downstream).
+        sla_class = headers.get("X-Llm-Relay-SLA-Class") or None
+        urgency = headers.get("X-Llm-Relay-Urgency") or None
+        quality_floor: float | None = None
+        qf_raw = headers.get("X-Llm-Relay-Quality-Floor")
+        if qf_raw:
+            try:
+                quality_floor = float(qf_raw)
+            except ValueError:
+                quality_floor = None
         ctx = RoutingContext(
             requested_model=request_data.get("model", "") or "",
             privacy=privacy,
             require_tools=headers.get("X-Llm-Relay-Require-Tools", "false").lower() == "true",
             min_context=max(explicit_min, estimated_min) or None,
+            min_preference=quality_floor,
+            sla_class=sla_class,
+            urgency=urgency,
         )
 
         candidates = self.selector.select_chain(ctx)
@@ -437,9 +452,17 @@ def _candidate_to_route_result(candidate: ChainCandidate, ctx: RoutingContext) -
         decision={
             "requested": ctx.requested_model,
             "selected": candidate.model,
+            "quant": candidate.quant,
+            "node": candidate.provider_name,
+            "batch": batch_policy_for(ctx.sla_class),
+            "sla_class": ctx.sla_class,
+            "urgency": ctx.urgency,
             "candidates": ctx.candidates,
             "ranked": ctx.ranked[:5],
             "privacy": ctx.privacy.value,
+            # quant is chosen as a side effect of preference (quality) ordering
+            # among variants, not an independent cost axis -- see plan 3.
+            "trace": "highest-preference variant meeting constraints",
         },
     )
 

@@ -747,9 +747,16 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
             )
             raise HTTPException(502, detail=f"Backend error: {e}")
 
+        _dec = result.decision or {}
         relay_headers = {
             "X-Llm-Relay-Selected-Model": result.selected_model or "",
             "X-Llm-Relay-Selected-Provider": result.provider_name or "",
+            # 4-tuple decision (plan 3): quant + node + batch policy. quant is the
+            # highest-preference variant's precision (a side effect of quality
+            # ordering, not an independent cost axis). Set on BOTH response paths.
+            "X-Llm-Relay-Decision-Quant": str(_dec.get("quant") or ""),
+            "X-Llm-Relay-Decision-Node": str(_dec.get("node") or ""),
+            "X-Llm-Relay-Decision-Batch": str(_dec.get("batch") or ""),
         }
 
         if is_stream:

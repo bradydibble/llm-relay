@@ -13,6 +13,16 @@ def _is_available(status: ModelStatus) -> bool:
     return status in (ModelStatus.available, ModelStatus.degraded)
 
 
+def batch_policy_for(sla_class: str | None) -> str:
+    """Thin, inert v1 mapping of SLA class -> batch policy, recorded in the
+    decision and consumed by the scheduler in plan 4. Interactive runs un-batched
+    for low TTFT; agentic/bulk coalesce for throughput. Unknown/None defaults to
+    the latency-safe ``none``."""
+    return {"interactive": "none", "agentic": "coalesce", "bulk": "coalesce"}.get(
+        (sla_class or "interactive").lower(), "none"
+    )
+
+
 @dataclass
 class ChainCandidate:
     """A fully-resolved candidate ready for forwarding.
@@ -32,6 +42,9 @@ class ChainCandidate:
     # max_tokens to this model's headroom so the output never overflows the
     # window it was actually routed to.
     context_window: int = 0
+    # This variant's quantization (plan 3), for the decision record. None for a
+    # flat model that declares no quant.
+    quant: str | None = None
 
 
 @dataclass
@@ -44,6 +57,11 @@ class RoutingContext:
     # (the opt-in quality gate). None = open (no floor). When the request is an
     # alias whose category declares a reasoning_floor, _prepare_ranked fills this in.
     min_preference: float | None = None
+    # Client-declared intent (plan 3). sla_class / urgency are recorded for the
+    # decision and consumed by the scheduler (plan 4); they do not change routing
+    # here. A request quality_floor is parsed into min_preference upstream.
+    sla_class: str | None = None
+    urgency: str | None = None
     resolved_model: str | None = None
     candidates: list[str] = field(default_factory=list)
     filtered: list[str] = field(default_factory=list)
@@ -63,6 +81,19 @@ class ModelSelector:
             return list(self.config.models.aliases[name])
         return [name]
 
+    def is_logical(self, name: str) -> bool:
+        """True if `name` is a logical model (a group of quant x node variants)."""
+        return name in self.config.models.logical_models
+
+    def resolve_logical(self, name: str) -> list[str]:
+        """The auto-routable variants of a logical model: its variant config
+        names minus any marked ``manual_only`` (those are exact-name-only, never
+        auto-picked for a logical request)."""
+        return [
+            v for v in self.config.models.logical_models.get(name, [])
+            if not self.config.models.models[v].manual_only
+        ]
+
     def _prepare_ranked(self, ctx: RoutingContext) -> list[str]:
         """Build and store the full ranked candidate list on *ctx*.
 
@@ -74,8 +105,12 @@ class ModelSelector:
         ctx.candidates = candidates
         # Apply the category's reasoning floor (opt-in quality gate) if the request
         # is an aliased category that declares one. None = open (no floor).
-        if ctx.min_preference is None:
-            ctx.min_preference = self._category_floor(ctx.requested_model)
+        # Effective reasoning floor = the stricter of the request's quality_floor
+        # (already in ctx.min_preference when the caller sent one) and the requested
+        # category's configured floor. Either may be None (open).
+        cat_floor = self._category_floor(ctx.requested_model)
+        floors = [f for f in (ctx.min_preference, cat_floor) if f is not None]
+        ctx.min_preference = max(floors) if floors else None
         filtered = self._apply_constraints(ctx, candidates)
         ctx.filtered = filtered
         if not filtered:
@@ -192,6 +227,7 @@ class ModelSelector:
                 slot_wait_timeout=slot_wait_timeout,
                 provider_name=cfg.provider,
                 context_window=self._window_of(name),
+                quant=cfg.quant,
             ))
         return out
 
@@ -228,6 +264,13 @@ class ModelSelector:
             return out, True
         if req in self.config.policy.fallback.graph:
             return list(self.config.policy.fallback.graph[req]), True
+        # Logical model: route over its variants (quant x node), preference-ranked
+        # (= quality) then load-spilled downstream. Checked AFTER concrete / alias /
+        # fallback-graph so a name that is already one of those keeps its meaning,
+        # and BEFORE the unknown-id fallthrough so a logical id never silently
+        # degrades to whole-fleet routing. Unordered -> _rank sorts by preference.
+        if self.is_logical(req):
+            return self.resolve_logical(req), False
         # Unknown id: best-effort over the whole LIVE fleet. Enumerate CONFIGURED
         # models resolved as available via get_model_state (which fuzzy-matches a
         # backend's GGUF-filename id back to the config name) rather than the raw
