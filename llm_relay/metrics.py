@@ -268,7 +268,7 @@ class RelayMetrics:
         self.duration = Histogram(
             "llm_relay_request_duration_seconds",
             "End-to-end relay request duration in seconds.",
-            ["provider", "model"],
+            ["provider", "model", "alias", "client"],
             buckets=_DURATION_BUCKETS,
             registry=self.registry,
         )
@@ -276,7 +276,7 @@ class RelayMetrics:
             "llm_relay_ttft_seconds",
             "Streaming time-to-first-token (first chunk) in seconds, end-to-end "
             "including routing. Observed only for streamed responses.",
-            ["provider", "model"],
+            ["provider", "model", "alias", "client"],
             buckets=_TTFT_BUCKETS,
             registry=self.registry,
         )
@@ -308,10 +308,10 @@ class RelayMetrics:
             self.tokens.labels(provider=prov, model=mdl, direction="completion", client=cli).inc(int(ct))
 
         if duration_s is not None and duration_s >= 0:
-            self.duration.labels(provider=prov, model=mdl).observe(duration_s)
+            self.duration.labels(provider=prov, model=mdl, alias=ali, client=cli).observe(duration_s)
 
         if ttft_s is not None and ttft_s >= 0:
-            self.ttft.labels(provider=prov, model=mdl).observe(ttft_s)
+            self.ttft.labels(provider=prov, model=mdl, alias=ali, client=cli).observe(ttft_s)
 
         if fell_back:
             self.fallbacks.labels(alias=ali, model=mdl, client=cli).inc()
