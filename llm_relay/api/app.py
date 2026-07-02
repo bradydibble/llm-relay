@@ -38,6 +38,17 @@ def _resolve_base_url() -> str:
     return os.environ.get("LLM_RELAY_BASE_URL", "http://127.0.0.1:8090").rstrip("/")
 
 
+def _job_visible(job, principal, auth_enabled: bool) -> bool:
+    """Jobs are principal-scoped on the auth listener: a caller sees only its
+    own jobs unless it carries the admin scope (the trusted listener's implicit
+    principal does). Auth disabled = legacy open behavior."""
+    if not auth_enabled:
+        return True
+    pid = getattr(principal, "id", "anonymous")
+    scopes = list(getattr(principal, "scopes", []) or [])
+    return job.principal == pid or "admin" in scopes
+
+
 def _clamp_privacy(principal, auth_enabled: bool, hint_headers: dict[str, str]) -> None:
     """Privacy ceiling: only principals carrying the ``cloud`` scope may pass
     ``cloud_ok`` upstream (trusted-listener traffic carries it implicitly).
@@ -1053,14 +1064,22 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
     @app.get("/v1/jobs/{job_id}")
     async def get_job(job_id: str, request: Request) -> dict[str, Any]:
         job = request.app.state.job_store.get(job_id)
-        if job is None:
+        if job is None or not _job_visible(
+            job, getattr(request.state, "principal", None),
+            request.app.state.config.auth.enabled,
+        ):
+            # 404 (not 403) for another principal's job: don't leak existence.
             raise HTTPException(404, detail=f"Unknown job: {job_id}")
         return job.public()
 
     @app.post("/v1/jobs/{job_id}/cancel")
     async def cancel_job(job_id: str, request: Request) -> dict[str, Any]:
         store = request.app.state.job_store
-        if store.get(job_id) is None:
+        job = store.get(job_id)
+        if job is None or not _job_visible(
+            job, getattr(request.state, "principal", None),
+            request.app.state.config.auth.enabled,
+        ):
             raise HTTPException(404, detail=f"Unknown job: {job_id}")
         cancelled = store.cancel(job_id)
         return {"job_id": job_id, "cancelled": cancelled, "status": store.get(job_id).status}
