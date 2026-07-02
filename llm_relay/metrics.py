@@ -280,6 +280,11 @@ class RelayMetrics:
             buckets=_TTFT_BUCKETS,
             registry=self.registry,
         )
+        self.auth_failures = Counter(
+            "llm_relay_auth_failures",
+            "Requests rejected by API-key auth (missing/unknown/disabled key).",
+            registry=self.registry,
+        )
 
     def record_request(
         self,
@@ -381,6 +386,16 @@ def get_metrics() -> RelayMetrics:
     if _METRICS is None:
         _METRICS = RelayMetrics(RELAY_REGISTRY)
     return _METRICS
+
+
+def record_auth_failure() -> None:
+    """Count one rejected request. Best-effort; never raises into the gate."""
+    if not metrics_enabled():
+        return
+    try:
+        get_metrics().auth_failures.inc()
+    except Exception:
+        pass
 
 
 def register_discovery_collector(discovery: Any) -> DiscoveryCollector:

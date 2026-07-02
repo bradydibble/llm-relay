@@ -4,20 +4,34 @@ Implemented as raw ASGI rather than Starlette ``BaseHTTPMiddleware`` on purpose:
 ``BaseHTTPMiddleware`` can buffer a ``StreamingResponse`` and interfere with a
 response's ``BackgroundTask``, and this gate sits in front of the streaming
 ``/v1/chat/completions`` proxy whose ``BackgroundTask(cleanup)`` frees in-flight
-slots. On a pass-through (auth disabled, exempt path, or a valid key) it hands
-the untouched ASGI scope straight to the app, so the response stream and its
-background task are never touched; on a failure it short-circuits with a 401
-before the app runs.
+slots. On a pass-through (auth disabled, trusted listener, exempt path, or a
+valid key) it hands the untouched ASGI scope straight to the app, so the
+response stream and its background task are never touched; on a failure it
+short-circuits with a 401/403 before the app runs.
 
-Not host-based: the relay typically runs behind a loopback reverse proxy, so
-trusting the peer address would bypass auth for all proxied traffic.
+Trust model (see also the README security model):
+- Never peer-address based: the relay typically runs behind a loopback reverse
+  proxy, so trusting the peer would bypass auth for all proxied traffic.
+- LISTENER based instead: requests arriving on a port listed in
+  ``auth.trusted_ports`` (the local socket they connected to, from
+  ``scope["server"]``) are implicitly the deployment's own local consumers.
+  They are attributed to ``auth.trusted_principal`` with admin+cloud scopes.
+  Bind trusted ports to loopback and never route external traffic to them.
+- Every other listener enforces a key, and the ``admin`` scope gates
+  ``/admin/*`` and ``/logs*`` (fleet-wide operator surfaces).
 """
 from __future__ import annotations
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from ..audit import audit
 from ..auth import AuthError, Principal, authenticate
+from ..metrics import record_auth_failure
+
+
+def _admin_gated(path: str) -> bool:
+    return path.startswith("/admin") or path == "/logs" or path.startswith("/logs/")
 
 
 class AuthMiddleware:
@@ -34,7 +48,17 @@ class AuthMiddleware:
             state["principal"] = Principal(id="anonymous")
             await self.app(scope, receive, send)
             return
-        if scope.get("path", "") in cfg.exempt_paths:
+        server = scope.get("server") or (None, None)
+        if server[1] in cfg.trusted_ports:
+            state["principal"] = Principal(
+                id=cfg.trusted_principal,
+                priority_weight=1.0,
+                scopes=["admin", "cloud"],
+            )
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        if path in cfg.exempt_paths:
             await self.app(scope, receive, send)
             return
         headers = {
@@ -48,10 +72,20 @@ class AuthMiddleware:
                 cfg,
             )
         except AuthError as e:
+            record_auth_failure()
+            audit("auth_failure", path=path, reason=e.reason)
             response = JSONResponse(
                 status_code=401,
                 content={"error": "unauthorized", "detail": e.reason},
                 headers={"WWW-Authenticate": "Bearer"},
+            )
+            await response(scope, receive, send)
+            return
+        if _admin_gated(path) and "admin" not in principal.scopes:
+            audit("scope_denied", path=path, principal=principal.id)
+            response = JSONResponse(
+                status_code=403,
+                content={"error": "forbidden", "detail": "admin scope required"},
             )
             await response(scope, receive, send)
             return
