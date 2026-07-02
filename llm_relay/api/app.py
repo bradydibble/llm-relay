@@ -747,14 +747,30 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
 
     @app.get("/routing-table/{model}")
     async def routing_table_for(model: str, request: Request) -> dict[str, Any]:
-        cfg = request.app.state.config.models.models.get(model)
-        if not cfg:
-            raise HTTPException(404, detail=f"Unknown model: {model}")
-        return {
-            "model": model,
-            "provider": cfg.provider,
-            "fallback_chain": request.app.state.router.selector.get_fallback_chain(model),
-        }
+        cfg_all = request.app.state.config
+        m = cfg_all.models.models.get(model)
+        if m:
+            return {
+                "model": model,
+                "provider": m.provider,
+                "fallback_chain": request.app.state.router.selector.get_fallback_chain(model),
+            }
+        # Aliases are first-class here too ("what does this alias resolve to
+        # right now"): use-case categories are derived, not static models, and
+        # health-gate tooling probes e.g. /routing-table/main.
+        members = cfg_all.models.aliases.get(model)
+        if members:
+            disc = request.app.state.discovery
+            resolved = None
+            for member in members:
+                if member in cfg_all.models.models and disc.get_model_state(member).value in (
+                    "available",
+                    "degraded",
+                ):
+                    resolved = member
+                    break
+            return {"alias": model, "members": list(members), "resolved": resolved}
+        raise HTTPException(404, detail=f"Unknown model: {model}")
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
