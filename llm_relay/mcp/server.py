@@ -3,7 +3,8 @@
 Mounted at /mcp inside the main FastAPI app.  Clients connect with the
 Streamable HTTP transport:
 
-    http://<host>:<port>/mcp   (POST / SSE endpoint)
+    http://<host>:<port>/mcp/   (POST / SSE endpoint; exact /mcp 307-redirects
+                                 here, and a reverse proxy can normalize it)
 
 Configured tool list:
   relay_status           — active mode, alias resolutions, backend health

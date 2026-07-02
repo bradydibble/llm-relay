@@ -24,7 +24,13 @@ _INIT = {
 def test_mcp_served_at_clean_path(tmp_path):
     app = create_app(config_dir=tmp_path)
     with TestClient(app) as c:  # context manager runs lifespan (session manager)
-        r = c.post("/mcp", json=_INIT, headers=_HDRS)
-        assert r.status_code != 404
-        old = c.post("/mcp/mcp", json=_INIT, headers=_HDRS)
-        assert old.status_code in (404, 307)
+        # Canonical direct form: trailing slash serves without redirect.
+        direct = c.post("/mcp/", json=_INIT, headers=_HDRS, follow_redirects=False)
+        assert direct.status_code not in (404, 307)
+        # Exact /mcp is a 307 to /mcp/ (normalized to /mcp/ at the reverse
+        # proxy for public clients); redirect-following clients work either way.
+        r = c.post("/mcp", json=_INIT, headers=_HDRS, follow_redirects=False)
+        assert r.status_code in (200, 307)
+        # The old doubled path is gone.
+        old = c.post("/mcp/mcp", json=_INIT, headers=_HDRS, follow_redirects=False)
+        assert old.status_code == 404
