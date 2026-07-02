@@ -186,6 +186,7 @@ def emit_chat_completion(
     client: str | None = None,
     fell_back: bool = False,
     ttft_ns: int | None = None,
+    principal: str | None = None,
 ) -> None:
     """Emit telemetry for one chat completion: Prometheus metrics (always) and,
     when LLM_RELAY_TELEMETRY is enabled, an OpenInference span. Best-effort;
@@ -216,6 +217,7 @@ def emit_chat_completion(
             duration_s=duration_s,
             fell_back=fell_back,
             ttft_s=(ttft_ns / 1e9) if ttft_ns is not None else None,
+            principal=principal,
         )
     except Exception as e:
         print(f"[llm-relay] metrics record failed (ignored): {e}", file=sys.stderr)

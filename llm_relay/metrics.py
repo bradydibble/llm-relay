@@ -250,13 +250,13 @@ class RelayMetrics:
         self.requests = Counter(
             "llm_relay_requests",
             "Chat-completion requests routed by the relay.",
-            ["provider", "model", "alias", "outcome", "client"],
+            ["provider", "model", "alias", "outcome", "client", "principal"],
             registry=self.registry,
         )
         self.tokens = Counter(
             "llm_relay_tokens",
             "Prompt/completion tokens routed by the relay.",
-            ["provider", "model", "direction", "client"],
+            ["provider", "model", "direction", "client", "principal"],
             registry=self.registry,
         )
         self.fallbacks = Counter(
@@ -299,18 +299,22 @@ class RelayMetrics:
         duration_s: float | None,
         fell_back: bool,
         ttft_s: float | None = None,
+        principal: str | None = None,
     ) -> None:
         if not metrics_enabled():
             return
         prov, mdl, ali, cli = _safe(provider), _safe(model), normalize_alias(alias), normalize_client(client)
-        self.requests.labels(provider=prov, model=mdl, alias=ali, outcome=outcome, client=cli).inc()
+        # Principal cardinality is bounded by the key store (plus
+        # internal/anonymous), so no dynamic cap: sanitize only.
+        pri = _sanitize_client(principal) if principal else "anonymous"
+        self.requests.labels(provider=prov, model=mdl, alias=ali, outcome=outcome, client=cli, principal=pri).inc()
 
         eff = _extract_usage(usage, response_body)
         pt, ct = eff.get("prompt_tokens"), eff.get("completion_tokens")
         if pt:
-            self.tokens.labels(provider=prov, model=mdl, direction="prompt", client=cli).inc(int(pt))
+            self.tokens.labels(provider=prov, model=mdl, direction="prompt", client=cli, principal=pri).inc(int(pt))
         if ct:
-            self.tokens.labels(provider=prov, model=mdl, direction="completion", client=cli).inc(int(ct))
+            self.tokens.labels(provider=prov, model=mdl, direction="completion", client=cli, principal=pri).inc(int(ct))
 
         if duration_s is not None and duration_s >= 0:
             self.duration.labels(provider=prov, model=mdl, alias=ali, client=cli).observe(duration_s)

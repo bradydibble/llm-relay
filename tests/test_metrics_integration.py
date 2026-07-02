@@ -75,9 +75,11 @@ async def test_successful_request_records_request_and_completion_tokens(tmp_path
     monkeypatch.setattr(app.state.router, "forward_request", _fake_forward)
 
     req_labels = {"provider": "local-llm", "model": "model-a", "alias": "main",
-                  "outcome": "success", "client": "claude-code"}
+                  "outcome": "success", "client": "claude-code",
+                  "principal": "anonymous"}
     tok_labels = {"provider": "local-llm", "model": "model-a",
-                  "direction": "completion", "client": "claude-code"}
+                  "direction": "completion", "client": "claude-code",
+                  "principal": "anonymous"}
     before_req = _val("llm_relay_requests_total", req_labels)
     before_tok = _val("llm_relay_tokens_total", tok_labels)
 

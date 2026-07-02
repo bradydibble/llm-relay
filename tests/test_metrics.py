@@ -131,7 +131,8 @@ def test_records_one_request_against_provider_model_alias_outcome_client():
     v = rm.registry.get_sample_value(
         "llm_relay_requests_total",
         {"provider": "prov-a", "model": "qwen3.5-35b",
-         "alias": "balanced", "outcome": "success", "client": "claude-code"},
+         "alias": "balanced", "outcome": "success", "client": "claude-code",
+         "principal": "anonymous"},
     )
     assert v == 1.0
 
@@ -145,11 +146,13 @@ def test_counts_prompt_and_completion_tokens_from_streaming_usage():
     )
     prompt = rm.registry.get_sample_value(
         "llm_relay_tokens_total",
-        {"provider": "prov-a", "model": "m", "direction": "prompt", "client": "unknown"},
+        {"provider": "prov-a", "model": "m", "direction": "prompt", "client": "unknown",
+         "principal": "anonymous"},
     )
     completion = rm.registry.get_sample_value(
         "llm_relay_tokens_total",
-        {"provider": "prov-a", "model": "m", "direction": "completion", "client": "unknown"},
+        {"provider": "prov-a", "model": "m", "direction": "completion", "client": "unknown",
+         "principal": "anonymous"},
     )
     assert prompt == 100.0
     assert completion == 40.0
@@ -167,7 +170,8 @@ def test_non_streaming_tokens_extracted_from_response_body_usage():
     )
     completion = rm.registry.get_sample_value(
         "llm_relay_tokens_total",
-        {"provider": "prov-a", "model": "m", "direction": "completion", "client": "unknown"},
+        {"provider": "prov-a", "model": "m", "direction": "completion", "client": "unknown",
+         "principal": "anonymous"},
     )
     assert completion == 12.0
 
@@ -358,7 +362,7 @@ def test_none_provider_and_model_coerced_to_label_safe_string():
     v = rm.registry.get_sample_value(
         "llm_relay_requests_total",
         {"provider": "none", "model": "none", "alias": "balanced",
-         "outcome": "no_candidate", "client": "unknown"},
+         "outcome": "no_candidate", "client": "unknown", "principal": "anonymous"},
     )
     assert v == 1.0
 

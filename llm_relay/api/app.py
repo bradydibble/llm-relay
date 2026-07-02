@@ -711,6 +711,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
         # can be attributed with zero client-side change while others opt in via
         # the header.
         client = resolve_client(request.headers.get("X-Llm-Relay-Client"), user_agent)
+        principal_id = getattr(_principal, "id", "anonymous")
         start_ns = time.time_ns()
         is_stream = body.get("stream") is True
 
@@ -724,7 +725,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 model_resolved=None, provider_name=None,
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=429, streamed=is_stream, error="shed: low urgency under contention",
-                outcome="shed", client=client,
+                outcome="shed", client=client, principal=principal_id,
             )
             raise HTTPException(
                 status_code=429,
@@ -747,7 +748,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 model_resolved=None, provider_name=None,
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=503, streamed=is_stream, error=str(e),
-                outcome="saturated", client=client,
+                outcome="saturated", client=client, principal=principal_id,
             )
             raise HTTPException(
                 status_code=503,
@@ -764,7 +765,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 model_resolved=None, provider_name=None,
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=503, streamed=is_stream, error=str(e),
-                outcome="no_backend", client=client,
+                outcome="no_backend", client=client, principal=principal_id,
             )
             raise HTTPException(
                 status_code=503,
@@ -778,7 +779,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 model_resolved=None, provider_name=None,
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=502, streamed=is_stream, error=f"Backend network error: {e}",
-                outcome="network_error", client=client,
+                outcome="network_error", client=client, principal=principal_id,
             )
             raise HTTPException(502, detail=f"Backend network error: {e}")
         except HTTPException:
@@ -789,7 +790,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 model_resolved=None, provider_name=None,
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=503, streamed=is_stream, error="No model matches constraints",
-                outcome="no_candidate", client=client,
+                outcome="no_candidate", client=client, principal=principal_id,
             )
             raise
         except Exception as e:
@@ -798,7 +799,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 model_resolved=None, provider_name=None,
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=502, streamed=is_stream, error=f"Backend error: {e}",
-                outcome="backend_error", client=client,
+                outcome="backend_error", client=client, principal=principal_id,
             )
             raise HTTPException(502, detail=f"Backend error: {e}")
 
@@ -850,7 +851,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                         user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                         status_code=upstream_status, streamed=True,
                         outcome=outcome,
-                        client=client,
+                        client=client, principal=principal_id,
                         fell_back=did_fall_back(result.selected_model, (result.decision or {}).get("ranked") or []),
                         ttft_ns=ttft_ns,
                     )
@@ -887,7 +888,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
             user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
             status_code=upstream.status_code, streamed=False,
             outcome="success" if upstream.status_code < 400 else "upstream_error",
-            client=client,
+            client=client, principal=principal_id,
             fell_back=did_fall_back(result.selected_model, (result.decision or {}).get("ranked") or []),
         )
         return JSONResponse(status_code=upstream.status_code, content=content, headers=relay_headers)
