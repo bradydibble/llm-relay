@@ -3,7 +3,7 @@
 Mounted at /mcp inside the main FastAPI app.  Clients connect with the
 Streamable HTTP transport:
 
-    http://<host>:<port>/mcp/mcp   (POST / SSE endpoint)
+    http://<host>:<port>/mcp   (POST / SSE endpoint)
 
 Configured tool list:
   relay_status           — active mode, alias resolutions, backend health
@@ -61,6 +61,9 @@ def build_mcp_server(
 
     mcp = FastMCP(
         name="llm-relay",
+        # Serve at the sub-app root so the FastAPI mount at /mcp yields a clean
+        # /mcp endpoint (not the SDK-default doubled /mcp/mcp).
+        streamable_http_path="/",
         instructions=(
             "Use relay_status to check the current LLM routing mode and which "
             "models are active before choosing a model for a task. "
