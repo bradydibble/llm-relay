@@ -96,6 +96,10 @@ class ModelConfig:
     # defaults, drop fields a backend rejects). Empty = no rewrite.
     strip_params: list[str] = field(default_factory=list)
     set_params: dict = field(default_factory=dict)
+    # Human-facing one-liner ("what is this model good for") surfaced through
+    # /v1/models, /v1/available-models, and the MCP list_models tool so clients
+    # and coworkers can pick by description, not just by name.
+    description: str | None = None
 
 
 @dataclass

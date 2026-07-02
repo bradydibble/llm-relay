@@ -146,6 +146,9 @@ def _model_entry(
     if ctx is not None:
         entry["context_length"] = ctx
         entry["max_model_len"] = ctx
+    m = cfg.models.models.get(lookup_name if lookup_name is not None else model_id)
+    if m is not None and m.description:
+        entry["description"] = m.description
     return entry
 
 
@@ -213,6 +216,8 @@ def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[
             # cockpit shows it; well-behaved auto-pickers should skip it.
             "manual_only": m.manual_only,
         }
+        if m.description:
+            out[name]["description"] = m.description
         # Runtime-discovered (found on a provider's discover_ports, not configured):
         # additive flag so the cockpit can distinguish ad-hoc bake-off models.
         if m.discovered:
