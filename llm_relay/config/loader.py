@@ -103,7 +103,9 @@ class ConfigLoader:
         enabled = os.environ.get("LLM_RELAY_AUTH") == "1" or bool(auth_block.get("enabled", False))
         self.auth = AuthConfig(
             enabled=enabled,
-            exempt_paths=list(auth_block.get("exempt_paths", ["/health", "/metrics"])),
+            exempt_paths=list(auth_block.get("exempt_paths", ["/health"])),
+            trusted_ports=[int(p) for p in (auth_block.get("trusted_ports") or [])],
+            trusted_principal=str(auth_block.get("trusted_principal", "internal")),
             principals_by_hash=load_keys(auth_file),
         )
 

@@ -34,10 +34,18 @@ class Principal:
 @dataclass
 class AuthConfig:
     enabled: bool = False
-    # Paths served without a key. The default keeps a Prometheus scrape and a
-    # liveness probe working; everything else needs a key when enabled. Not
-    # host-based on purpose -- see the module docstring.
-    exempt_paths: list[str] = field(default_factory=lambda: ["/health", "/metrics"])
+    # Paths served without a key. Only the liveness probe by default: /metrics
+    # carries principal/model/token detail, so a scraper gets a key instead
+    # (or scrapes a trusted listener). Not host-based on purpose -- see the
+    # module docstring; trusted_ports below is LISTENER-based, which is a
+    # different thing: the local listening socket a request arrived on, never
+    # the peer address a proxy can launder.
+    exempt_paths: list[str] = field(default_factory=lambda: ["/health"])
+    # Local listener ports whose traffic is implicitly trusted (attributed to
+    # ``trusted_principal`` with admin+cloud scopes). Bind these to loopback
+    # and never route external traffic to them.
+    trusted_ports: list[int] = field(default_factory=list)
+    trusted_principal: str = "internal"
     principals_by_hash: dict[str, "Principal"] = field(default_factory=dict)
 
 

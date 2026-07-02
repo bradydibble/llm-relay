@@ -232,3 +232,24 @@ def test_insecure_bind_warning():
     # Routable bind with auth off: warn.
     w = _insecure_bind_warning("0.0.0.0", auth_enabled=False)
     assert w is not None and "auth" in w.lower()
+
+
+# --- Task A1: trusted-listener config ---------------------------------------
+
+def test_authconfig_defaults_trusted_ports_empty_and_health_exempt():
+    cfg = AuthConfig()
+    assert cfg.trusted_ports == []
+    assert cfg.trusted_principal == "internal"
+    assert cfg.exempt_paths == ["/health"]
+
+
+def test_load_auth_reads_trusted_ports(tmp_path, monkeypatch):
+    monkeypatch.delenv("LLM_RELAY_AUTH", raising=False)
+    (tmp_path / "auth.yaml").write_text(
+        "auth:\n  enabled: true\n  trusted_ports: [8090]\n  trusted_principal: internal\n"
+    )
+    loader = ConfigLoader(config_dir=tmp_path)
+    loader.load()
+    assert loader.auth.enabled is True
+    assert loader.auth.trusted_ports == [8090]
+    assert loader.auth.trusted_principal == "internal"
