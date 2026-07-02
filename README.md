@@ -54,18 +54,39 @@ llm-relay route qwen3.5-35b --privacy cloud_ok
 llm-relay supports per-user **API-key authentication**, off by default. Enable it
 with `LLM_RELAY_AUTH=1` (or an `auth.enabled: true` block in `auth.yaml`). When
 enabled, every request to a non-exempt path must present a key via
-`Authorization: Bearer <key>` or `X-API-Key: <key>`. `/health` and `/metrics` are
-exempt by default (configurable via `auth.exempt_paths`), and `/health` returns a
-minimal body so it leaks no topology. Mint and manage keys with `llm-relay keys
-add|list|revoke`; keys are stored **hashed** (sha256) in `api_keys.yaml` in your
-config dir, which should live outside the repo and never be committed (the repo
-ships only `config/api_keys.example.yaml`). Each key maps to a principal carrying a
-priority weight (used by the scheduler) and reserved scopes.
+`Authorization: Bearer <key>` or `X-API-Key: <key>`. Only `/health` is exempt by
+default (configurable via `auth.exempt_paths`), and it returns a minimal body so
+it leaks no topology; give a remote Prometheus a key, or scrape a trusted
+listener (below). Mint and manage keys with `llm-relay keys add|list|revoke`
+(`revoke` takes a principal id or `--hash <prefix>` for single-key rotation, and
+`list` shows created dates and notes); keys are stored **hashed** (sha256) in
+`api_keys.yaml` in your config dir, which should live outside the repo and never
+be committed (the repo ships only `config/api_keys.example.yaml`). Each key maps
+to a principal carrying a priority weight (used by the scheduler) and scopes.
 
-Enforcement is **key-based, not host-based**: the relay typically runs behind a
-loopback reverse proxy, so trusting the peer address would bypass auth for all
-proxied traffic. Give your local tooling (the dashboard, the CLI, a remote
-Prometheus) a key rather than relying on a loopback exemption.
+**Dual-listener deployments.** One relay process can serve two loopback
+listeners: the primary (`LLM_RELAY_PORT`) and an auth listener
+(`LLM_RELAY_AUTH_PORT`). Ports listed in `auth.trusted_ports` (see
+`config/auth.example.yaml`) are implicitly trusted: their requests are
+attributed to the `auth.trusted_principal` (default `internal`) with
+`admin`+`cloud` scopes, and need no key. This is how a deployment lets its own
+local agents keep working keyless while a reverse proxy routes external traffic
+to the enforced listener. Trust is decided by the LISTENING socket a request
+arrived on, never the peer address: a loopback reverse proxy makes every peer
+look local, but it cannot change which port it connected to. Fail-closed: the
+auth listener refuses to start while the key store has no enabled key.
+
+**Scopes.** `admin` gates `/admin/*` (including `/admin/keys` mint/list/revoke)
+and `/logs*`. Keys minted over the HTTP API are always scope-less; scoped keys
+(admin, cloud) are mintable only via the on-box CLI, so a leaked admin key
+cannot create more admins. `cloud` is the privacy ceiling: without it, a
+request's `X-Llm-Relay-Privacy: cloud_ok` hint is clamped to `local_only`, so
+unscoped callers can never route to a cloud provider even when one is enabled.
+Async jobs are principal-scoped (you can fetch/cancel only your own), and the
+request/token metrics carry a `principal` label. Auth failures increment
+`llm_relay_auth_failures_total` and, like key mints/revokes and admin actions,
+append to a JSON-lines audit log (`LLM_RELAY_AUDIT_LOG`, default
+`<config dir>/audit.log`).
 
 With auth **disabled** (the default), llm-relay has no inbound authentication and
 binds to `127.0.0.1` (override with `--host` / `LLM_RELAY_HOST`). In that mode any
