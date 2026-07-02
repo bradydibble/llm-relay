@@ -16,6 +16,8 @@ from .jobs import STATUS_DONE, STATUS_ERROR, STATUS_RUNNING, Job, JobStore
 
 
 def _headers_for(job: Job) -> dict[str, str]:
+    # Privacy ceiling note: only SLA/urgency are forwarded, never a privacy
+    # hint, so async jobs are structurally local_only regardless of principal.
     headers: dict[str, str] = {}
     if job.sla_class:
         headers["X-Llm-Relay-SLA-Class"] = job.sla_class

@@ -38,6 +38,19 @@ def _resolve_base_url() -> str:
     return os.environ.get("LLM_RELAY_BASE_URL", "http://127.0.0.1:8090").rstrip("/")
 
 
+def _clamp_privacy(principal, auth_enabled: bool, hint_headers: dict[str, str]) -> None:
+    """Privacy ceiling: only principals carrying the ``cloud`` scope may pass
+    ``cloud_ok`` upstream (trusted-listener traffic carries it implicitly).
+    With auth disabled, legacy open-deployment behavior is preserved."""
+    if not auth_enabled:
+        return
+    scopes = list(getattr(principal, "scopes", []) or [])
+    if "cloud" in scopes:
+        return
+    if hint_headers.get("X-Llm-Relay-Privacy") == "cloud_ok":
+        hint_headers["X-Llm-Relay-Privacy"] = "local_only"
+
+
 def _resolve_config_dir(config_dir: str | Path | None) -> Path:
     if config_dir:
         return Path(config_dir)
@@ -688,6 +701,8 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
             v = request.headers.get(key)
             if v is not None:
                 hint_headers[key] = v
+        _principal = getattr(request.state, "principal", None)
+        _clamp_privacy(_principal, request.app.state.config.auth.enabled, hint_headers)
         user_agent = request.headers.get("user-agent", "")
         # Explicit X-Llm-Relay-Client header wins; else fall back to a configured
         # distinctive User-Agent pattern; else "unknown". The known-client set and
@@ -887,6 +902,11 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
         hint_headers = {
             k: request.headers[k] for k in ("X-Llm-Relay-Privacy",) if k in request.headers
         }
+        _clamp_privacy(
+            getattr(request.state, "principal", None),
+            request.app.state.config.auth.enabled,
+            hint_headers,
+        )
         try:
             upstream, result = await request.app.state.router.route_simple(
                 body, headers=hint_headers, upstream_path=upstream_path,
