@@ -145,35 +145,60 @@ def cmd_config(args: argparse.Namespace) -> int:
 def cmd_keys(args: argparse.Namespace) -> int:
     from pathlib import Path
 
-    from .auth import hash_key, load_keys, mint_key, revoke_id, write_keys
+    from .audit import audit
+    from .auth import add_key_record, load_key_records, revoke_hash, revoke_id
 
     config_dir = Path(os.environ.get("LLM_RELAY_CONFIG_DIR", "config"))
     path = config_dir / "api_keys.yaml"
     console = Console()
     action = getattr(args, "keys_action", None)
     if action == "add":
-        principals = load_keys(path)
-        plaintext, principal = mint_key(args.id, priority_weight=args.priority, scopes=args.scopes)
-        principals[hash_key(plaintext)] = principal
         config_dir.mkdir(parents=True, exist_ok=True)
-        write_keys(path, principals)
+        plaintext = add_key_record(
+            path, args.id, priority_weight=args.priority, scopes=args.scopes,
+            note=getattr(args, "note", None),
+        )
+        audit("key_minted", principal=args.id, scopes=args.scopes, by="cli")
         console.print(
             f"[green]Key for {args.id}[/green] (store securely, shown once): [bold]{plaintext}[/bold]"
         )
         return 0
     if action == "list":
-        principals = load_keys(path)
+        records = load_key_records(path)
         table = Table(title="API key principals")
+        table.add_column("hash", style="dim")
         table.add_column("id", style="cyan")
         table.add_column("priority")
         table.add_column("scopes")
         table.add_column("enabled")
-        for p in principals.values():
-            table.add_row(p.id, str(p.priority_weight), ", ".join(p.scopes) or "-", str(p.enabled))
+        table.add_column("created")
+        table.add_column("note")
+        for h, r in sorted(records.items()):
+            table.add_row(
+                h[:12], str(r.get("id", "?")), str(r.get("priority_weight", 1.0)),
+                ", ".join(r.get("scopes") or []) or "-", str(r.get("enabled", True)),
+                str(r.get("created", "")), str(r.get("note", "")),
+            )
         console.print(table)
         return 0
     if action == "revoke":
+        hash_prefix = getattr(args, "hash_prefix", None)
+        if hash_prefix:
+            n = revoke_hash(path, hash_prefix)
+            if n == 1:
+                audit("key_revoked", hash_prefix=hash_prefix, by="cli")
+                console.print(f"[yellow]Revoked key {hash_prefix}...[/yellow]")
+                return 0
+            console.print(
+                "[red]Prefix ambiguous; use a longer one[/red]" if n == -1
+                else "[red]No key matches that prefix[/red]"
+            )
+            return 1
+        if not args.id:
+            console.print("[red]Give a principal id or --hash <prefix>[/red]")
+            return 1
         removed = revoke_id(path, args.id)
+        audit("key_revoked", principal=args.id, count=removed, by="cli")
         console.print(f"[yellow]Revoked {removed} key(s) for {args.id}[/yellow]")
         return 0
     console.print("[red]Usage: llm-relay keys {add|list|revoke}[/red]")
@@ -209,9 +234,11 @@ def main() -> int:
     k_add.add_argument("id")
     k_add.add_argument("--priority", type=float, default=1.0)
     k_add.add_argument("--scope", action="append", default=[], dest="scopes")
+    k_add.add_argument("--note", default=None)
     keys_sub.add_parser("list", help="List key principals (never prints keys)")
-    k_rev = keys_sub.add_parser("revoke", help="Revoke all keys for a user/agent")
-    k_rev.add_argument("id")
+    k_rev = keys_sub.add_parser("revoke", help="Revoke keys by principal id or --hash prefix")
+    k_rev.add_argument("id", nargs="?")
+    k_rev.add_argument("--hash", dest="hash_prefix", default=None)
 
     args = parser.parse_args()
     if args.command == "run":

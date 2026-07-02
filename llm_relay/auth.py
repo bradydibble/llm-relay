@@ -148,8 +148,71 @@ def write_keys(path: Path, principals_by_hash: dict[str, Principal]) -> None:
 
 def revoke_id(path: Path, id: str) -> int:
     """Remove every key whose principal id matches. Returns the count removed."""
-    principals = load_keys(path)
-    kept = {h: p for h, p in principals.items() if p.id != id}
-    removed = len(principals) - len(kept)
-    write_keys(path, kept)
+    records = load_key_records(path)
+    kept = {h: r for h, r in records.items() if str(r.get("id")) != id}
+    removed = len(records) - len(kept)
+    write_key_records(path, kept)
     return removed
+
+
+# --- Raw key records (per-hash metadata: created/note, round-tripped) --------
+#
+# ``load_keys`` above builds runtime Principals and ignores extra fields; the
+# record functions preserve everything so the CLI and /admin/keys can show and
+# maintain audit-friendly metadata without a second store.
+
+def load_key_records(path: Path) -> dict[str, dict]:
+    """Raw ``{key_hash: record}`` including metadata. ``{}`` if absent."""
+    if not path.exists():
+        return {}
+    raw = yaml.safe_load(path.read_text()) or {}
+    return {str(h): dict(meta or {}) for h, meta in (raw.get("keys") or {}).items()}
+
+
+def write_key_records(path: Path, records: dict[str, dict]) -> None:
+    path.write_text(yaml.safe_dump({"keys": records}, sort_keys=True))
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def add_key_record(
+    path: Path,
+    id: str,
+    priority_weight: float = 1.0,
+    scopes: list[str] | None = None,
+    note: str | None = None,
+) -> str:
+    """Mint a key and persist its record (hash only). Returns the plaintext,
+    which is shown once by the caller and never stored."""
+    import datetime
+
+    plaintext, principal = mint_key(id, priority_weight=priority_weight, scopes=scopes)
+    records = load_key_records(path)
+    records[hash_key(plaintext)] = {
+        "id": principal.id,
+        "priority_weight": principal.priority_weight,
+        "scopes": principal.scopes,
+        "enabled": True,
+        "created": datetime.date.today().isoformat(),
+        "note": note or "",
+    }
+    write_key_records(path, records)
+    return plaintext
+
+
+def revoke_hash(path: Path, hash_prefix: str) -> int:
+    """Revoke the single key whose hash starts with ``hash_prefix``.
+
+    Returns 1 on success, 0 when nothing matches, -1 when the prefix is
+    ambiguous (empty or matching more than one key)."""
+    records = load_key_records(path)
+    matches = [h for h in records if h.startswith(hash_prefix)]
+    if not hash_prefix or len(matches) > 1:
+        return -1
+    if not matches:
+        return 0
+    del records[matches[0]]
+    write_key_records(path, records)
+    return 1

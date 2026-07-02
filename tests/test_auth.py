@@ -234,6 +234,38 @@ def test_insecure_bind_warning():
     assert w is not None and "auth" in w.lower()
 
 
+# --- Task A3: key records + revoke-by-hash ----------------------------------
+from llm_relay.auth import add_key_record, load_key_records, revoke_hash
+
+
+def test_add_key_record_sets_created_and_note(tmp_path):
+    path = tmp_path / "api_keys.yaml"
+    plaintext = add_key_record(path, "jdoe", priority_weight=0.5, note="coworker")
+    assert plaintext.startswith("llmr_")
+    records = load_key_records(path)
+    ((h, rec),) = records.items()
+    assert rec["id"] == "jdoe" and rec["note"] == "coworker"
+    assert rec["created"][:2] == "20"
+    assert load_keys(path)[h].priority_weight == 0.5  # Principal load still works
+
+
+def test_revoke_hash_prefix(tmp_path):
+    path = tmp_path / "api_keys.yaml"
+    add_key_record(path, "a")
+    add_key_record(path, "a")
+    records = load_key_records(path)
+    target = sorted(records)[0]
+    assert revoke_hash(path, target[:12]) == 1
+    assert len(load_key_records(path)) == 1
+
+
+def test_revoke_hash_ambiguous_or_missing(tmp_path):
+    path = tmp_path / "api_keys.yaml"
+    add_key_record(path, "a")
+    assert revoke_hash(path, "") == -1  # matches everything = ambiguous guard
+    assert revoke_hash(path, "zzzz") == 0
+
+
 # --- Task A1: trusted-listener config ---------------------------------------
 
 def test_authconfig_defaults_trusted_ports_empty_and_health_exempt():
