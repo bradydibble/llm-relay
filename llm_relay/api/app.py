@@ -671,6 +671,60 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
         cfg.save_paused_providers(persisted)
         return {"ok": True, "provider": provider, "paused": disc.is_provider_paused(provider)}
 
+    # --- Key lifecycle over HTTP (admin scope enforced by the middleware). ---
+    # API minting is deliberately scope-less: admin-scoped keys are mintable
+    # only via the on-box CLI, so a leaked admin key can manage users but
+    # cannot quietly create more admins.
+    from ..audit import audit as _audit
+    from ..auth import add_key_record, load_key_records, load_keys as _load_keys, revoke_hash
+
+    _keys_path = cfg_path / "api_keys.yaml"
+
+    def _reload_principals() -> None:
+        config.auth.principals_by_hash = _load_keys(_keys_path)
+
+    def _acting(request: Request) -> str:
+        return getattr(getattr(request.state, "principal", None), "id", "?")
+
+    @app.get("/admin/keys")
+    async def admin_keys_list(request: Request) -> dict[str, Any]:
+        records = load_key_records(_keys_path)
+        return {"keys": [
+            {"hash_prefix": h[:12], "id": r.get("id"), "scopes": r.get("scopes", []),
+             "priority_weight": r.get("priority_weight", 1.0),
+             "enabled": r.get("enabled", True), "created": r.get("created", ""),
+             "note": r.get("note", "")}
+            for h, r in sorted(records.items())
+        ]}
+
+    @app.post("/admin/keys")
+    async def admin_keys_add(request: Request) -> dict[str, Any]:
+        body = await request.json()
+        if body.get("scopes"):
+            raise HTTPException(400, detail="scoped keys are mintable only via the on-box CLI")
+        kid = str(body.get("id") or "").strip()
+        if not kid:
+            raise HTTPException(400, detail="id required")
+        plaintext = add_key_record(
+            _keys_path, kid,
+            priority_weight=float(body.get("priority_weight", 0.5)),
+            note=str(body.get("note", "")),
+        )
+        _reload_principals()
+        _audit("key_minted", principal=kid, by=_acting(request))
+        return {"id": kid, "key": plaintext}
+
+    @app.delete("/admin/keys/{hash_prefix}")
+    async def admin_keys_revoke(hash_prefix: str, request: Request) -> dict[str, Any]:
+        n = revoke_hash(_keys_path, hash_prefix)
+        if n == 0:
+            raise HTTPException(404, detail="no key matches that prefix")
+        if n == -1:
+            raise HTTPException(409, detail="prefix ambiguous; use a longer one")
+        _reload_principals()
+        _audit("key_revoked", hash_prefix=hash_prefix, by=_acting(request))
+        return {"revoked": n}
+
     @app.get("/routing-table")
     async def routing_table(request: Request) -> dict[str, list[str]]:
         return dict(request.app.state.config.policy.fallback.graph)
