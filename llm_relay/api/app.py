@@ -1108,7 +1108,60 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
     return app
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("LLM_RELAY_PORT", 8090))
+def build_sockets(host: str, port: int, auth_port: int | None, auth_cfg) -> tuple[list, list[str]]:
+    """Listener sockets for :func:`serve`. Fail-closed: the auth listener is
+    refused (with a warning) when auth is enabled but the key store has no
+    enabled key, so a misconfigured deployment cannot expose a keyless "auth"
+    port. The trusted/primary listener always binds so local consumers stay up.
+    """
+    import socket as _socket
+
+    def _bind(p: int):
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        s.bind((host, p))
+        s.listen(2048)
+        return s
+
+    sockets, warnings = [_bind(port)], []
+    if auth_port is not None:
+        has_key = any(p.enabled for p in auth_cfg.principals_by_hash.values())
+        if auth_cfg.enabled and not has_key:
+            warnings.append(
+                f"auth listener :{auth_port} REFUSED: auth enabled but api_keys.yaml has no enabled key"
+            )
+        else:
+            sockets.append(_bind(auth_port))
+    return sockets, warnings
+
+
+async def serve(config_dir: str | Path | None = None) -> None:
+    """Run one relay process on one or two listeners (single lifespan).
+
+    ``LLM_RELAY_PORT`` is the primary listener (typically a trusted loopback
+    port, see auth.trusted_ports); ``LLM_RELAY_AUTH_PORT``, when set, adds the
+    key-enforced listener a reverse proxy routes external traffic to.
+    """
+    import logging
+
+    log = logging.getLogger("llm_relay")
     host = os.environ.get("LLM_RELAY_HOST", "127.0.0.1")
-    uvicorn.run("llm_relay.api.app:create_app", host=host, port=port, factory=True)
+    port = int(os.environ.get("LLM_RELAY_PORT", 8090))
+    auth_port_raw = os.environ.get("LLM_RELAY_AUTH_PORT", "")
+    auth_port = int(auth_port_raw) if auth_port_raw else None
+    app = create_app(config_dir)
+    sockets, warnings = build_sockets(host, port, auth_port, app.state.config.auth)
+    for w in warnings:
+        log.error(w)
+    log.info(
+        "listeners: %s (primary=%s auth=%s trusted_ports=%s)",
+        [s.getsockname()[1] for s in sockets], port, auth_port,
+        app.state.config.auth.trusted_ports,
+    )
+    config = uvicorn.Config(app, log_level=os.environ.get("LLM_RELAY_LOG_LEVEL", "info"))
+    server = uvicorn.Server(config)
+    await server.serve(sockets=sockets)
+
+
+if __name__ == "__main__":
+    asyncio.run(serve())

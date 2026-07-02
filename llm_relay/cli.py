@@ -35,8 +35,6 @@ def _insecure_bind_warning(host: str, auth_enabled: bool) -> str | None:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    import uvicorn
-
     port = args.port or int(os.environ.get("LLM_RELAY_PORT", 8090))
     host = args.host or os.environ.get("LLM_RELAY_HOST", "127.0.0.1")
     try:
@@ -46,13 +44,26 @@ def cmd_run(args: argparse.Namespace) -> int:
     warning = _insecure_bind_warning(host, auth_enabled)
     if warning:
         Console(stderr=True).print(f"[bold red]WARNING:[/bold red] {warning}")
-    uvicorn.run(
-        "llm_relay.api.app:create_app",
-        host=host,
-        port=port,
-        factory=True,
-        reload=args.reload,
-    )
+    if args.reload:
+        # Dev mode: uvicorn's reloader needs an import string; single listener.
+        import uvicorn
+
+        uvicorn.run(
+            "llm_relay.api.app:create_app",
+            host=host,
+            port=port,
+            factory=True,
+            reload=True,
+        )
+        return 0
+    # Production path: one process, one or two listeners (LLM_RELAY_AUTH_PORT).
+    import asyncio
+
+    from .api.app import serve
+
+    os.environ["LLM_RELAY_HOST"] = host
+    os.environ["LLM_RELAY_PORT"] = str(port)
+    asyncio.run(serve())
     return 0
 
 
