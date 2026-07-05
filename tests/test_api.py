@@ -227,6 +227,29 @@ def test_v1_models_list_advertises_qualified_ids():
         cfg.models.models["qwen3.5-9b"].context_window
 
 
+def test_v1_models_list_hides_unservable_models_once_discovery_sees_the_fleet():
+    """/v1/models advertises only what is servable right now: with the 9b live
+    and the 35b down, the 35b entry disappears while `main` (still servable via
+    its 9b member) stays. A blind discovery (fresh relay, nothing polled yet)
+    fails open to the full configured list rather than an empty one."""
+    cfg = _load_cfg()
+
+    blind = _build_models_list_payload(cfg, DiscoveryManager())
+    assert any(e["id"] == "local-llm:qwen3.5-35b" for e in blind["data"]), \
+        "blind discovery must fail open to the full list"
+
+    disc = DiscoveryManager()
+    _seed(disc, "qwen3.5-9b", EndpointStatus.healthy)
+    _seed(disc, "qwen3.5-35b", EndpointStatus.unavailable)
+    payload = _build_models_list_payload(cfg, disc)
+    ids = {e["id"] for e in payload["data"]}
+    assert "local-llm:qwen3.5-9b" in ids
+    assert "local-llm:qwen3.5-35b" not in ids, "down model must not be advertised"
+    assert "anthropic:claude-3-5-sonnet" not in ids, \
+        "unprobed models (incl. cloud) are not advertised while filtering"
+    assert "main" in ids, "alias with a live member stays advertised"
+
+
 def test_v1_model_card_accepts_qualified_and_bare():
     """The card resolves a qualified id (echoing it) and a bare id (back-compat);
     a mismatched provider:model pair is a 404 (None)."""

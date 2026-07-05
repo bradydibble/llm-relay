@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from ..config.loader import ConfigLoader
-from ..config.types import ModelConfig, NoBackendAvailableError, Privacy, SaturationError
+from ..config.types import ModelConfig, ModelStatus, NoBackendAvailableError, Privacy, SaturationError
 from ..discovery.manager import DiscoveryManager
 from ..routing.keys import compose_backend_key, compose_model_id, resolve_model_id
 from ..routing.router import RequestRouter
@@ -153,22 +153,40 @@ def _model_entry(
 
 
 def _build_models_list_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[str, Any]:
-    """OpenAI-compatible ``/v1/models`` list: every concrete model and alias,
-    each enriched with context metadata so discovery clients can read it from
-    the list response (the path most OpenAI-compat resolvers hit first)."""
+    """OpenAI-compatible ``/v1/models`` list, enriched with context metadata so
+    discovery clients can read it from the list response (the path most
+    OpenAI-compat resolvers hit first).
+
+    Only models the relay can serve RIGHT NOW (status available/degraded per
+    discovery, same authority as ``/available-models``) are advertised; an
+    alias stays listed while at least one member is servable. Model pickers
+    (Open WebUI etc.) therefore show the live fleet, not the config file.
+
+    Fail-open-when-blind: if discovery reports NOTHING servable (typically a
+    just-restarted relay before its first poll, or a total fleet outage), the
+    full configured list is returned instead — an empty list would tell
+    clients the fleet doesn't exist, which is a worse lie than a stale one.
+    ``/available-models`` remains the full config-with-status view."""
+    usable = {ModelStatus.available, ModelStatus.degraded}
+    states = {name: disc.get_model_state(name) for name in cfg.models.models}
+    filtering = any(s in usable for s in states.values())
     data: list[dict[str, Any]] = []
     seen: set[str] = set()
     for name, m in cfg.models.models.items():
         if name in seen:
             continue
         seen.add(name)
+        if filtering and states[name] not in usable:
+            continue
         # Advertise the host-qualified id so the same model on different hosts is
         # distinguishable; context is still resolved by the bare name.
         data.append(_model_entry(cfg, disc, compose_model_id(m.provider, name), m.provider, lookup_name=name))
-    for alias in cfg.models.aliases.keys():
+    for alias, members in cfg.models.aliases.items():
         if alias in seen:
             continue
         seen.add(alias)
+        if filtering and not any(states.get(member) in usable for member in members):
+            continue
         data.append(_model_entry(cfg, disc, alias, "llm-relay-alias"))
     return {"object": "list", "data": data}
 
