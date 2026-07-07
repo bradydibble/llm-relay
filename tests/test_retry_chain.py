@@ -668,11 +668,13 @@ async def test_route_and_forward_exhausted_chain_reports_correct_candidate(tmp_p
 # ---------------------------------------------------------------------------
 
 def test_estimate_prompt_tokens_scales_with_message_size():
-    # ~3 chars/token (conservative over-count) of the PROMPT only.
+    # ~3 chars/token of the PROMPT only, times the 1.2 upper-bound safety margin:
+    # 30000/3 * 1.2 = 12000.
     assert _estimate_prompt_tokens(
         {"messages": [{"role": "user", "content": "x" * 30000}]}
-    ) == 10000
-    # A trivially small request rounds to nothing -> no implicit floor.
+    ) == 12000
+    # A trivially small request still rounds to nothing (margin is multiplicative)
+    # -> no implicit floor.
     assert _estimate_prompt_tokens(
         {"messages": [{"role": "user", "content": "hi"}]}
     ) is None
@@ -686,7 +688,7 @@ def test_estimate_prompt_tokens_ignores_max_tokens():
     est = _estimate_prompt_tokens(
         {"messages": [{"role": "user", "content": "x" * 3000}], "max_tokens": 50000}
     )
-    assert est == 1000  # 3000//3 prompt tokens; max_tokens excluded
+    assert est == 1200  # 3000/3 * 1.2 safety margin prompt tokens; max_tokens excluded
 
 
 def test_estimate_prompt_tokens_handles_malformed_body():
@@ -880,3 +882,113 @@ async def test_route_and_forward_routes_host_qualified_id_to_that_backend(tmp_pa
     assert resp.status_code == 200
     assert result.selected_model == "model-big"
     assert called == ["model-big"], "qualified id must forward to exactly that backend"
+
+
+# ---------------------------------------------------------------------------
+# Context-overflow backstop: when the prompt estimate under-shoots and the chosen
+# model hard-rejects at its boundary, escalate to a larger-window candidate rather
+# than surfacing the raw upstream 400. On exhaustion, a structured 413 the client
+# can compact-and-retry. (Defense-in-depth behind the conservative estimate.)
+# ---------------------------------------------------------------------------
+
+_OVERFLOW_BODY = b'{"error":{"message":"the request exceeds the available context size","type":"exceed_context_size_error"}}'
+
+
+async def test_context_overflow_escalates_to_larger_backend(tmp_path, monkeypatch):
+    """A SMALL-enough prompt passes model-small's fit gate but the backend still
+    400s as context-overflow (estimate under-shot the real tokenization). The
+    router must escalate to model-big (larger window) and return its 200, not
+    surface the raw 400."""
+    app = _make_ctx_app(tmp_path)
+    router = app.state.router
+    tried: list[str] = []
+
+    async def _fake_forward(backend_url, model_name, *args, **kwargs):
+        tried.append(model_name)
+        if model_name == "model-small":
+            return httpx.Response(400, content=_OVERFLOW_BODY)
+        return httpx.Response(200, json={"choices": []})
+
+    monkeypatch.setattr(router, "forward_request", _fake_forward)
+
+    resp, result = await router.route_and_forward(
+        request_data={"model": "main", "messages": [{"role": "user", "content": "x" * 3000}]},
+        stream=False,
+    )
+    assert resp.status_code == 200
+    assert result.selected_model == "model-big"
+    assert tried == ["model-small", "model-big"], "must try the priority model, then escalate up"
+
+
+async def test_context_overflow_exhausted_returns_structured_413(tmp_path, monkeypatch):
+    """When every large-enough candidate overflows, surface a structured
+    context_overflow (413 + X-Llm-Relay-Error header) the client can act on —
+    never the raw upstream 400."""
+    app = _make_ctx_app(tmp_path)
+    router = app.state.router
+
+    async def _fake_forward(backend_url, model_name, *args, **kwargs):
+        return httpx.Response(400, content=_OVERFLOW_BODY)
+
+    monkeypatch.setattr(router, "forward_request", _fake_forward)
+
+    with pytest.raises(HTTPException) as ei:
+        await router.route_and_forward(
+            request_data={"model": "main", "messages": [{"role": "user", "content": "x" * 3000}]},
+            stream=False,
+        )
+    assert ei.value.status_code == 413
+    assert ei.value.detail["error"] == "context_overflow"
+    assert ei.value.headers.get("X-Llm-Relay-Error") == "context_overflow"
+
+
+async def test_ordinary_400_is_not_treated_as_overflow(tmp_path, monkeypatch):
+    """A genuine bad-request 400 (no overflow marker) must propagate as-is, not
+    burn the chain escalating — only a context-overflow body triggers escalation."""
+    app = _make_ctx_app(tmp_path)
+    router = app.state.router
+    tried: list[str] = []
+
+    async def _fake_forward(backend_url, model_name, *args, **kwargs):
+        tried.append(model_name)
+        return httpx.Response(400, json={"error": "malformed tool schema"})
+
+    monkeypatch.setattr(router, "forward_request", _fake_forward)
+
+    resp, result = await router.route_and_forward(
+        request_data={"model": "main", "messages": [{"role": "user", "content": "x" * 3000}]},
+        stream=False,
+    )
+    assert resp.status_code == 400
+    assert tried == ["model-small"], "a non-overflow 400 must not escalate across the chain"
+
+
+async def test_context_overflow_escalates_on_streaming_path(tmp_path, monkeypatch):
+    """The SSE path escalates on overflow too: model-small streams back a 400
+    overflow status pre-first-byte; the router reads the (small) body, abandons it,
+    and commits to model-big. Exercises the aread/replay branch."""
+    app = _make_ctx_app(tmp_path)
+    router = app.state.router
+    tried: list[str] = []
+
+    async def _empty_iter():
+        yield b""
+
+    async def _cleanup():
+        return None
+
+    async def _fake_stream(backend_url, model_name, request_data, *args, **kwargs):
+        tried.append(model_name)
+        if model_name == "model-small":
+            return httpx.Response(400, content=_OVERFLOW_BODY), _empty_iter(), _cleanup
+        return httpx.Response(200, content=b""), _empty_iter(), _cleanup
+
+    monkeypatch.setattr(router, "stream_request", _fake_stream)
+
+    upstream, body_iter, result, cleanup = await router.route_and_forward(
+        request_data={"model": "main", "messages": [{"role": "user", "content": "x" * 3000}], "stream": True},
+        stream=True,
+    )
+    assert upstream.status_code == 200
+    assert result.selected_model == "model-big"
+    assert tried == ["model-small", "model-big"]

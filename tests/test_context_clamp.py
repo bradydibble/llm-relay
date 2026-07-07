@@ -26,10 +26,11 @@ from llm_relay.routing.router import (
 # --- _estimate_prompt_tokens: prompt only, never the output ceiling ----------
 
 def test_estimate_prompt_tokens_counts_prompt_not_max_tokens():
-    # 3000 prompt chars -> 1000 tokens; max_tokens (an output ceiling) is IGNORED.
+    # 3000 prompt chars -> 3000/3 * 1.2 safety margin = 1200 tokens; max_tokens
+    # (an output ceiling) is IGNORED.
     assert _estimate_prompt_tokens(
         {"messages": [{"role": "user", "content": "x" * 3000}], "max_tokens": 50000}
-    ) == 1000
+    ) == 1200
 
 
 # --- _clamp_max_tokens: cap the output to the chosen model's headroom ----------
@@ -117,7 +118,7 @@ async def test_big_max_tokens_degrades_to_smaller_model_with_clamp(tmp_path, mon
     resp, result = await router.route_and_forward(
         request_data={
             "model": "main",
-            "messages": [{"role": "user", "content": "x" * 30000}],  # 10000 est tokens
+            "messages": [{"role": "user", "content": "x" * 30000}],  # 12000 est tokens (30000/3*1.2)
             "max_tokens": 32768,
         },
         stream=False,
@@ -125,7 +126,7 @@ async def test_big_max_tokens_degrades_to_smaller_model_with_clamp(tmp_path, mon
 
     assert resp.status_code == 200
     assert captured["model"] == "small-model", "request must degrade to the live small model"
-    assert captured["max_tokens"] == 6000, "output clamped to small-model headroom (16000 - 10000)"
+    assert captured["max_tokens"] == 4000, "output clamped to small-model headroom (16000 - 12000)"
     assert MIN_OUTPUT_HEADROOM > 0
 
 
@@ -162,7 +163,7 @@ async def test_big_max_tokens_degrades_with_clamp_streaming(tmp_path, monkeypatc
     upstream, body_iter, result, cleanup = await router.route_and_forward(
         request_data={
             "model": "main",
-            "messages": [{"role": "user", "content": "x" * 30000}],  # 10000 est tokens
+            "messages": [{"role": "user", "content": "x" * 30000}],  # 12000 est tokens (30000/3*1.2)
             "max_tokens": 32768,
             "stream": True,
         },
@@ -171,4 +172,4 @@ async def test_big_max_tokens_degrades_with_clamp_streaming(tmp_path, monkeypatc
 
     assert upstream.status_code == 200
     assert captured["model"] == "small-model"
-    assert captured["max_tokens"] == 6000, "output clamped on the streaming path too"
+    assert captured["max_tokens"] == 4000, "output clamped on the streaming path too"

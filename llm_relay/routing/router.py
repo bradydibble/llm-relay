@@ -24,6 +24,40 @@ from .selector import ChainCandidate, ModelSelector, RoutingContext, batch_polic
 # routing; only a prompt that genuinely fits nothing live is refused (oversize).
 MIN_OUTPUT_HEADROOM = 1024
 
+# Prompt-size estimation is a heuristic (no server tokenizer). It must be a true
+# UPPER bound: under-counting routes a request to a backend too small to hold it
+# and the upstream hard-rejects at the boundary (the 2026-07-07 subagent incident:
+# a real 66,284-token prompt estimated just under the 65,536 window and 400'd on
+# the 9B). Over-counting only forgoes spilling to a smaller/faster backend — the
+# safe direction. So the estimator pads the raw char-count heuristic:
+#   * PROMPT_CHARS_PER_TOKEN — base ratio; ~3 chars/token is near English but
+#     code / structured JSON / CJK / tool payloads pack MORE tokens per char, so 3
+#     alone is not a reliable ceiling near the boundary.
+#   * PROMPT_ESTIMATE_SAFETY_MARGIN — multiplicative pad so the estimate clears the
+#     real count even when the per-char ratio bites. Scales with prompt size, so
+#     the absolute headroom grows exactly where boundary risk is highest. 1.2
+#     covers a per-char ratio down to ~2.5 (dense code/JSON); the observed incident
+#     miss was ~5%, so this is ~4x that. A trivially small prompt still rounds to
+#     0 -> None (no implicit floor), preserved by keeping the margin multiplicative.
+PROMPT_CHARS_PER_TOKEN = 3
+PROMPT_ESTIMATE_SAFETY_MARGIN = 1.2
+
+# Substrings (lowercased) that mark an upstream "prompt exceeds context window"
+# rejection across the fleet's backends (llama.cpp `exceed_context_size_error`,
+# vLLM "maximum context length", generic proxies). Matched against the response
+# body to distinguish a context-overflow 400/413 — which should ESCALATE to a
+# larger-window candidate — from an ordinary malformed-request 400, which must not.
+_CONTEXT_OVERFLOW_MARKERS = (
+    "exceed_context_size",
+    "exceeds the available context",
+    "maximum context length",
+    "context window",
+    "context length",
+    "too many tokens",
+    "prompt is too long",
+    "reduce the length",
+)
+
 # Retry-After hint (seconds) for a TRANSIENT no-candidate: the constraints are
 # satisfiable but every matching backend is momentarily down/paused. Sized to the
 # ~15s discovery poll cadence, so a recovered/unpaused backend is re-detected
@@ -334,7 +368,12 @@ class RequestRouter:
             # (the prior is freed before a newer is kept), so at most one extra
             # slot is occupied transiently — and it is always released, never leaked.
             pending: tuple | None = None
+            # See the non-streaming loop: once a model overflows the prompt, only
+            # a strictly larger-window candidate can serve it.
+            overflow_floor = 0
             for candidate in candidates:
+                if overflow_floor and candidate.context_window and candidate.context_window <= overflow_floor:
+                    continue
                 # Skip a backend with no free slot WITHOUT waiting on it — same
                 # pre-flight spill as the non-streaming path.
                 if not self.discovery.has_free_slot(candidate.backend_key):
@@ -368,8 +407,34 @@ class RequestRouter:
                         await pending[3]()
                     pending = (upstream, body_iter, route_result, cleanup)
                     continue
-                # Success — or a non-retryable status (e.g. 400) we must not burn
-                # the chain on. Commit to it; free any pending retry-status stream.
+                # Context overflow: no SSE bytes have flowed on an error status, so
+                # the (small) body can be read to confirm it, and this candidate
+                # abandoned for a larger-window one — same escalation as the
+                # non-streaming path. Reading DRAINS the streamed body, so a
+                # non-overflow 400 that we still commit to must REPLAY the buffered
+                # bytes (body_iter would now yield nothing).
+                if upstream.status_code in (400, 413):
+                    buffered = b""
+                    with contextlib.suppress(Exception):
+                        buffered = await upstream.aread()
+                    if _looks_like_context_overflow(
+                        upstream.status_code, buffered.decode("utf-8", "replace")
+                    ):
+                        overflow_floor = max(overflow_floor, candidate.context_window or 0)
+                        await cleanup()
+                        continue
+
+                    async def _replay(_data: bytes = buffered, _cleanup=cleanup) -> AsyncIterator[bytes]:
+                        try:
+                            yield _data
+                        finally:
+                            await _cleanup()
+
+                    if pending is not None:
+                        await pending[3]()
+                    return upstream, _replay(), route_result, cleanup
+                # Success — or a non-retryable status we must not burn the chain on.
+                # Commit to it; free any pending retry-status stream.
                 if pending is not None:
                     await pending[3]()
                 return upstream, body_iter, route_result, cleanup
@@ -379,6 +444,9 @@ class RequestRouter:
                 # client still sees the upstream 5xx (as the single-candidate path
                 # did). Earlier candidates were already cleaned up above.
                 return pending
+            # Every large-enough candidate overflowed → structured context_overflow.
+            if overflow_floor:
+                raise _context_overflow_error(ctx, overflow_floor)
             if saturation_error is not None:
                 raise saturation_error
             if last_error is not None:
@@ -403,8 +471,17 @@ class RequestRouter:
         # candidate-by-candidate and only surfaced if the WHOLE chain is full —
         # at which point backpressure (503 + Retry-After) is the correct answer.
         saturation_error: SaturationError | None = None
+        # Largest context window that hard-rejected the prompt as too big. Once a
+        # model overflows, no candidate with an equal-or-smaller window can serve
+        # it, so we escalate PAST them to any larger-window candidate; if none is
+        # left the chain surfaces a structured context_overflow (below).
+        overflow_floor = 0
 
         for candidate in candidates:
+            # A model no larger than one that already overflowed will overflow too:
+            # skip it so escalation only ever moves UP in window size.
+            if overflow_floor and candidate.context_window and candidate.context_window <= overflow_floor:
+                continue
             route_result = _candidate_to_route_result(candidate, ctx)
             # Spill past a backend with no free slot WITHOUT waiting on it: a single
             # saturated backend is not a reason to fail when another can serve the
@@ -429,6 +506,12 @@ class RequestRouter:
                     last_response = resp
                     last_response_candidate = candidate
                     continue
+                # Prompt overflowed this model's window (estimate under-shot the
+                # boundary): escalate to a larger-window candidate rather than
+                # returning the raw upstream 400.
+                if _looks_like_context_overflow(resp.status_code, resp.text):
+                    overflow_floor = max(overflow_floor, candidate.context_window or 0)
+                    continue
                 return resp, route_result
             except SaturationError as exc:
                 # Raced: passed the free-slot check but filled before acquire.
@@ -448,6 +531,10 @@ class RequestRouter:
             return last_response, final_result
         if last_error is not None:
             raise last_error
+        # Every candidate large enough was tried and the prompt overflowed them
+        # all → structured context_overflow the client can compact-and-retry.
+        if overflow_floor:
+            raise _context_overflow_error(ctx, overflow_floor)
         # Every viable candidate was saturated → backpressure.
         if saturation_error is not None:
             raise saturation_error
@@ -555,14 +642,60 @@ def _candidate_to_route_result(candidate: ChainCandidate, ctx: RoutingContext) -
     )
 
 
+def _looks_like_context_overflow(status_code: int, body_text: str | None) -> bool:
+    """True when an upstream 400/413 is a 'prompt exceeds context window' reject
+    (as opposed to an ordinary malformed-request 400).
+
+    Drives the escalate-to-a-larger-window backstop in ``route_and_forward``: when
+    the prompt estimate under-shot and the chosen model hard-rejects at its
+    boundary, the relay retries a bigger-window candidate instead of surfacing the
+    raw upstream 400. Matched on the response body against
+    ``_CONTEXT_OVERFLOW_MARKERS`` so it never mistakes a genuine bad request for an
+    overflow (which would burn the chain pointlessly)."""
+    if status_code not in (400, 413):
+        return False
+    b = (body_text or "").lower()
+    return any(m in b for m in _CONTEXT_OVERFLOW_MARKERS)
+
+
+def _context_overflow_error(ctx: RoutingContext, largest_window_tried: int) -> HTTPException:
+    """Structured, client-reconcilable error for a prompt that overflowed every
+    routable model. Carries an ``X-Llm-Relay-Error`` header and a ``context`` block
+    (mirroring ``diagnose_context_shortfall``) so a harness can compact/resize and
+    retry deterministically instead of parsing a backend's freeform 400 text."""
+    return HTTPException(
+        status_code=413,
+        detail={
+            "error": "context_overflow",
+            "message": (
+                "Prompt exceeds the context window of every model this request "
+                "could route to. Reduce the prompt (compact/summarize) and retry."
+            ),
+            "context": {
+                "estimated_tokens": ctx.min_context,
+                "largest_window_tried": largest_window_tried,
+                "classification": "oversize_period",
+            },
+            "decision": {
+                "requested": ctx.requested_model,
+                "candidates": ctx.candidates,
+            },
+        },
+        headers={"X-Llm-Relay-Error": "context_overflow"},
+    )
+
+
 def _estimate_prompt_tokens(request_data: dict) -> int | None:
     """Conservatively estimate the PROMPT's token count for a chat request.
 
     The relay is provider-agnostic and has no tokenizer, so this approximates
     from character counts and deliberately OVER-estimates: under-counting would
-    route a request to a backend too small to hold the prompt (a mid-stream
-    failure), whereas over-counting only forgoes spilling to a smaller, faster
-    backend. ~3 chars/token over-counts vs. the typical ~3.5-4 for English text.
+    route a request to a backend too small to hold the prompt (a boundary
+    hard-reject), whereas over-counting only forgoes spilling to a smaller, faster
+    backend. The estimate is padded to a true upper bound — base char ratio times a
+    safety margin (see the PROMPT_* constants above) — because a bare ~3 chars/token
+    ratio under-counts for code / JSON / CJK / tool payloads and missed a boundary
+    by ~5% in the 2026-07-07 subagent incident.
 
     Counts message content plus tool/function schemas. ``max_tokens`` is
     deliberately EXCLUDED: it is an output ceiling, not context the model must
@@ -570,7 +703,7 @@ def _estimate_prompt_tokens(request_data: dict) -> int | None:
     a generous max_tokens to the single largest-context backend). The output is
     fitted separately, per-candidate, by ``_clamp_max_tokens``.
 
-    Returns the estimated prompt tokens (chars / 3), or None when the request is
+    Returns the upper-bound estimated prompt tokens, or None when the request is
     trivially small or unparseable — in which case no implicit floor is imposed
     and normal routing applies.
     """
@@ -599,7 +732,13 @@ def _estimate_prompt_tokens(request_data: dict) -> int | None:
                 chars += len(json.dumps(spec))
             except (TypeError, ValueError):
                 pass
-        return (chars // 3) or None
+        if not chars:
+            return None
+        # Upper-bound estimate: base char ratio times a multiplicative safety pad
+        # (see the constants above). Bias high so the fit-gate never admits a model
+        # the prompt would overflow. A trivially small prompt rounds to 0 -> None,
+        # imposing no implicit routing floor.
+        return int(chars / PROMPT_CHARS_PER_TOKEN * PROMPT_ESTIMATE_SAFETY_MARGIN) or None
     except Exception:
         return None
 

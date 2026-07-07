@@ -19,7 +19,6 @@ from ..config.types import ModelConfig, ModelStatus, NoBackendAvailableError, Pr
 from ..discovery.manager import DiscoveryManager
 from ..routing.keys import compose_backend_key, compose_model_id, resolve_model_id
 from ..routing.router import RequestRouter
-from ..routing.selector import ModelSelector, RoutingContext
 from .instrumentation import (
     _classify_stream_outcome,
     emit_chat_completion,
@@ -71,23 +70,23 @@ def _resolve_config_dir(config_dir: str | Path | None) -> Path:
     return Path(__file__).resolve().parents[2] / "config"
 
 
-def _alias_servable_ceiling(cfg: ConfigLoader, disc: DiscoveryManager, alias: str) -> int | None:
-    """Largest context window the alias can SERVE right now: the max live window
-    among the candidates ``select_chain`` currently yields (named members + open
-    fallthrough, already filtered to available + locally-admissible). ``None`` when
-    nothing servable is live.
+def _alias_current_member(cfg: ConfigLoader, disc: DiscoveryManager, alias: str) -> str | None:
+    """The member an alias routes a normally-sized request to RIGHT NOW: the first
+    declared member that discovery reports available/degraded, else the first
+    declared configured member (so the answer survives a full-fleet outage).
 
-    This drives the honest context advertisement — a client can size a request up
-    to this number and the context-fit gate guarantees it routes to a model that
-    holds it, instead of being told a down primary's nominal window it can't get.
+    This is the model whose context window the alias should advertise — see
+    ``_resolve_context_window``. It matches ``select_best`` for a request with no
+    context floor, and the ``current`` field in ``_build_available_payload``.
     """
-    sel = ModelSelector(cfg, disc)
-    windows = [
-        disc.get_live_context_window(c.model) or (cfg.models.models[c.model].context_window or 0)
-        for c in sel.select_chain(RoutingContext(requested_model=alias))
-    ]
-    windows = [w for w in windows if w]
-    return max(windows) if windows else None
+    members = cfg.models.aliases.get(alias) or []
+    for m in members:
+        if m in cfg.models.models and disc.get_model_state(m).value in ("available", "degraded"):
+            return m
+    for m in members:
+        if m in cfg.models.models:
+            return m
+    return None
 
 
 def _resolve_context_window(cfg: ConfigLoader, disc: DiscoveryManager, name: str) -> int | None:
@@ -96,13 +95,16 @@ def _resolve_context_window(cfg: ConfigLoader, disc: DiscoveryManager, name: str
     Concrete model: the backend's live ``max_model_len`` (authoritative) when it
     reports one, else the static models.yaml value.
 
-    Alias: the largest context it can SERVE right now — the max live window among
-    the models it currently routes to (named members + open fallthrough), via
-    ``_alias_servable_ceiling``. This is the honest "size a request up to here"
-    number; advertising a down primary's nominal window while a smaller model
-    actually serves is the "sized it right, still 503'd" lie. Falls back to the
-    primary (first-declared) member's window when nothing servable is live, so the
-    advertised capability survives a full-fleet outage.
+    Alias: the window of the member it routes a normally-sized request to RIGHT
+    NOW (``_alias_current_member`` — first available member, else first declared),
+    NOT the fleet-max ceiling across its open-fallthrough tail. This is the number
+    a client's autocompaction must key off: a `subagent` alias fronting the 64K 9B
+    must advertise 65536 so the harness compacts to stay on the fast model, not the
+    262K a big fallthrough model *could* serve — advertising that ceiling let a
+    66K prompt sail past pi's autocompact straight into the 9B's wall (2026-07-07).
+    A too-big prompt still escalates up the chain at request time (the selector's
+    context-fit gate + router's overflow backstop); advertisement tracks the
+    everyday routing target, escalation handles the exception.
 
     Returns None when `name` is neither a known model nor a resolvable alias.
     """
@@ -110,14 +112,10 @@ def _resolve_context_window(cfg: ConfigLoader, disc: DiscoveryManager, name: str
     if name in models:
         live = disc.get_live_context_window(name)
         return live if live is not None else models[name].context_window
-    members = cfg.models.aliases.get(name)
-    if members:
-        ceiling = _alias_servable_ceiling(cfg, disc, name)
-        if ceiling is not None:
-            return ceiling
-        for member in members:
-            if member in models:
-                return _resolve_context_window(cfg, disc, member)
+    if name in cfg.models.aliases:
+        current = _alias_current_member(cfg, disc, name)
+        if current is not None:
+            return _resolve_context_window(cfg, disc, current)
     return None
 
 
@@ -266,27 +264,16 @@ def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[
     alias_info: dict[str, Any] = {}
     for alias, members in cfg.models.aliases.items():
         members_list = list(members)
-        current: str | None = None
-        for member in members_list:
-            if member not in cfg.models.models:
-                continue
-            if disc.get_model_state(member).value in ("available", "degraded"):
-                current = member
-                break
-        if current is None:
-            for member in members_list:
-                if member in cfg.models.models:
-                    current = member
-                    break
-        # `context_window` is the live-servable CEILING (max live window among the
-        # alias's currently-routable candidates, via _resolve_context_window ->
-        # _alias_servable_ceiling) — the number a client can safely size a request
-        # up to. It tracks the live fleet rather than a down primary's nominal
-        # window, so a client never sizes to context the alias cannot actually hold
-        # (the "sized it right, still 503'd" lie). Size the PROMPT as chars/3 <=
-        # context_window; max_tokens is an output ceiling, clamped to the chosen
-        # model's headroom at forward time (see _clamp_max_tokens), not counted
-        # toward eligibility (see _estimate_prompt_tokens).
+        current = _alias_current_member(cfg, disc, alias)
+        # `context_window` is the window of `current` — the member this alias routes
+        # a normally-sized request to right now (see _resolve_context_window). A
+        # client keys its autocompaction off this number, so it must be the everyday
+        # target's window, NOT the fleet-max a big fallthrough model could serve
+        # (advertising that let a 66K prompt overrun the 64K 9B on 2026-07-07). A
+        # prompt too big for `current` still escalates up the chain at request time
+        # (selector context-fit gate + router overflow backstop). Size the PROMPT
+        # under context_window; max_tokens is an output ceiling clamped per-candidate
+        # at forward time (see _clamp_max_tokens), not counted toward eligibility.
         alias_info[alias] = {
             "members": members_list,
             "current": current,

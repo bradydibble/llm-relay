@@ -81,16 +81,15 @@ def test_alias_info_current_tracks_first_available_member():
     assert info["current"] == "qwen3.5-9b"
 
 
-def test_alias_info_context_window_is_the_live_servable_ceiling():
-    """context_window advertises what the alias can ACTUALLY serve right now — the
-    largest live window among its available candidates — not the down primary's
-    nominal window.
+def test_alias_info_context_window_tracks_current_servable_member():
+    """context_window advertises the window of the member the alias routes a
+    normally-sized request to right now (the current/first-available member) — not
+    the down primary's nominal window.
 
-    Supersedes the old "advertise the primary member, stable" behavior: advertising
-    262144 while a 9b (32768) is what actually serves is the "sized it right, still
-    503'd" lie. Open-by-default makes fallback-serving the norm (not a brief blip),
-    so the advertised ceiling must track the live fleet — the number a client can
-    safely size a request up to."""
+    Advertising the down primary's 262144 while a 9b (32768) is what actually serves
+    is the "sized it right, still 503'd" lie; advertising a fleet-max ceiling is the
+    opposite lie that overran the 9b on 2026-07-07. The advertised number is the
+    everyday routing target's window: the client keys its autocompaction off it."""
     cfg = _load_cfg()
     disc = DiscoveryManager()
     _seed(disc, "qwen3.5-35b", EndpointStatus.unavailable)
@@ -99,21 +98,25 @@ def test_alias_info_context_window_is_the_live_servable_ceiling():
     info = _build_available_payload(cfg, disc)["alias_info"]["main"]
     assert info["current"] == "qwen3.5-9b", "current reflects the live-serving fallback"
     assert info["context_window"] == cfg.models.models["qwen3.5-9b"].context_window, \
-        "context_window must report the live-servable ceiling (9b 32768), not the down primary (35b)"
+        "context_window must report the current servable member (9b 32768), not the down primary (35b)"
 
 
-def test_alias_info_context_window_reflects_open_fallthrough_tail():
-    """When ALL named members are down but a non-member is live (open fallthrough),
-    the advertised ceiling tracks the tail model that would actually serve — proving
-    the ceiling is computed over the live fleet, not just the named members. main's
-    members are all down; trinity-mini (16384, not a member) is the only live model."""
+def test_alias_info_context_window_does_not_chase_fallthrough_tail():
+    """The advertised window is the everyday routing TARGET's (the current member),
+    NOT the largest window an open-fallthrough tail model could serve. Advertising
+    the tail ceiling let a prompt sized to it overrun the smaller model a normal
+    request actually lands on (2026-07-07). With all named members of `main` down
+    and only a non-member (trinity-mini) live, the advertised window is the
+    first-declared member's (stable outage fallback), never trinity's — a too-big
+    prompt escalates to the tail at request time, it is not advertised up front."""
     cfg = _load_cfg()
     disc = DiscoveryManager()
     _seed(disc, "trinity-mini", EndpointStatus.healthy)  # not a member of `main`
 
     info = _build_available_payload(cfg, disc)["alias_info"]["main"]
-    assert info["context_window"] == cfg.models.models["trinity-mini"].context_window, \
-        "ceiling must reflect the live fallthrough model (trinity 16384) the request would route to"
+    assert info["context_window"] == cfg.models.models["qwen3.5-35b"].context_window, \
+        "advertised window tracks the current/first-declared member, not the fallthrough tail"
+    assert info["context_window"] != cfg.models.models["trinity-mini"].context_window
 
 
 def test_alias_info_falls_back_to_first_declared_when_none_available():
@@ -153,16 +156,16 @@ def test_resolve_context_window_concrete_model_prefers_live_over_config():
     assert _resolve_context_window(cfg, disc, "qwen3.5-9b") == 12345
 
 
-def test_resolve_context_window_alias_reports_live_servable_ceiling():
-    """An alias resolves to the largest context it can SERVE right now (the max
-    live window among its available candidates), not its first-declared member's
-    nominal window. With nothing live it falls back to the primary's window so the
-    advertised capability survives a full-fleet outage."""
+def test_resolve_context_window_alias_reports_current_member_window():
+    """An alias resolves to the window of the member it routes a normally-sized
+    request to right now (current = first available member, else first declared) —
+    not a fleet-max ceiling. With nothing live it falls back to the first-declared
+    member's window so the advertised capability survives a full-fleet outage."""
     cfg = _load_cfg()
     disc = DiscoveryManager()
-    # Nothing live → fall back to the primary (first-declared) member's window.
+    # Nothing live → fall back to the first-declared member's window.
     assert _resolve_context_window(cfg, disc, "main") == cfg.models.models["qwen3.5-35b"].context_window
-    # Primary down, smaller fallback up → reports the fallback's (servable) window.
+    # Primary down, smaller fallback up → reports the current (servable) member's window.
     _seed(disc, "qwen3.5-35b", EndpointStatus.unavailable)
     _seed(disc, "qwen3.5-9b", EndpointStatus.healthy)
     assert _resolve_context_window(cfg, disc, "main") == cfg.models.models["qwen3.5-9b"].context_window
