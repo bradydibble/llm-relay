@@ -58,6 +58,48 @@ _CONTEXT_OVERFLOW_MARKERS = (
     "reduce the length",
 )
 
+
+class ContextLengthExceededError(Exception):
+    """Raised when a request's prompt exceeds the context window of every model
+    that can serve it right now (see ``Selector.diagnose_context_shortfall``).
+
+    The API layer renders ``.body`` as a TOP-LEVEL HTTP 400 ``{"error": {...}}``
+    with ``code == "context_length_exceeded"`` — the exact shape OpenAI/Anthropic
+    return — so OpenAI-compatible clients (pi, the OpenAI SDK, …) AUTO-COMPACT and
+    retry a smaller prompt, instead of reading a 5xx as transient and retrying the
+    same oversized prompt until retries are exhausted and the session dies. A bare
+    ``HTTPException`` would nest the payload under ``"detail"``, which clients do
+    not recognize as a context error."""
+
+    def __init__(self, body: dict):
+        super().__init__(body.get("error", {}).get("message", "context_length_exceeded"))
+        self.body = body
+
+
+def _context_length_exceeded_error(shortfall: dict) -> ContextLengthExceededError:
+    """Build the OpenAI-standard context_length_exceeded error from a context
+    shortfall diagnosis. Reports the currently-servable ceiling so the client
+    compacts to a size that will actually route."""
+    limit = shortfall.get("max_available_now") or shortfall.get("max_in_catalog") or 0
+    est = shortfall.get("estimated_tokens") or 0
+    message = (
+        f"This model's maximum context length is {limit} tokens. However, your "
+        f"messages resulted in approximately {est} tokens. Please reduce the "
+        f"length of the messages."
+    )
+    return ContextLengthExceededError(
+        {
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "code": "context_length_exceeded",
+                "param": "messages",
+                # Non-standard diagnostics; OpenAI clients ignore unknown keys.
+                "llm_relay_context": shortfall,
+            }
+        }
+    )
+
 # Retry-After hint (seconds) for a TRANSIENT no-candidate: the constraints are
 # satisfiable but every matching backend is momentarily down/paused. Sized to the
 # ~15s discovery poll cadence, so a recovered/unpaused backend is re-detected
@@ -143,7 +185,7 @@ class RequestRouter:
         # caller's longer client timeout (the wiki engine sets 900s) and killed any
         # non-stream completion past five minutes — an arbitrary cutoff on hardware
         # that is idle most of the day. The read window matches the engine's 900s.
-        timeout = httpx.Timeout(connect=10.0, read=900.0, write=10.0, pool=10.0)
+        timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
         # backend_key="" / None → acquire_slot is a no-op (no semaphore registered).
         async with self.discovery.acquire_slot(backend_key or "", wait_timeout=slot_wait_timeout):
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -193,7 +235,7 @@ class RequestRouter:
             merged_headers["Authorization"] = f"Bearer {bearer}"
         # 600s per-chunk read timeout — SSE may legitimately stall between tokens
         # on slow models within that window, but a truly dead upstream gets canceled.
-        timeout = httpx.Timeout(connect=10.0, read=600.0, write=10.0, pool=10.0)
+        timeout = httpx.Timeout(connect=10.0, read=3600.0, write=10.0, pool=10.0)
 
         # Acquire the slot BEFORE building the client so a SaturationError never
         # leaks an open connection. The handle's release is synchronous and runs
@@ -332,7 +374,10 @@ class RequestRouter:
             shortfall = self.selector.diagnose_context_shortfall(ctx)
             if shortfall is not None:
                 detail["context"] = shortfall
-                raise HTTPException(status_code=503, detail=detail)
+                # Context is the binding constraint: signal it as an OpenAI-standard
+                # 400 context_length_exceeded (rendered top-level by the API layer)
+                # so clients auto-compact instead of retrying a 5xx to death.
+                raise _context_length_exceeded_error(shortfall)
             # Not a context shortfall: if the constraints WOULD be met by a
             # configured model that's merely down/paused right now (a discovery
             # blip or a maintenance pause), the empty chain is a TRANSIENT

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from contextlib import asynccontextmanager
@@ -18,7 +19,7 @@ from ..config.loader import ConfigLoader
 from ..config.types import ModelConfig, ModelStatus, NoBackendAvailableError, Privacy, SaturationError
 from ..discovery.manager import DiscoveryManager
 from ..routing.keys import compose_backend_key, compose_model_id, resolve_model_id
-from ..routing.router import RequestRouter
+from ..routing.router import ContextLengthExceededError, RequestRouter
 from .instrumentation import (
     _classify_stream_outcome,
     emit_chat_completion,
@@ -830,9 +831,121 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                     request_data=body, headers=hint_headers, stream=True,
                 )
             else:
-                upstream, result = await request.app.state.router.route_and_forward(
-                    request_data=body, headers=hint_headers, stream=False,
+                _fwd_task = asyncio.ensure_future(
+                    request.app.state.router.route_and_forward(
+                        request_data=body, headers=hint_headers, stream=False,
+                    )
                 )
+                try:
+                    upstream, result = await asyncio.wait_for(
+                        asyncio.shield(_fwd_task), timeout=60.0
+                    )
+                except asyncio.TimeoutError:
+                    # Backend needs >60s (ornith-397b etc). Drip whitespace
+                    # keepalives so Cloudflare's 100s edge timeout stays open.
+                    async def _keepalive_drip():
+                        try:
+                            while not _fwd_task.done():
+                                yield b" "
+                                done, _ = await asyncio.wait(
+                                    {_fwd_task}, timeout=30
+                                )
+                                if done:
+                                    break
+                            _up, _res = _fwd_task.result()
+                        except Exception as _exc:
+                            _err = {
+                                "error": {
+                                    "message": f"Backend error: {_exc}",
+                                    "type": "relay_error",
+                                }
+                            }
+                            emit_chat_completion(
+                                request_body=body,
+                                response_body=None,
+                                response_text=None,
+                                usage=None,
+                                model_resolved=None,
+                                provider_name=None,
+                                user_agent=user_agent,
+                                start_ns=start_ns,
+                                end_ns=time.time_ns(),
+                                status_code=502,
+                                streamed=False,
+                                error=str(_exc),
+                                outcome="backend_error",
+                                client=client,
+                                principal=principal_id,
+                            )
+                            yield json.dumps(_err).encode()
+                            return
+                        try:
+                            _content = _up.json()
+                            if isinstance(_content, dict):
+                                _content["llm-relay"] = {
+                                    "selected_model": _res.selected_model,
+                                    "selected_provider": _res.provider_name,
+                                    "decision": _res.decision,
+                                }
+                        except Exception:
+                            _content = {"raw": _up.text}
+                        emit_chat_completion(
+                            request_body=body,
+                            response_body=(
+                                _content
+                                if isinstance(_content, dict)
+                                else None
+                            ),
+                            response_text=(
+                                None
+                                if isinstance(_content, dict)
+                                else _up.text
+                            ),
+                            usage=None,
+                            model_resolved=_res.selected_model,
+                            provider_name=_res.provider_name,
+                            user_agent=user_agent,
+                            start_ns=start_ns,
+                            end_ns=time.time_ns(),
+                            status_code=_up.status_code,
+                            streamed=False,
+                            outcome=(
+                                "success"
+                                if _up.status_code < 400
+                                else "upstream_error"
+                            ),
+                            client=client,
+                            principal=principal_id,
+                            fell_back=did_fall_back(
+                                _res.selected_model,
+                                (_res.decision or {}).get("ranked") or [],
+                            ),
+                        )
+                        if isinstance(_content, dict):
+                            yield json.dumps(_content).encode()
+                        else:
+                            yield _up.text.encode()
+
+                    return StreamingResponse(
+                        _keepalive_drip(),
+                        status_code=200,
+                        media_type="application/json",
+                    )
+        except ContextLengthExceededError as e:
+            # Prompt exceeds every servable model's window. Return the OpenAI-standard
+            # top-level 400 context_length_exceeded so clients auto-compact and retry
+            # smaller, instead of treating a 5xx as transient and retry-dying.
+            emit_chat_completion(
+                request_body=body, response_body=None, response_text=None, usage=None,
+                model_resolved=None, provider_name=None,
+                user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
+                status_code=400, streamed=is_stream, error=str(e),
+                outcome="context_length_exceeded", client=client, principal=principal_id,
+            )
+            return JSONResponse(
+                status_code=400, content=e.body,
+                headers={"X-Llm-Relay-Error": "context_length_exceeded"},
+            )
         except SaturationError as e:
             emit_chat_completion(
                 request_body=body, response_body=None, response_text=None, usage=None,

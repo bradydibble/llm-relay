@@ -68,7 +68,7 @@ def _sanitize_client(raw: str) -> str:
 
 # End-to-end latency buckets (seconds): sub-second routing overhead through
 # multi-minute large-model generations on the local fleet.
-_DURATION_BUCKETS = (0.1, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, float("inf"))
+_DURATION_BUCKETS = (0.1, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600, 1800, 3600, float("inf"))
 
 # Time-to-first-token buckets (seconds): snappy small models through slow
 # prompt-processing on large-context requests, which dominates streaming TTFT.

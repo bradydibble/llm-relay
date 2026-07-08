@@ -381,7 +381,16 @@ class ModelSelector:
         """
         if not ctx.min_context:
             return None
-        admissible = self._apply_constraints(ctx, list(self.config.models.models), ignore_context=True)
+        # Diagnose against THIS request's actual candidate universe (respecting a
+        # pin/alias), not the whole fleet. A request pinned to a small model cannot
+        # escalate to a bigger one, so "it would fit some other fleet model" is
+        # irrelevant — it still overflows everything it can route to. Using the whole
+        # fleet here made pinned-small-model overflows fall through to a generic 503
+        # (retryable → client retries the same prompt to death) instead of a
+        # context_length_exceeded the client can compact on. Aliases keep whole-fleet
+        # behaviour because their universe already IS the fleet (members + tail).
+        universe, _ = self._build_candidates(ctx)
+        admissible = self._apply_constraints(ctx, universe, ignore_context=True)
         max_live = max(
             (self._window_of(m) for m in admissible if _is_available(self.discovery.get_model_state(m))),
             default=0,
