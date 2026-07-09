@@ -72,7 +72,7 @@ _DURATION_BUCKETS = (0.1, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600, 1800, 360
 
 # Time-to-first-token buckets (seconds): snappy small models through slow
 # prompt-processing on large-context requests, which dominates streaming TTFT.
-_TTFT_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, float("inf"))
+_TTFT_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600, float("inf"))
 
 # Dedicated registry for relay metrics — kept off the global default REGISTRY so
 # repeated create_app() calls (tests, reloads) never collide, and the relay's
