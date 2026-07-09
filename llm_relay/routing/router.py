@@ -82,10 +82,16 @@ def _context_length_exceeded_error(shortfall: dict) -> ContextLengthExceededErro
     compacts to a size that will actually route."""
     limit = shortfall.get("max_available_now") or shortfall.get("max_in_catalog") or 0
     est = shortfall.get("estimated_tokens") or 0
+    # The message TEXT (not error.code) is what OpenAI-compatible agents pattern-match
+    # to trigger auto-compaction: pi keys on /context[_ ]length[_ ]exceeded/i and on the
+    # OpenAI phrase "exceeds the model's maximum context length of N". Lead with the
+    # literal code AND include the OpenAI phrasing so pi / goose / opencode all recognize
+    # it and compact-and-retry instead of hanging on an unrecognized error. See
+    # https://github.com/earendil-works/pi-mono/blob/main/packages/ai/src/utils/overflow.ts
     message = (
-        f"This model's maximum context length is {limit} tokens. However, your "
-        f"messages resulted in approximately {est} tokens. Please reduce the "
-        f"length of the messages."
+        f"context_length_exceeded: this request is approximately {est} tokens, which "
+        f"exceeds the model's maximum context length of {limit} tokens. Reduce the "
+        f"length of the messages (input) and retry."
     )
     return ContextLengthExceededError(
         {
