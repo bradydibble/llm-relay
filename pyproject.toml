@@ -27,6 +27,7 @@ dependencies = [
     "uvicorn>=0.34",
     "rich>=13.0",
     "prometheus-client>=0.20",
+    "tiktoken>=0.7",
 ]
 
 [project.optional-dependencies]

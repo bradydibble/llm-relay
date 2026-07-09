@@ -42,6 +42,36 @@ MIN_OUTPUT_HEADROOM = 1024
 PROMPT_CHARS_PER_TOKEN = 3
 PROMPT_ESTIMATE_SAFETY_MARGIN = 1.2
 
+# Accurate token counting via tiktoken (cl100k_base) when available — a real BPE
+# count is within a few percent of the model's own tokenizer AND of what pi/openai
+# clients compute, whereas the char heuristic above over-counts English by ~60%.
+# That over-count is what pushed pi PAST its own proactive-compaction guard into a
+# server 400 it hangs on (cloud never trips this because pi's count matches the
+# real window). An accurate count keeps the relay's fit-gate aligned with the
+# client's, so a correctly-trimmed request is accepted instead of falsely rejected.
+# tiktoken != the qwen/llama tokenizer exactly, but it is far closer than chars/3.
+# The char heuristic remains the fallback if tiktoken is unavailable or errors.
+_TIKTOKEN_ENC = None
+_TIKTOKEN_TRIED = False
+
+
+def _token_count(text: str) -> int | None:
+    """Accurate prompt token count via tiktoken; None if unavailable/errors."""
+    global _TIKTOKEN_ENC, _TIKTOKEN_TRIED
+    if not text:
+        return 0
+    try:
+        if _TIKTOKEN_ENC is None and not _TIKTOKEN_TRIED:
+            _TIKTOKEN_TRIED = True
+            import tiktoken
+            _TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
+        if _TIKTOKEN_ENC is None:
+            return None
+        return len(_TIKTOKEN_ENC.encode(text, disallowed_special=()))
+    except Exception:
+        _TIKTOKEN_ENC = None
+        return None
+
 # Substrings (lowercased) that mark an upstream "prompt exceeds context window"
 # rejection across the fleet's backends (llama.cpp `exceed_context_size_error`,
 # vLLM "maximum context length", generic proxies). Matched against the response
@@ -759,36 +789,41 @@ def _estimate_prompt_tokens(request_data: dict) -> int | None:
     and normal routing applies.
     """
     try:
+        parts: list[str] = []
         messages = request_data.get("messages") or []
-        chars = 0
         for m in messages:
             content = m.get("content") if isinstance(m, dict) else None
             if isinstance(content, str):
-                chars += len(content)
+                parts.append(content)
             elif isinstance(content, list):
-                # Multimodal content parts: count the text parts' lengths.
+                # Multimodal content parts: count the text parts.
                 for part in content:
                     if isinstance(part, dict) and isinstance(part.get("text"), str):
-                        chars += len(part["text"])
+                        parts.append(part["text"])
         # Tool/function schemas are top-level and frequently large (full JSON
         # parameter schemas); tool-using agents are a primary workload, so the
-        # definitions must count toward the prompt. Omitting them under-counts —
-        # the unsafe direction. Serialize per-spec so a single unserializable
-        # entry can't void the message-based estimate.
+        # definitions must count toward the prompt. Serialize per-spec so a single
+        # unserializable entry can't void the estimate.
         for key in ("tools", "functions"):
             spec = request_data.get(key)
             if not spec:
                 continue
             try:
-                chars += len(json.dumps(spec))
+                parts.append(json.dumps(spec))
             except (TypeError, ValueError):
                 pass
+        chars = sum(len(p) for p in parts)
         if not chars:
             return None
-        # Upper-bound estimate: base char ratio times a multiplicative safety pad
-        # (see the constants above). Bias high so the fit-gate never admits a model
-        # the prompt would overflow. A trivially small prompt rounds to 0 -> None,
-        # imposing no implicit routing floor.
+        # Prefer an accurate BPE count (tiktoken) with NO safety pad — it tracks the
+        # real token count within a few percent, so it neither over-rejects a
+        # client's correctly-trimmed prompt (the pi-hang trigger) nor under-counts
+        # into a boundary hard-reject (the 2026-07-07 incident, which the accurate
+        # count also catches). Fall back to the padded char heuristic only when
+        # tiktoken is unavailable/errors. A trivially small prompt -> None.
+        exact = _token_count("\n".join(parts))
+        if exact is not None:
+            return exact or None
         return int(chars / PROMPT_CHARS_PER_TOKEN * PROMPT_ESTIMATE_SAFETY_MARGIN) or None
     except Exception:
         return None
