@@ -5,7 +5,7 @@ import asyncio
 import json
 import os
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +31,52 @@ from ..logbuffer import install_log_buffer
 from ..scheduler import AdmissionController
 from ..jobs import JobStore
 from ..jobworker import run_worker
+
+
+_KEEPALIVE_INTERVAL_S = 15.0
+
+
+async def _sse_stream_keepalive(body_iter, media_type, interval):
+    """Yield ``(payload, is_keepalive)`` from an upstream byte iterator, emitting
+    an SSE comment frame (``: ka``) whenever no upstream chunk arrives within
+    ``interval`` seconds.
+
+    Large-context ornith-397b requests spend tens of seconds in prefill before
+    the first token (observed: 120k ctx -> ~90s TTFT), during which the streaming
+    path is otherwise silent. That silent gap trips Cloudflare's ~100s edge-idle
+    timeout and client read timeouts, killing the connection before any token
+    flows. SSE comment lines are ignored by all SSE/OpenAI clients, so they keep
+    the connection warm without corrupting the stream or the token content.
+
+    Only applied to ``text/event-stream`` responses; any other media type passes
+    through untouched. Keepalive payloads are relay-injected and are NOT part of
+    the upstream body, so callers must not fold them into reassembly/usage.
+    """
+    if not (media_type or "").startswith("text/event-stream"):
+        async for chunk in body_iter:
+            yield chunk, False
+        return
+    ait = body_iter.__aiter__()
+    pending = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(ait.__anext__())
+            done, _ = await asyncio.wait({pending}, timeout=interval)
+            if pending in done:
+                nxt, pending = pending, None
+                try:
+                    chunk = nxt.result()
+                except StopAsyncIteration:
+                    return
+                yield chunk, False
+            else:
+                yield b": ka\n\n", True
+    finally:
+        if pending is not None:
+            pending.cancel()
+            with suppress(BaseException):
+                await pending
 
 
 def _resolve_base_url() -> str:
@@ -1028,7 +1074,12 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 exc: BaseException | None = None
                 first_chunk_ns: int | None = None
                 try:
-                    async for chunk in body_iter:
+                    async for chunk, _is_ka in _sse_stream_keepalive(
+                        body_iter, media_type, _KEEPALIVE_INTERVAL_S
+                    ):
+                        if _is_ka:
+                            yield chunk
+                            continue
                         if first_chunk_ns is None:
                             first_chunk_ns = time.time_ns()
                         chunks.append(chunk)
