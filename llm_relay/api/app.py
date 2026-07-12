@@ -79,6 +79,29 @@ async def _sse_stream_keepalive(body_iter, media_type, interval):
                 await pending
 
 
+def _backpressure_response(status_code, err_type, message, retry_after_seconds, extra=None):
+    """Well-formed backpressure response. The error goes at the TOP LEVEL
+    (``{"error": {...}}``), never nested under FastAPI's ``detail`` — clients
+    (pi, Paseo, OpenAI SDKs) parse the top-level shape and otherwise see the
+    rejection as "no body". A real ``Retry-After`` header is always set.
+
+    Status: **429** for slot saturation (too many concurrent requests on a
+    reachable backend — the caller should back off and retry the SAME model),
+    **503** only for a transient backend-down/paused gap. A 503 for saturation
+    was the bug: it reads as a server fault, not backpressure.
+    """
+    err = {"message": message, "type": err_type, "code": err_type,
+           "retry_after_seconds": retry_after_seconds}
+    if extra:
+        err.update(extra)
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": err},
+        headers={"Retry-After": str(max(1, int(retry_after_seconds))),
+                 "X-Llm-Relay-Error": err_type},
+    )
+
+
 def _resolve_base_url() -> str:
     """Externally-reachable root URL advertised in the MCP config."""
     return os.environ.get("LLM_RELAY_BASE_URL", "http://127.0.0.1:8090").rstrip("/")
@@ -997,14 +1020,12 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 request_body=body, response_body=None, response_text=None, usage=None,
                 model_resolved=None, provider_name=None,
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
-                status_code=503, streamed=is_stream, error=str(e),
+                status_code=429, streamed=is_stream, error=str(e),
                 outcome="saturated", client=client, principal=principal_id,
             )
-            raise HTTPException(
-                status_code=503,
-                detail={"error": "backend saturated", "backend": e.backend_key,
-                        "retry_after_seconds": e.retry_after_seconds},
-                headers={"Retry-After": str(max(1, int(e.retry_after_seconds)))},
+            return _backpressure_response(
+                429, "backend_saturated", str(e), e.retry_after_seconds,
+                {"backend": e.backend_key},
             )
         except NoBackendAvailableError as e:
             # Transient availability gap (constraints satisfiable, every match
@@ -1017,11 +1038,8 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 status_code=503, streamed=is_stream, error=str(e),
                 outcome="no_backend", client=client, principal=principal_id,
             )
-            raise HTTPException(
-                status_code=503,
-                detail={"error": "no backend available",
-                        "retry_after_seconds": e.retry_after_seconds},
-                headers={"Retry-After": str(max(1, int(e.retry_after_seconds)))},
+            return _backpressure_response(
+                503, "no_backend_available", str(e), e.retry_after_seconds,
             )
         except httpx.RequestError as e:
             emit_chat_completion(
@@ -1168,16 +1186,12 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 body, headers=hint_headers, upstream_path=upstream_path,
             )
         except SaturationError as e:
-            raise HTTPException(
-                status_code=503,
-                detail={"error": "backend saturated", "retry_after_seconds": e.retry_after_seconds},
-                headers={"Retry-After": str(max(1, int(e.retry_after_seconds)))},
+            return _backpressure_response(
+                429, "backend_saturated", str(e), e.retry_after_seconds,
             )
         except NoBackendAvailableError as e:
-            raise HTTPException(
-                status_code=503,
-                detail={"error": "no backend available", "retry_after_seconds": e.retry_after_seconds},
-                headers={"Retry-After": str(max(1, int(e.retry_after_seconds)))},
+            return _backpressure_response(
+                503, "no_backend_available", str(e), e.retry_after_seconds,
             )
         except httpx.RequestError as e:
             raise HTTPException(502, detail=f"Backend network error: {e}")

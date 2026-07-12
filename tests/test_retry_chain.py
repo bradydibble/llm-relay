@@ -291,7 +291,7 @@ async def test_route_and_forward_skips_saturated_backend_without_forwarding(tmp_
 
 
 async def test_route_and_forward_503_via_api_on_saturation(tmp_path, monkeypatch):
-    """End-to-end: SaturationError still produces 503 + Retry-After at the HTTP layer."""
+    """End-to-end: SaturationError produces 429 + Retry-After backpressure (was 503)."""
     app = _make_app_with_both_healthy(tmp_path)
 
     async def _fake_forward(*args, **kwargs):
@@ -307,11 +307,12 @@ async def test_route_and_forward_503_via_api_on_saturation(tmp_path, monkeypatch
             json={"model": "main", "messages": [{"role": "user", "content": "hi"}]},
         )
 
-    assert resp.status_code == 503
+    assert resp.status_code == 429
     assert "Retry-After" in resp.headers
     assert int(resp.headers["Retry-After"]) >= 1
     body = resp.json()
-    assert body["detail"]["error"] == "backend saturated"
+    assert "detail" not in body
+    assert body["error"]["type"] == "backend_saturated"
 
 
 async def test_route_and_forward_streaming_passes_through_response(tmp_path, monkeypatch):
