@@ -286,6 +286,13 @@ class RelayMetrics:
             registry=self.registry,
         )
 
+        self.cache_tokens = Counter(
+            "llm_relay_cache_tokens_total",
+            "Prompt tokens served from llama.cpp prefix cache (cache_n from timings).",
+            ["model", "client", "principal"],
+            registry=self.registry,
+        )
+
     def record_request(
         self,
         *,
@@ -315,6 +322,11 @@ class RelayMetrics:
             self.tokens.labels(provider=prov, model=mdl, direction="prompt", client=cli, principal=pri).inc(int(pt))
         if ct:
             self.tokens.labels(provider=prov, model=mdl, direction="completion", client=cli, principal=pri).inc(int(ct))
+
+        # Prefix-cache reuse: extract cache_n from llama.cpp timings if present.
+        cache_n = (response_body or {}).get("timings", {}).get("cache_n", 0)
+        if cache_n:
+            self.cache_tokens.labels(model=mdl, client=cli, principal=pri).inc(int(cache_n))
 
         if duration_s is not None and duration_s >= 0:
             self.duration.labels(provider=prov, model=mdl, alias=ali, client=cli).observe(duration_s)
