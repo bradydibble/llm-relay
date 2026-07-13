@@ -25,10 +25,21 @@ def test_mirror_adds_reasoning_content_on_message():
     assert msg["reasoning"] == "thinking..."  # dual-emit: original kept
 
 
+def test_mirror_adds_reasoning_from_reasoning_content():
+    # Reverse direction: older vLLM (Reno 0.21) emits reasoning_content; mirror the
+    # standard `reasoning` name in so newer clients keying on it also see it.
+    payload = {"choices": [{"message": {"content": "pong", "reasoning_content": "thinking..."}}]}
+    assert _mirror_reasoning(payload) is True
+    msg = payload["choices"][0]["message"]
+    assert msg["reasoning"] == "thinking..."
+    assert msg["reasoning_content"] == "thinking..."
+
+
 def test_mirror_preserves_existing_reasoning_content():
     payload = {"choices": [{"message": {"reasoning": "a", "reasoning_content": "b"}}]}
-    assert _mirror_reasoning(payload) is False  # do not clobber
+    assert _mirror_reasoning(payload) is False  # both present -> do not clobber either
     assert payload["choices"][0]["message"]["reasoning_content"] == "b"
+    assert payload["choices"][0]["message"]["reasoning"] == "a"
 
 
 def test_mirror_noop_without_reasoning():
@@ -52,6 +63,14 @@ def test_sse_frame_mirrors_delta_reasoning():
     parsed = json.loads(line)
     assert parsed["choices"][0]["delta"]["reasoning_content"] == "step"
     assert parsed["choices"][0]["delta"]["reasoning"] == "step"
+
+
+def test_sse_frame_mirrors_delta_reasoning_content_reverse():
+    obj = {"choices": [{"delta": {"reasoning_content": "step"}}]}
+    frame = "data: " + json.dumps(obj)
+    parsed = json.loads(_mirror_reasoning_sse_frame(frame).split("data:", 1)[1].strip())
+    assert parsed["choices"][0]["delta"]["reasoning"] == "step"
+    assert parsed["choices"][0]["delta"]["reasoning_content"] == "step"
 
 
 def test_sse_frame_passthrough_done_and_comments():

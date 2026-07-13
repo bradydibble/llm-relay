@@ -37,17 +37,22 @@ _KEEPALIVE_INTERVAL_S = 15.0
 
 
 def _mirror_reasoning(payload: dict) -> bool:
-    """Mirror a nonstandard ``reasoning`` field to the OpenAI-standard
-    ``reasoning_content`` on each choice (``message`` for non-stream, ``delta``
-    for stream), when ``reasoning_content`` is absent. Some vLLM builds
-    (ornith-397b) emit chain-of-thought as ``reasoning``, which pi/zed/OpenAI SDKs
-    do not render — they key off ``reasoning_content`` — so the thinking shows as
-    an empty bubble. Dual-emit (keep BOTH names) is non-breaking and version-proof:
-    a client reading either name sees the reasoning. Mutates in place; returns
-    True iff it changed anything. Tolerant of any shape (no-op on surprises).
+    """Normalize reasoning field names so EITHER `reasoning` or `reasoning_content`
+    is always present on each choice (`message` for non-stream, `delta` for stream).
 
-    This is the relay-side compatibility shim; the root-cause fix is to correct
-    the serve's reasoning-parser so it emits ``reasoning_content`` natively."""
+    Why this lives in the relay and NOT in the serve (deliberate, durable):
+    vLLM RENAMED the field `reasoning_content` -> `reasoning` and deprecated the old
+    name (docs.vllm.ai reasoning_outputs: "reasoning used to be called
+    reasoning_content ... directly replace"). There is NO serve flag to emit the old
+    name — reverting it would mean forking vLLM and re-applying the patch on every
+    upgrade, the exact treadmill we avoid. Meanwhile a fleet is often MIXED-version:
+    newer vLLM builds emit `reasoning`, older builds emit `reasoning_content`, and
+    clients (pi/zed/OpenAI SDKs) variously key on one or the other. So the relay —
+    the one point that spans the whole fleet — mirrors
+    BOTH directions: whichever field the serve emits, the other is copied in. This is
+    non-breaking (a client reading either name works) and immune to vLLM renaming the
+    field in future patches. Mutates in place; returns True iff it changed anything;
+    tolerant of any shape (no-op on surprises)."""
     changed = False
     try:
         for ch in payload.get("choices", []) or []:
@@ -55,11 +60,16 @@ def _mirror_reasoning(payload: dict) -> bool:
                 continue
             for key in ("message", "delta"):
                 node = ch.get(key)
-                if isinstance(node, dict):
-                    r = node.get("reasoning")
-                    if r is not None and not node.get("reasoning_content"):
-                        node["reasoning_content"] = r
-                        changed = True
+                if not isinstance(node, dict):
+                    continue
+                r = node.get("reasoning")
+                rc = node.get("reasoning_content")
+                if r is not None and rc is None:
+                    node["reasoning_content"] = r
+                    changed = True
+                elif rc is not None and r is None:
+                    node["reasoning"] = rc
+                    changed = True
     except Exception:
         pass
     return changed
