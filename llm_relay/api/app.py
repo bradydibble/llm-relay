@@ -36,6 +36,61 @@ from ..jobworker import run_worker
 _KEEPALIVE_INTERVAL_S = 15.0
 
 
+def _mirror_reasoning(payload: dict) -> bool:
+    """Mirror a nonstandard ``reasoning`` field to the OpenAI-standard
+    ``reasoning_content`` on each choice (``message`` for non-stream, ``delta``
+    for stream), when ``reasoning_content`` is absent. Some vLLM builds
+    (ornith-397b) emit chain-of-thought as ``reasoning``, which pi/zed/OpenAI SDKs
+    do not render — they key off ``reasoning_content`` — so the thinking shows as
+    an empty bubble. Dual-emit (keep BOTH names) is non-breaking and version-proof:
+    a client reading either name sees the reasoning. Mutates in place; returns
+    True iff it changed anything. Tolerant of any shape (no-op on surprises).
+
+    This is the relay-side compatibility shim; the root-cause fix is to correct
+    the serve's reasoning-parser so it emits ``reasoning_content`` natively."""
+    changed = False
+    try:
+        for ch in payload.get("choices", []) or []:
+            if not isinstance(ch, dict):
+                continue
+            for key in ("message", "delta"):
+                node = ch.get(key)
+                if isinstance(node, dict):
+                    r = node.get("reasoning")
+                    if r is not None and not node.get("reasoning_content"):
+                        node["reasoning_content"] = r
+                        changed = True
+    except Exception:
+        pass
+    return changed
+
+
+def _mirror_reasoning_sse_frame(frame: str) -> str:
+    """Apply ``_mirror_reasoning`` to any ``data: {json}`` line in a single,
+    COMPLETE SSE frame. Keepalive comments (``: ...``), ``data: [DONE]``, and any
+    non-JSON line pass through byte-identical; a frame we do not change is returned
+    unchanged (never re-serialized). Frame boundaries (the trailing blank line) are
+    handled by the caller — this only rewrites line content."""
+    if "reasoning" not in frame:  # cheap fast-path: nothing to mirror
+        return frame
+    lines = frame.split("\n")
+    changed = False
+    for i, line in enumerate(lines):
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            continue
+        if isinstance(obj, dict) and _mirror_reasoning(obj):
+            lines[i] = "data: " + json.dumps(obj, separators=(",", ":"))
+            changed = True
+    return "\n".join(lines) if changed else frame
+
+
 async def _sse_stream_keepalive(body_iter, media_type, interval):
     """Yield ``(payload, is_keepalive)`` from an upstream byte iterator, emitting
     an SSE comment frame (``: ka``) whenever no upstream chunk arrives within
@@ -1072,6 +1127,12 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
             raise HTTPException(502, detail=f"Backend error: {e}")
 
         _dec = result.decision or {}
+        # reasoning->reasoning_content mirroring is applied ONLY for models that
+        # advertise the `reasoning` capability. For every other backend the
+        # response is passed through byte-identical (no parse, no re-serialize),
+        # so this is zero-overhead and zero-risk for the fast local fleet.
+        _sel_cfg = request.app.state.config.models.models.get(result.selected_model or "")
+        _mirror_r = bool(_sel_cfg and "reasoning" in (_sel_cfg.capabilities or []))
         relay_headers = {
             "X-Llm-Relay-Selected-Model": result.selected_model or "",
             "X-Llm-Relay-Selected-Provider": result.provider_name or "",
@@ -1091,6 +1152,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 chunks: list[bytes] = []
                 exc: BaseException | None = None
                 first_chunk_ns: int | None = None
+                carry = b""  # partial trailing SSE frame awaiting its blank-line terminator
                 try:
                     async for chunk, _is_ka in _sse_stream_keepalive(
                         body_iter, media_type, _KEEPALIVE_INTERVAL_S
@@ -1100,8 +1162,28 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                             continue
                         if first_chunk_ns is None:
                             first_chunk_ns = time.time_ns()
-                        chunks.append(chunk)
-                        yield chunk
+                        if not _mirror_r:
+                            # Non-reasoning model: byte-identical passthrough.
+                            chunks.append(chunk)
+                            yield chunk
+                            continue
+                        # Reasoning model: mirror reasoning->reasoning_content on
+                        # COMPLETE frames only (split on the blank-line terminator),
+                        # buffering any partial tail so a JSON payload is never split
+                        # mid-frame or mid-codepoint. Keepalives are handled above and
+                        # never enter this buffer.
+                        carry += chunk
+                        while b"\n\n" in carry:
+                            fb, carry = carry.split(b"\n\n", 1)
+                            out = (_mirror_reasoning_sse_frame(fb.decode("utf-8", "replace"))
+                                   + "\n\n").encode("utf-8")
+                            chunks.append(out)
+                            yield out
+                    if _mirror_r and carry:
+                        # Flush a trailing frame that lacked its terminator (rare).
+                        out = _mirror_reasoning_sse_frame(carry.decode("utf-8", "replace")).encode("utf-8")
+                        chunks.append(out)
+                        yield out
                 except BaseException as e:
                     # Capture HOW the stream ended so the outcome is honest, then
                     # always re-raise: a swallowed CancelledError/GeneratorExit would
@@ -1145,6 +1227,8 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
         try:
             content = upstream.json()
             if isinstance(content, dict):
+                if _mirror_r:
+                    _mirror_reasoning(content)
                 content["llm-relay"] = {
                     "selected_model": result.selected_model,
                     "selected_provider": result.provider_name,

@@ -24,6 +24,19 @@ from .selector import ChainCandidate, ModelSelector, RoutingContext, batch_polic
 # routing; only a prompt that genuinely fits nothing live is refused (oversize).
 MIN_OUTPUT_HEADROOM = 1024
 
+# Reasoning models (their `capabilities` include "reasoning") emit a long
+# chain-of-thought that counts toward the SAME max_tokens ceiling as the final
+# answer. A modest client max_tokens is then consumed entirely by the reasoning,
+# leaving the answer empty or truncated (finish_reason=length) — the dominant
+# failure mode observed on ornith-397b (40/400 max_tokens -> empty content, 2000
+# -> a real answer). So _clamp_max_tokens floors the forwarded ceiling UP to this
+# many tokens for reasoning models, capped by the window headroom so it can never
+# overflow. Capability-gated (see RequestRouter._reasoning_floor): it applies to
+# any reasoning model with no per-model special-casing, and is a no-op for every
+# non-reasoning backend. The right long-term fix is at the serve (bound the
+# reasoning length / emit reasoning_content); this is the fleet-policy backstop.
+REASONING_OUTPUT_FLOOR = 2048
+
 # Prompt-size estimation is a heuristic (no server tokenizer). It must be a true
 # UPPER bound: under-counting routes a request to a backend too small to hold it
 # and the upstream hard-rejects at the boundary (the 2026-07-07 subagent incident:
@@ -193,6 +206,17 @@ class RequestRouter:
         out = {k: v for k, v in body.items() if k not in strip}
         out.update(setp)
         return out
+
+    def _reasoning_floor(self, model_name: str) -> int:
+        """``REASONING_OUTPUT_FLOOR`` when the chosen model advertises the
+        ``reasoning`` capability, else 0. Config-less paths (stream logic is
+        exercised with ``config=None`` in tests) get 0 — no floor."""
+        if self.config is None:
+            return 0
+        cfg = self.config.models.models.get(model_name)
+        if cfg and "reasoning" in (cfg.capabilities or []):
+            return REASONING_OUTPUT_FLOOR
+        return 0
 
     async def forward_request(
         self,
@@ -465,7 +489,8 @@ class RequestRouter:
                         )
                     continue
                 try:
-                    fwd = _clamp_max_tokens(request_data, prompt_est, candidate.context_window)
+                    fwd = _clamp_max_tokens(request_data, prompt_est, candidate.context_window,
+                                            self._reasoning_floor(candidate.model))
                     upstream, body_iter, cleanup = await self.stream_request(
                         candidate.backend_url, candidate.model, fwd,
                         headers=headers,
@@ -576,7 +601,8 @@ class RequestRouter:
                     )
                 continue
             try:
-                fwd = _clamp_max_tokens(request_data, prompt_est, candidate.context_window)
+                fwd = _clamp_max_tokens(request_data, prompt_est, candidate.context_window,
+                                        self._reasoning_floor(candidate.model))
                 resp = await self.forward_request(
                     candidate.backend_url, candidate.model, fwd,
                     headers=headers,
@@ -829,30 +855,41 @@ def _estimate_prompt_tokens(request_data: dict) -> int | None:
         return None
 
 
-def _clamp_max_tokens(request_data: dict, prompt_est: int | None, window: int) -> dict:
-    """Cap a request's ``max_tokens`` to the chosen model's remaining headroom.
+def _clamp_max_tokens(request_data: dict, prompt_est: int | None, window: int,
+                      reasoning_floor: int = 0) -> dict:
+    """Fit a request's ``max_tokens`` to the chosen model: cap DOWN to the window
+    headroom, then (for reasoning models) floor UP so reasoning can't starve the
+    answer.
 
     ``max_tokens`` is an output ceiling, not a context reservation, so it never
     gates routing (see ``_estimate_prompt_tokens``). But once a model is chosen
     the output still has to fit its window: a request whose ``prompt + max_tokens``
     exceeds the window would overflow it — silently truncated by llama.cpp, hard
-    400-rejected by vLLM. So clamp the forwarded ceiling to ``window - prompt``.
+    400-rejected by vLLM. So the ceiling is capped to ``window - prompt`` (the
+    accurate ``prompt_est`` sits within a few percent of the real count).
 
-    ``prompt_est = chars // 3`` over-counts real tokens, so ``window - prompt_est``
-    sits conservatively below the true headroom (the safe direction — no fudge
-    factor needed). Returns the request unchanged (same object) when there is
-    nothing to clamp; otherwise a shallow copy with the lowered ``max_tokens`` —
-    never mutating the caller's dict, which is shared across the candidate chain.
-    A clamp can yield a shorter completion than asked (``finish_reason=length``):
-    that is honest graceful degradation, far better than excluding the model and
-    dead-ending the open-fallthrough in a 503.
+    ``reasoning_floor`` (0 = disabled) raises a too-small ceiling for reasoning
+    models — see ``REASONING_OUTPUT_FLOOR`` — but never above the headroom, so
+    fit always wins over floor. Returns the request unchanged (same object) when
+    neither cap nor floor moves ``max_tokens``; otherwise a shallow copy with the
+    adjusted value — never mutating the caller's dict, which is shared across the
+    candidate chain. A down-clamp can still yield a shorter completion than asked
+    (``finish_reason=length``): honest graceful degradation, far better than
+    excluding the model and dead-ending the open-fallthrough in a 503.
     """
-    if not prompt_est or not window:
-        return request_data
     max_tokens = request_data.get("max_tokens")
     if not isinstance(max_tokens, int) or max_tokens <= 0:
         return request_data
-    headroom = window - prompt_est
-    if max_tokens <= headroom:
+    new_mt = max_tokens
+    headroom = (window - prompt_est) if (prompt_est and window) else None
+    # Cap DOWN so prompt + output fits the window.
+    if headroom is not None and new_mt > headroom:
+        new_mt = headroom
+    # Floor UP for reasoning models, but never past the headroom (fit wins).
+    if reasoning_floor and new_mt < reasoning_floor:
+        target = min(reasoning_floor, headroom) if headroom is not None else reasoning_floor
+        if target > new_mt:
+            new_mt = target
+    if new_mt == max_tokens:
         return request_data
-    return {**request_data, "max_tokens": headroom}
+    return {**request_data, "max_tokens": new_mt}
