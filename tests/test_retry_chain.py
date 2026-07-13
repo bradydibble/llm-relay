@@ -11,7 +11,11 @@ from llm_relay.api.app import create_app
 from llm_relay.config.types import CircuitBreaker, EndpointState, EndpointStatus, SaturationError
 from llm_relay.discovery.endpoint import EndpointClient
 from llm_relay.discovery.manager import DiscoveryManager
-from llm_relay.routing.router import RequestRouter, _estimate_prompt_tokens
+from llm_relay.routing.router import (
+    ContextLengthExceededError,
+    RequestRouter,
+    _estimate_prompt_tokens,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -669,16 +673,15 @@ async def test_route_and_forward_exhausted_chain_reports_correct_candidate(tmp_p
 # ---------------------------------------------------------------------------
 
 def test_estimate_prompt_tokens_scales_with_message_size():
-    # ~3 chars/token of the PROMPT only, times the 1.2 upper-bound safety margin:
-    # 30000/3 * 1.2 = 12000.
+    # tiktoken (cl100k_base) exact-counts the PROMPT: 30000 repeated "x" BPE-pack
+    # to 3750 tokens. The estimate scales with prompt size.
     assert _estimate_prompt_tokens(
         {"messages": [{"role": "user", "content": "x" * 30000}]}
-    ) == 12000
-    # A trivially small request still rounds to nothing (margin is multiplicative)
-    # -> no implicit floor.
+    ) == 3750
+    # A trivially small request counts to a tiny value (0 -> None only for empty).
     assert _estimate_prompt_tokens(
         {"messages": [{"role": "user", "content": "hi"}]}
-    ) is None
+    ) == 1
 
 
 def test_estimate_prompt_tokens_ignores_max_tokens():
@@ -689,7 +692,7 @@ def test_estimate_prompt_tokens_ignores_max_tokens():
     est = _estimate_prompt_tokens(
         {"messages": [{"role": "user", "content": "x" * 3000}], "max_tokens": 50000}
     )
-    assert est == 1200  # 3000/3 * 1.2 safety margin prompt tokens; max_tokens excluded
+    assert est == 375  # tiktoken exact prompt tokens; max_tokens (output ceiling) excluded
 
 
 def test_estimate_prompt_tokens_handles_malformed_body():
@@ -702,10 +705,10 @@ def test_estimate_prompt_tokens_counts_tool_definitions():
     """Tool schemas are top-level and often large; tool-using agents are the
     target workload, so they must count toward the prompt. Omitting them
     under-counts -- the unsafe direction."""
-    assert _estimate_prompt_tokens({"messages": [{"role": "user", "content": "hi"}]}) is None
+    assert _estimate_prompt_tokens({"messages": [{"role": "user", "content": "hi"}]}) == 1
     est = _estimate_prompt_tokens({
         "messages": [{"role": "user", "content": "hi"}],
-        "tools": [{"type": "function", "function": {"name": "f", "parameters": {"blob": "y" * 30000}}}],
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": {"blob": "y" * 80000}}}],
     })
     assert est is not None and est > 8000, "large tool definitions must lift the estimate"
 
@@ -770,9 +773,11 @@ async def test_route_and_forward_pins_large_request_to_big_context_backend(tmp_p
     assert "model-small" not in called, "large request must not be routed to the 8192-ctx backend"
 
 
-async def test_route_and_forward_503_when_request_exceeds_all_backend_contexts(tmp_path, monkeypatch):
-    """A request larger than every available backend's context honestly 503s
-    (no candidate) rather than being routed somewhere it can't fit."""
+async def test_route_and_forward_context_length_exceeded_when_request_exceeds_all_backends(tmp_path, monkeypatch):
+    """A request larger than every available backend's context raises an
+    OpenAI-standard context_length_exceeded (rendered a top-level 400 by the API
+    layer so clients auto-compact) rather than being routed somewhere it can't fit.
+    (Superseded the old 503 path on 2026-07-08 — see ContextLengthExceededError.)"""
     app = _make_ctx_app(tmp_path)
     router = app.state.router
 
@@ -781,18 +786,19 @@ async def test_route_and_forward_503_when_request_exceeds_all_backend_contexts(t
 
     monkeypatch.setattr(router, "forward_request", _fake_forward)
 
-    huge = "x" * 900000  # ~300000 tokens > 200000
-    with pytest.raises(HTTPException) as ei:
+    huge = "x" * 2000000  # ~250000 tokens > 200000 (largest catalog window)
+    with pytest.raises(ContextLengthExceededError) as ei:
         await router.route_and_forward(
             request_data={"model": "main", "messages": [{"role": "user", "content": huge}]},
             stream=False,
         )
-    assert ei.value.status_code == 503
+    assert ei.value.body["error"]["code"] == "context_length_exceeded"
 
 
-async def test_503_oversize_period_carries_context_diagnosis(tmp_path, monkeypatch):
-    """A request larger than EVERY catalog window 503s with an 'oversize_period'
-    context diagnosis: resize/defer is the only path, waiting cannot help."""
+async def test_oversize_period_carries_context_diagnosis(tmp_path, monkeypatch):
+    """A request larger than EVERY catalog window carries an 'oversize_period'
+    context diagnosis on the context_length_exceeded error: resize/defer is the
+    only path, waiting cannot help."""
     app = _make_ctx_app(tmp_path)
     router = app.state.router
 
@@ -800,20 +806,19 @@ async def test_503_oversize_period_carries_context_diagnosis(tmp_path, monkeypat
         raise AssertionError("must not forward when nothing fits")
     monkeypatch.setattr(router, "forward_request", _fake_forward)
 
-    huge = "x" * 900000  # ~300000 tokens > 200000 (largest catalog window)
-    with pytest.raises(HTTPException) as ei:
+    huge = "x" * 2000000  # ~250000 tokens > 200000 (largest catalog window)
+    with pytest.raises(ContextLengthExceededError) as ei:
         await router.route_and_forward(
             request_data={"model": "main", "messages": [{"role": "user", "content": huge}]},
             stream=False,
         )
-    assert ei.value.status_code == 503
-    info = ei.value.detail["context"]
+    info = ei.value.body["error"]["llm_relay_context"]
     assert info["classification"] == "oversize_period"
     assert info["max_in_catalog"] == 200000
     assert info["max_available_now"] == 200000  # model-big is live but still too small
 
 
-async def test_503_oversize_for_now_when_big_backend_down(tmp_path, monkeypatch):
+async def test_oversize_for_now_when_big_backend_down(tmp_path, monkeypatch):
     """A mid-size request no LIVE model can hold, but a DOWN catalog model could ->
     'oversize_for_now': waiting for the big backend to return is viable."""
     app = _make_ctx_app(tmp_path)
@@ -825,14 +830,13 @@ async def test_503_oversize_for_now_when_big_backend_down(tmp_path, monkeypatch)
         raise AssertionError("must not forward when nothing fits")
     monkeypatch.setattr(router, "forward_request", _fake_forward)
 
-    mid = "x" * 150000  # ~50000 tokens: > model-small (8192), <= model-big catalog (200000)
-    with pytest.raises(HTTPException) as ei:
+    mid = "x" * 150000  # ~18750 tokens: > model-small (8192), <= model-big catalog (200000)
+    with pytest.raises(ContextLengthExceededError) as ei:
         await router.route_and_forward(
             request_data={"model": "main", "messages": [{"role": "user", "content": mid}]},
             stream=False,
         )
-    assert ei.value.status_code == 503
-    info = ei.value.detail["context"]
+    info = ei.value.body["error"]["llm_relay_context"]
     assert info["classification"] == "oversize_for_now"
     assert info["max_available_now"] == 8192
     assert info["max_in_catalog"] == 200000

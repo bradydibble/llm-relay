@@ -245,7 +245,7 @@ class RequestRouter:
         # caller's longer client timeout (the wiki engine sets 900s) and killed any
         # non-stream completion past five minutes — an arbitrary cutoff on hardware
         # that is idle most of the day. The read window matches the engine's 900s.
-        timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+        timeout = httpx.Timeout(connect=10.0, read=900.0, write=10.0, pool=10.0)
         # backend_key="" / None → acquire_slot is a no-op (no semaphore registered).
         async with self.discovery.acquire_slot(backend_key or "", wait_timeout=slot_wait_timeout):
             async with httpx.AsyncClient(timeout=timeout) as client:
