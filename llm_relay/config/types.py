@@ -75,6 +75,10 @@ class ModelConfig:
     # backends an agent must never reach by accident (e.g. a costly/experimental
     # model wired into the relay but gated to manual use).
     manual_only: bool = False
+    # Candidate lane. When set, this model only appears as a routing candidate when
+    # the request's candidate-lane matches AND is one of 'interactive'/'batch'. An
+    # empty or unset value means the model is open to both lanes (default behavior).
+    candidate_lane: str | None = None
 
 
 @dataclass

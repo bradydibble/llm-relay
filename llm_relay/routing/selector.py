@@ -44,6 +44,9 @@ class RoutingContext:
     # (the opt-in quality gate). None = open (no floor). When the request is an
     # alias whose category declares a reasoning_floor, _prepare_ranked fills this in.
     min_preference: float | None = None
+    # Candidate lane filter. Models configured with `candidate_lane='interactive'`
+    # only appear when ctx.lane == 'interactive', etc. None/empty means "any lane".
+    lane: str | None = None
     resolved_model: str | None = None
     candidates: list[str] = field(default_factory=list)
     filtered: list[str] = field(default_factory=list)
@@ -251,6 +254,11 @@ class ModelSelector:
             if ctx.privacy == Privacy.local_only and cfg.privacy == Privacy.cloud_ok:
                 continue
             if ctx.require_tools and "tool_use" not in cfg.capabilities:
+                continue
+            # Candidate-lane filter: when the request asks for a specific lane,
+            # only admit models that are open to all lanes OR share that lane.
+            # A model without candidate_lane set stays visible in any lane (default).
+            if ctx.lane and cfg.candidate_lane is not None and cfg.candidate_lane != ctx.lane:
                 continue
             # Reasoning floor (opt-in quality gate): drop models whose preference is
             # below the requested category's floor. Applies to named members AND the

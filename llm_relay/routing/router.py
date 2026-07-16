@@ -235,11 +235,17 @@ class RequestRouter:
         explicit_min = int(headers.get("X-Llm-Relay-Min-Context", "0") or 0)
         prompt_est = _estimate_prompt_tokens(request_data)
         estimated_min = (prompt_est + MIN_OUTPUT_HEADROOM) if prompt_est else 0
+        # Candidate-lane filter: interactive clients ask for low-latency models,
+        # batch jobs ask for high-throughput ones. Models declare their lane via
+        # `candidate_lane` in config; requests pass one via this header. Empty /
+        # unset means "any lane".
+        requested_lane = headers.get("X-Llm-Relay-Candidate-Lane", "").strip() or None
         ctx = RoutingContext(
             requested_model=request_data.get("model", "") or "",
             privacy=privacy,
             require_tools=headers.get("X-Llm-Relay-Require-Tools", "false").lower() == "true",
             min_context=max(explicit_min, estimated_min) or None,
+            lane=requested_lane,
         )
 
         candidates = self.selector.select_chain(ctx)
