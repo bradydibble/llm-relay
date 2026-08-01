@@ -148,8 +148,10 @@ class ConfigLoader:
                 raise ValueError(
                     f"provider {name!r} in {path} is missing required key 'ownership'. "
                     f"Set 'ownership: ciq_owned' for hardware CIQ fully owns, or "
-                    f"'ownership: third_party' for borrowed/shared/vendor-hosted metal "
-                    f"(which may then serve ONLY workloads declared non-confidential)."
+                    f"'ownership: third_party' for a borrowed/shared machine we run "
+                    f"our own models on (which may then serve ONLY workloads declared "
+                    f"non-confidential). This is about who controls the box, not about "
+                    f"vendor inference APIs — the relay does not proxy those."
                 )
             self._providers[name] = ProviderConfig(
                 type=ProviderType(cfg.get("type", "openai")),
