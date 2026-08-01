@@ -118,6 +118,11 @@ default upstream may break. Prefer `llm-mode <mode>` or `llm-mode set-default`.
 
 ## Adding hardware CIQ does not own
 
+This is about **running our own models on someone else's machine** — a borrowed
+lab box, a shared tray. It is not about vendor inference APIs; the relay does not
+proxy those, and access to them is a company-authorization question handled in
+the client harness, not an `ownership` value here.
+
 Every provider must declare `ownership`. The loader **raises and the relay
 refuses to start** if one omits it — deliberately, because the alternative is a
 silent default, and a wrong default here routes confidential workloads onto
@@ -128,7 +133,7 @@ providers:
   nvidia-lab-a:
     type: openai
     base_url: http://10.0.0.9
-    ownership: third_party    # borrowed / shared / vendor-hosted
+    ownership: third_party    # our models, someone else's machine
 ```
 
 Consequences of `third_party`, all automatic:

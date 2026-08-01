@@ -28,10 +28,23 @@ class Privacy(str, Enum):
 class Confidentiality(str, Enum):
     """Workload sensitivity, declared by the CALLER on each request.
 
+    SCOPE — this axis answers exactly one question: *may this workload run on a
+    machine CIQ does not control?* It is a HARDWARE-CUSTODY control, not a
+    general data-sensitivity policy. The relay's whole remit is CIQ-operated
+    inference (our own open-weight models on our own or borrowed metal), so that
+    is the only risk it can speak to: on borrowed hardware the box operator can
+    observe or retain anything, and no contract governs them.
+
+    It says NOTHING about sending data to a contracted vendor's inference API.
+    That is a different risk model entirely — governed by commercial agreement,
+    compliance obligations, and company authorization rather than by who racks
+    the machine — and it is deliberately out of this relay's scope. Do not
+    generalize this enum into a "can this data leave CIQ" flag.
+
     ``confidential`` is the DEFAULT and is fail-closed: assume the workload may
     carry CIQ-proprietary material (sales data, Fathom transcripts, Slack,
     closed-source code — Fuzzball, Ledger Pro, ELLM, build/automation tooling),
-    so it may only be served by hardware CIQ fully owns.
+    so it may only run on hardware CIQ fully owns.
 
     ``non_confidential`` is an explicit caller assertion that the workload is
     safe to run on metal CIQ does not own — open-source work (kernel, Warewulf,
@@ -46,14 +59,24 @@ class Confidentiality(str, Enum):
 
 
 class Ownership(str, Enum):
-    """Who owns the physical hardware behind a provider.
+    """Who physically controls the machine a provider's models run on.
+
+    Every provider here is CIQ-operated inference — our own models, served by us.
+    The only variable is whose rack the GPU sits in.
 
     ``ciq_owned`` — CIQ controls the machine end to end (llama-01, ciq-l4,
     ciq-mi100). Any workload may run there, confidential or not.
 
-    ``third_party`` — borrowed, shared, or vendor-hosted metal (amd-dev, the
-    NVIDIA lab). ONLY workloads explicitly declared ``non_confidential`` may be
-    routed here.
+    ``third_party`` — borrowed or shared metal we run our own models on
+    (amd-dev, the NVIDIA lab). We control the software; someone else controls
+    the machine, and no agreement binds what they may observe or retain. ONLY
+    workloads explicitly declared ``non_confidential`` may be routed here.
+
+    NOT what this means: a contracted vendor's inference API (Anthropic, OpenAI).
+    Those are a different trust model — the counterparty carries compliance and
+    contractual obligations — and the relay does not proxy them at all. Access to
+    vendor inference is a company-authorization question handled in the client
+    harness, not an ``Ownership`` value.
 
     Deliberately has NO default: ``providers.yaml`` must state ownership for
     every provider and the loader raises if one omits it. A forgotten tag on

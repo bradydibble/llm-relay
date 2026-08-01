@@ -57,11 +57,20 @@ entirely:
   `privacy: cloud_ok`. Cross this boundary by setting the
   `X-Llm-Relay-Privacy: cloud_ok` header.
 - **Confidentiality**: `confidential` (the default) excludes every model whose
-  **provider** is `ownership: third_party` — hardware CIQ does not fully own
-  (borrowed lab boxes, vendor-hosted trays). Cross this boundary by setting the
-  `X-Llm-Relay-Confidentiality: non_confidential` header, which asserts the
-  workload carries no CIQ-proprietary material (open-source work: kernel,
-  Warewulf, Ascender base, public codebases).
+  **provider** is `ownership: third_party` — borrowed or shared machines that CIQ
+  runs its own models on (the AMD MI300X tray, the NVIDIA lab). Cross this
+  boundary by setting the `X-Llm-Relay-Confidentiality: non_confidential` header,
+  which asserts the workload carries no CIQ-proprietary material (open-source
+  work: kernel, Warewulf, Ascender base, public codebases).
+
+  **What this axis is, and is not.** It answers exactly one question: *may this
+  workload run on a machine CIQ does not control?* The risk it addresses is
+  hardware custody — on borrowed metal the box operator can observe or retain
+  anything, and no agreement binds them. It is **not** a general "may this data
+  leave CIQ" policy, and it says nothing about a contracted vendor's inference
+  API, where the counterparty carries compliance and contractual obligations.
+  That is a different and separately-governed trust model; this relay serves only
+  CIQ-operated inference and does not proxy vendors at all.
 
   Three properties make this a control rather than a suggestion:
 
