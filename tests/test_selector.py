@@ -226,7 +226,7 @@ def test_privacy_local_only_excludes_cloud():
     c = _load()
     disc = DiscoveryManager()
     sel = ModelSelector(c, disc)
-    ctx = RoutingContext(requested_model="claude-3-5-sonnet")
+    ctx = RoutingContext(requested_model="example-cloud-large")
     # Default privacy is local_only — cloud-only model should not survive filter.
     pick = sel.select_best(ctx)
     assert pick is None

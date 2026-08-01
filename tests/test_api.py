@@ -221,7 +221,7 @@ def test_v1_models_list_advertises_qualified_ids():
     by_id = {e["id"]: e for e in payload["data"]}
     ids = set(by_id)
     assert "local-llm:qwen3.5-9b" in ids
-    assert "anthropic:claude-3-5-sonnet" in ids
+    assert "example-cloud:example-cloud-large" in ids
     assert "qwen3.5-9b" not in ids, "bare concrete names must not be advertised"
     assert "main" in ids and "subagent" in ids, "aliases (categories) stay advertised"
     assert by_id["local-llm:qwen3.5-9b"]["owned_by"] == "local-llm"
@@ -248,7 +248,7 @@ def test_v1_models_list_hides_unservable_models_once_discovery_sees_the_fleet():
     ids = {e["id"] for e in payload["data"]}
     assert "local-llm:qwen3.5-9b" in ids
     assert "local-llm:qwen3.5-35b" not in ids, "down model must not be advertised"
-    assert "anthropic:claude-3-5-sonnet" not in ids, \
+    assert "example-cloud:example-cloud-large" not in ids, \
         "unprobed models (incl. cloud) are not advertised while filtering"
     assert "main" in ids, "alias with a live member stays advertised"
 
@@ -267,7 +267,7 @@ def test_v1_model_card_accepts_qualified_and_bare():
     b = _build_model_card(cfg, disc, "qwen3.5-9b")
     assert b["id"] == "qwen3.5-9b", "bare id still resolves and echoes (back-compat)"
 
-    assert _build_model_card(cfg, disc, "anthropic:qwen3.5-9b") is None, \
+    assert _build_model_card(cfg, disc, "example-cloud:qwen3.5-9b") is None, \
         "mismatched provider:model is not a valid pairing"
 
 
@@ -280,7 +280,7 @@ async def test_v1_models_card_route_handles_colon_in_path():
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         ok = await client.get("/v1/models/local-llm:qwen3.5-9b")
-        bad = await client.get("/v1/models/anthropic:qwen3.5-9b")
+        bad = await client.get("/v1/models/example-cloud:qwen3.5-9b")
     assert ok.status_code == 200
     assert ok.json()["id"] == "local-llm:qwen3.5-9b"
     assert bad.status_code == 404

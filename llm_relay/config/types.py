@@ -6,8 +6,18 @@ from enum import Enum
 
 
 class ProviderType(str, Enum):
+    """Wire protocol a provider speaks.
+
+    Only ``openai`` exists: the relay forwards OpenAI-compatible chat-completions
+    and nothing in the codebase branches on this value. An ``anthropic`` member
+    was removed 2026-07-31 along with the Anthropic provider — it was decorative
+    (an anthropic-typed provider was forwarded as OpenAI chat-completions anyway),
+    and dropping it makes the policy structural: this gateway serves CIQ-operated
+    inference, so reintroducing a vendor cloud is a code change and a review, not
+    a config edit. `ProviderType("anthropic")` now raises at load.
+    """
+
     openai = "openai"
-    anthropic = "anthropic"
 
 
 class Privacy(str, Enum):

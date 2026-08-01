@@ -100,7 +100,9 @@ default upstream may break. Prefer `llm-mode <mode>` or `llm-mode set-default`.
 
 1. Enable in `config/providers.yaml`:
    ```yaml
-   anthropic:
+   example-cloud:
+     type: openai          # the only wire protocol the relay speaks
+     ownership: third_party
      enabled: true
      auth_source: vault    # see README for credential handling
    ```

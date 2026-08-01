@@ -33,14 +33,17 @@ providers:
       failure_threshold: 3
       recovery_timeout: 30s
 
-  anthropic:
-    type: anthropic
-    base_url: https://api.anthropic.com
-    # Vendor-hosted inference — not your hardware. Reaching it therefore needs
-    # BOTH `privacy: cloud_ok` and a `non_confidential` declaration.
+  # Vendor-neutral example of a CLOUD tier, kept disabled. Deliberately generic:
+  # this template ships no real vendor, and `type:` has only one value (`openai`)
+  # because the relay speaks OpenAI-compatible chat-completions to everything.
+  # Present so the privacy axis (`X-Llm-Relay-Privacy: cloud_ok` + the `cloud` key
+  # scope) has something to gate — see tests/test_selector.py.
+  #
+  # Reaching a provider like this needs BOTH `privacy: cloud_ok` AND a
+  # `non_confidential` declaration: it is someone else's hardware on both axes.
+  example-cloud:
+    type: openai
+    base_url: https://cloud.example.invalid
     ownership: third_party
     enabled: false
     auth_source: vault
-    model_overrides:
-      - claude-3-5-sonnet-20241022
-      - claude-3-5-haiku-20241022

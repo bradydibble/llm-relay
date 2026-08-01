@@ -121,12 +121,12 @@ providers:
     credential:
       source: env          # env | file | pass | none
       ref: LLM_RELAY_LOCAL_KEY   # env var name / file path / get-secret key
-  anthropic:
-    base_url: https://api.anthropic.com
+  example-cloud:
+    base_url: https://cloud.example.invalid
     enabled: false
     credential:
       source: pass         # resolves via ~/bin/get-secret <ref> (homelab only)
-      ref: anthropic/shared/api-key
+      ref: example-cloud/shared/api-key
 ```
 
 Sources:

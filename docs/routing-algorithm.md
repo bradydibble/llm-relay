@@ -213,12 +213,12 @@ request time, with no human intervention.
 ### Category spanning local and cloud, default privacy
 
 `POST /v1/chat/completions { "model": "fast" }`
-with `fast` tagged on `[qwen3.5-9b, claude-3-5-haiku]` and default
+with `fast` tagged on `[qwen3.5-9b, example-cloud-fast]` and default
 `privacy: local_only`:
 
-1. Build: `[qwen3.5-9b, claude-3-5-haiku]` + open-fallthrough tail (other live
+1. Build: `[qwen3.5-9b, example-cloud-fast]` + open-fallthrough tail (other live
    local models, preference-ranked)
-2. Filter: claude drops out (cloud_ok under local_only)
+2. Filter: `example-cloud-fast` drops out (cloud_ok under local_only)
 3. Order: `[qwen3.5-9b, <other live local models that fit>]`
 4. Select: `qwen3.5-9b` if up; otherwise fall through to the next live local
    model. Only 503s if no live local model can serve the request — and then with

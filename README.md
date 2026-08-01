@@ -69,7 +69,7 @@ listeners: the primary (`LLM_RELAY_PORT`) and an auth listener
 (`LLM_RELAY_AUTH_PORT`). Ports listed in `auth.trusted_ports` (see
 `config/auth.example.yaml`) are implicitly trusted: their requests are
 attributed to the `auth.trusted_principal` (default `internal`) with
-`admin`+`cloud` scopes, and need no key. This is how a deployment lets its own
+`admin`+`cloud`+`third_party` scopes, and need no key. This is how a deployment lets its own
 local agents keep working keyless while a reverse proxy routes external traffic
 to the enforced listener. Trust is decided by the LISTENING socket a request
 arrived on, never the peer address: a loopback reverse proxy makes every peer
@@ -107,15 +107,15 @@ providers:
   local-llm:
     type: openai
     base_url: http://127.0.0.1
+    ownership: ciq_owned      # required — see the confidentiality axis
     enabled: true
     poll_interval: 15s
 
-  anthropic:
-    type: anthropic
-    base_url: https://api.anthropic.com
+  example-cloud:
+    type: openai              # the only value; the relay speaks OpenAI-compatible
+    base_url: https://cloud.example.invalid
+    ownership: third_party    # someone else's hardware, on both axes
     enabled: false
-    model_overrides:
-      - claude-3-5-sonnet-20241022
 ```
 
 ### `config/models.yaml`
@@ -171,8 +171,8 @@ policy:
 
   fallback:
     graph:
-      high-quality: [qwen3.5-35b, llama-3.3-70b, claude-3-5-sonnet]
-      fast: [qwen3.5-9b, claude-3-5-haiku]
+      high-quality: [qwen3.5-35b, llama-3.3-70b, example-cloud-large]
+      fast: [qwen3.5-9b, example-cloud-fast]
 ```
 
 ### `config/modes.yaml` (optional)

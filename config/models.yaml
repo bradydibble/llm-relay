@@ -91,18 +91,18 @@ models:
   # Cloud (disabled unless privacy: cloud_ok). No use_cases here — cloud is a
   # last-resort the fallback graph (policy.yaml) appends; tag it into a category
   # only if you want it in that category's normal priority order.
-  claude-3-5-sonnet:
-    provider: anthropic
-    class: cloud-anthropic
+  example-cloud-large:
+    provider: example-cloud
+    class: cloud-example
     context_window: 200000
     capabilities: [tool_use, reasoning, long_context]
     tags: [cloud, high-quality]
     preference: 0.95
     privacy: cloud_ok
 
-  claude-3-5-haiku:
-    provider: anthropic
-    class: cloud-anthropic
+  example-cloud-fast:
+    provider: example-cloud
+    class: cloud-example
     context_window: 200000
     capabilities: [tool_use]
     tags: [cloud, fast]
