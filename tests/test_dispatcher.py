@@ -10,8 +10,8 @@ from llm_relay.routing.selector import ModelSelector, RoutingContext
 
 PROVIDERS = (
     "providers:\n"
-    "  p1:\n    base_url: http://127.0.0.1\n"
-    "  p2:\n    base_url: http://127.0.0.1\n"
+    "  p1:\n    base_url: http://127.0.0.1\n    ownership: ciq_owned\n"
+    "  p2:\n    base_url: http://127.0.0.1\n    ownership: ciq_owned\n"
 )
 MODELS = (
     "models:\n"

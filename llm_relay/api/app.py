@@ -196,6 +196,41 @@ def _clamp_privacy(principal, auth_enabled: bool, hint_headers: dict[str, str]) 
         hint_headers["X-Llm-Relay-Privacy"] = "local_only"
 
 
+def _ownership_value(cfg, provider_name: str) -> str:
+    """Ownership string for *provider_name*, failing closed to ``third_party``
+    when the provider cannot be resolved — mirrors ``ModelSelector._ownership_of``
+    so the discovery surface never advertises a model as safer than routing will
+    actually treat it."""
+    provider = cfg.providers.get(provider_name)
+    return provider.ownership.value if provider else "third_party"
+
+
+def _clamp_confidentiality(principal, auth_enabled: bool, hint_headers: dict[str, str]) -> None:
+    """Confidentiality ceiling: only principals carrying the ``third_party``
+    scope may declare a workload ``non_confidential`` and thereby reach hardware
+    CIQ does not own.
+
+    The declaration itself is the operator's to make — the relay cannot inspect a
+    prompt and decide whether it contains sales data or kernel patches. What it
+    CAN do is bound who is allowed to make the claim at all, so a misconfigured
+    or copy-pasted agent cannot unilaterally route CIQ-proprietary work onto
+    borrowed metal. A caller without the scope is silently clamped back to
+    ``confidential`` (fail-closed) rather than rejected, so an over-broad header
+    degrades to the safe pool instead of breaking the request.
+
+    Trusted-listener traffic (the keyless :8090 tailnet listener) carries the
+    scope implicitly, and with auth disabled the legacy open-deployment
+    behavior is preserved — matching ``_clamp_privacy`` exactly.
+    """
+    if not auth_enabled:
+        return
+    scopes = list(getattr(principal, "scopes", []) or [])
+    if "third_party" in scopes:
+        return
+    if hint_headers.get("X-Llm-Relay-Confidentiality") == "non_confidential":
+        hint_headers["X-Llm-Relay-Confidentiality"] = "confidential"
+
+
 def _resolve_config_dir(config_dir: str | Path | None) -> Path:
     if config_dir:
         return Path(config_dir)
@@ -360,6 +395,13 @@ def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[
             "capabilities": m.capabilities,
             "tags": m.tags,
             "privacy": m.privacy.value,
+            # Who owns the metal this model runs on, inherited from its provider,
+            # plus the consequence a client actually has to act on: a model on
+            # third-party hardware is unreachable unless the request declares the
+            # workload non-confidential. Surfaced so pickers can filter up front
+            # instead of discovering it as a 503.
+            "ownership": _ownership_value(cfg, m.provider),
+            "requires_non_confidential": _ownership_value(cfg, m.provider) != "ciq_owned",
             "port": m.port,
             "path": m.path,
             # Isolated backend: reachable only by exact name, never via alias /
@@ -918,9 +960,14 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
             body = await request.json()
         except Exception:
             raise HTTPException(400, detail="Invalid JSON")
+        # NOTE: this allowlist is the door. A routing header parsed in the router
+        # but missing here is silently dropped and the axis ships inert — that is
+        # exactly how X-Llm-Relay-Candidate-Lane shipped dead. Add the header here
+        # in the same change that parses it, and cover it with a TestClient test.
         hint_headers: dict[str, str] = {}
         for key in (
             "X-Llm-Relay-Privacy",
+            "X-Llm-Relay-Confidentiality",
             "X-Llm-Relay-Require-Tools",
             "X-Llm-Relay-Min-Context",
         ):
@@ -929,6 +976,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 hint_headers[key] = v
         _principal = getattr(request.state, "principal", None)
         _clamp_privacy(_principal, request.app.state.config.auth.enabled, hint_headers)
+        _clamp_confidentiality(_principal, request.app.state.config.auth.enabled, hint_headers)
         user_agent = request.headers.get("user-agent", "")
         # Explicit X-Llm-Relay-Client header wins; else fall back to a configured
         # distinctive User-Agent pattern; else "unknown". The known-client set and
@@ -1268,9 +1316,16 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
         except Exception:
             raise HTTPException(400, detail="Invalid JSON")
         hint_headers = {
-            k: request.headers[k] for k in ("X-Llm-Relay-Privacy",) if k in request.headers
+            k: request.headers[k]
+            for k in ("X-Llm-Relay-Privacy", "X-Llm-Relay-Confidentiality")
+            if k in request.headers
         }
         _clamp_privacy(
+            getattr(request.state, "principal", None),
+            request.app.state.config.auth.enabled,
+            hint_headers,
+        )
+        _clamp_confidentiality(
             getattr(request.state, "principal", None),
             request.app.state.config.auth.enabled,
             hint_headers,

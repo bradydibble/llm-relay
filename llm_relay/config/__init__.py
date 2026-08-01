@@ -3,11 +3,13 @@
 from .loader import ConfigLoader
 from .types import (
     CircuitBreaker,
+    Confidentiality,
     EndpointStatus,
     EndpointState,
     ModelConfig,
     ModelStatus,
     ModelState,
+    Ownership,
     PolicyConfig,
     Privacy,
     ProviderConfig,
@@ -17,11 +19,13 @@ from .types import (
 __all__ = [
     "ConfigLoader",
     "CircuitBreaker",
+    "Confidentiality",
     "EndpointStatus",
     "EndpointState",
     "ModelConfig",
     "ModelStatus",
     "ModelState",
+    "Ownership",
     "PolicyConfig",
     "Privacy",
     "ProviderConfig",

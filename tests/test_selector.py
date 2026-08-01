@@ -537,11 +537,28 @@ def test_explicit_aliases_block_is_ignored_in_favor_of_tags(tmp_path, caplog):
         "an ignored aliases block must warn so a legacy config can migrate"
 
 
+def _write_ciq_owned_providers(tmp_path, *names: str) -> None:
+    """Write a minimal providers.yaml declaring each name as CIQ-owned hardware.
+
+    `ownership` is required on every provider, so a synthetic config that writes
+    only models.yaml now has no resolvable ownership and — by the fail-closed
+    rule in ModelSelector._ownership_of — every model reads as third_party and is
+    dropped for a default (confidential) request. Tests that are not about the
+    confidentiality axis declare CIQ-owned metal here so that axis stays neutral.
+    """
+    body = "providers:\n" + "".join(
+        f"  {n}:\n    type: openai\n    base_url: http://127.0.0.1\n    ownership: ciq_owned\n"
+        for n in names
+    )
+    (tmp_path / "providers.yaml").write_text(body)
+
+
 def test_reasoning_floor_refuses_sub_floor_models(tmp_path):
     """A category with `reasoning_floor` (opt-in, off by default) only admits models
     whose preference clears the floor — the quality gate. A sub-floor model is
     refused even when it's the only thing live (better an honest no-candidate than
     quality below the bar); a model clearing the floor is selected normally."""
+    _write_ciq_owned_providers(tmp_path, "local-llm")
     (tmp_path / "models.yaml").write_text(
         "models:\n"
         "  weak:\n    provider: local-llm\n    port: 8080\n    preference: 0.5\n    use_cases: {smart: 1}\n"
@@ -561,6 +578,7 @@ def test_reasoning_floor_refuses_sub_floor_models(tmp_path):
 def test_no_reasoning_floor_is_open_by_default(tmp_path):
     """Without a reasoning_floor, a category admits any live model in priority order
     — the floor is strictly opt-in."""
+    _write_ciq_owned_providers(tmp_path, "local-llm")
     (tmp_path / "models.yaml").write_text(
         "models:\n"
         "  weak:\n    provider: local-llm\n    port: 8080\n    preference: 0.5\n    use_cases: {smart: 1}\n"

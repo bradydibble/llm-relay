@@ -16,6 +16,7 @@ from .types import (
     ModelConfig,
     ModeConfig,
     ModeHint,
+    Ownership,
     PolicyConfig,
     PrivacyConstraints,
     Privacy,
@@ -138,9 +139,22 @@ class ConfigLoader:
             data = yaml.safe_load(f) or {}
         for name, cfg in (data.get("providers") or {}).items():
             cb = cfg.get("circuit_breaker") or {}
+            # Hardware ownership is REQUIRED — no default. An untagged provider
+            # would otherwise inherit a guess, and guessing "CIQ owns this" about
+            # borrowed metal silently routes confidential workloads onto it. Fail
+            # loudly at load (the relay refuses to start, fixed in seconds) rather
+            # than quietly at request time.
+            if "ownership" not in cfg:
+                raise ValueError(
+                    f"provider {name!r} in {path} is missing required key 'ownership'. "
+                    f"Set 'ownership: ciq_owned' for hardware CIQ fully owns, or "
+                    f"'ownership: third_party' for borrowed/shared/vendor-hosted metal "
+                    f"(which may then serve ONLY workloads declared non-confidential)."
+                )
             self._providers[name] = ProviderConfig(
                 type=ProviderType(cfg.get("type", "openai")),
                 base_url=cfg["base_url"],
+                ownership=Ownership(cfg["ownership"]),
                 enabled=cfg.get("enabled", True),
                 auth_source=cfg.get("auth_source"),
                 health_endpoint=cfg.get("health_endpoint", "/v1/models"),

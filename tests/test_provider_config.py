@@ -21,7 +21,12 @@ def test_loader_max_concurrent_round_trip(tmp_path: Path, yaml_value, expected):
     """Verify max_concurrent loads from providers.yaml and respects defaults."""
     cfg_dir = tmp_path / "cfg"
     cfg_dir.mkdir()
-    provider_cfg = {"type": "openai", "base_url": "http://127.0.0.1", "enabled": True}
+    provider_cfg = {
+        "type": "openai",
+        "base_url": "http://127.0.0.1",
+        "ownership": "ciq_owned",
+        "enabled": True,
+    }
     if yaml_value is not None:
         provider_cfg["max_concurrent"] = yaml_value
     (cfg_dir / "providers.yaml").write_text(yaml.safe_dump({
@@ -46,7 +51,12 @@ def test_loader_slot_wait_timeout_round_trip(tmp_path: Path, yaml_value, expecte
     """Verify slot_wait_timeout loads from providers.yaml and defaults to 30.0."""
     cfg_dir = tmp_path / "cfg"
     cfg_dir.mkdir()
-    provider_cfg = {"type": "openai", "base_url": "http://127.0.0.1", "enabled": True}
+    provider_cfg = {
+        "type": "openai",
+        "base_url": "http://127.0.0.1",
+        "ownership": "ciq_owned",
+        "enabled": True,
+    }
     if yaml_value is not None:
         provider_cfg["slot_wait_timeout"] = yaml_value
     (cfg_dir / "providers.yaml").write_text(yaml.safe_dump({

@@ -31,6 +31,7 @@ def _make_config(tmp_path: Path) -> Path:
             "local-llm": {
                 "type": "openai",
                 "base_url": "http://127.0.0.1",
+                "ownership": "ciq_owned",
                 "enabled": True,
             }
         }
@@ -720,7 +721,7 @@ def _make_ctx_app(tmp_path: Path):
     cfg_dir = tmp_path / "ctxcfg"
     cfg_dir.mkdir()
     (cfg_dir / "providers.yaml").write_text(yaml.safe_dump({
-        "providers": {"local-llm": {"type": "openai", "base_url": "http://127.0.0.1", "enabled": True}}
+        "providers": {"local-llm": {"type": "openai", "base_url": "http://127.0.0.1", "ownership": "ciq_owned", "enabled": True}}
     }))
     (cfg_dir / "models.yaml").write_text(yaml.safe_dump({
         "models": {

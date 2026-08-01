@@ -56,6 +56,32 @@ entirely:
 - **Privacy**: `local_only` (the default) excludes any model with
   `privacy: cloud_ok`. Cross this boundary by setting the
   `X-Llm-Relay-Privacy: cloud_ok` header.
+- **Confidentiality**: `confidential` (the default) excludes every model whose
+  **provider** is `ownership: third_party` — hardware CIQ does not fully own
+  (borrowed lab boxes, vendor-hosted trays). Cross this boundary by setting the
+  `X-Llm-Relay-Confidentiality: non_confidential` header, which asserts the
+  workload carries no CIQ-proprietary material (open-source work: kernel,
+  Warewulf, Ascender base, public codebases).
+
+  Three properties make this a control rather than a suggestion:
+
+  1. **Ownership is a property of the metal, not the weights.** It is declared
+     once per provider in `providers.yaml` and inherited by every model on that
+     host, including runtime-discovered ones. It is a *required* key — the loader
+     refuses to start without it, because an untagged provider would otherwise
+     inherit a guess.
+  2. **It fails closed everywhere.** An absent header, a misspelled value
+     (`non-confidential`, `nonconfidential`), or a model naming a provider that
+     does not exist all resolve to the restrictive answer.
+  3. **The declaration is bounded by the caller's key.** Only principals carrying
+     the `third_party` scope may pass `non_confidential`; others are clamped back
+     to `confidential` (see `_clamp_confidentiality`). The relay cannot read a
+     prompt and judge its sensitivity, but it can bound who is allowed to make
+     the claim, so a misconfigured agent cannot unilaterally route proprietary
+     work onto borrowed metal.
+
+  A request blocked by this axis is **terminal, never retried**, and the 503 names
+  the third-party nodes involved and the header to set.
 - **Tool requirement**: with `X-Llm-Relay-Require-Tools: true`, models without
   `tool_use` in their capabilities are dropped.
 - **Context window**: models whose **live** `context_window` cannot hold the

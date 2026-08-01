@@ -1,10 +1,10 @@
 """Model selection logic: filter, rank, pick."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from ..config.loader import ConfigLoader
-from ..config.types import ModelStatus, Privacy
+from ..config.types import Confidentiality, ModelStatus, Ownership, Privacy
 from ..discovery.manager import DiscoveryManager
 from .keys import compose_backend_key, compose_backend_url, resolve_model_id
 
@@ -51,6 +51,11 @@ class ChainCandidate:
 class RoutingContext:
     requested_model: str
     privacy: Privacy = Privacy.local_only
+    # Caller-declared workload sensitivity. Defaults to `confidential` — the
+    # fail-closed posture — so a request that says nothing can only be served by
+    # hardware CIQ fully owns. Only an explicit, scope-authorized
+    # X-Llm-Relay-Confidentiality: non_confidential unlocks third-party metal.
+    confidentiality: Confidentiality = Confidentiality.confidential
     require_tools: bool = False
     min_context: int | None = None
     # Minimum model `preference` admissible for this request — the reasoning floor
@@ -244,6 +249,24 @@ class ModelSelector:
             # Fallthrough is for aliases only — explicit / host-pinned requests
             # (below) stay deliberately specific.
             members = self.resolve_alias(req)
+            # EXCEPTION — hardware-pin aliases do not fall through. When every
+            # named member is `manual_only`, the alias is not a capability
+            # category ("give me something good at code") but a pin to a specific
+            # tray ("give me whatever is live on amd-dev"). Degrading that to an
+            # unrelated backend answers a question the caller did not ask: they
+            # named hardware and silently got different hardware. Keeping the tail
+            # here would also defeat the confidentiality gate — an undeclared
+            # request for a third-party tray would quietly fall through to a
+            # CIQ-owned model instead of surfacing "declare non_confidential".
+            # Capability aliases (main, daily, code_heavy...) have at least one
+            # non-manual_only member and keep their open tail unchanged.
+            member_cfgs = [
+                self.config.models.models[m]
+                for m in members
+                if m in self.config.models.models
+            ]
+            if member_cfgs and all(c.manual_only for c in member_cfgs):
+                return members, True
             return members + self._fleet_tail(members), True
         # Normalize a host-qualified 'provider:model' id to its bare config name
         # (the provider is validated against the model's configured provider).
@@ -293,6 +316,16 @@ class ModelSelector:
                 continue
             if ctx.privacy == Privacy.local_only and cfg.privacy == Privacy.cloud_ok:
                 continue
+            # Confidentiality gate. A `confidential` workload (the default, and
+            # anything that did not explicitly declare otherwise) may only run on
+            # hardware CIQ fully owns. `non_confidential` widens the pool to
+            # borrowed metal as well — it is a ceiling-raise, never a restriction,
+            # so declaring it never costs you a CIQ-owned backend.
+            if (
+                ctx.confidentiality == Confidentiality.confidential
+                and self._ownership_of(name) != Ownership.ciq_owned
+            ):
+                continue
             if ctx.require_tools and "tool_use" not in cfg.capabilities:
                 continue
             # Reasoning floor (opt-in quality gate): drop models whose preference is
@@ -311,6 +344,22 @@ class ModelSelector:
                 continue
             out.append(name)
         return out
+
+    def _ownership_of(self, model_name: str) -> Ownership:
+        """Ownership of the hardware serving *model_name*, inherited from its
+        provider (ownership is a property of the metal, not of the weights).
+
+        Fails CLOSED: a model with no config entry, or one naming a provider that
+        does not exist, resolves to ``third_party``. A dangling provider reference
+        must never widen the pool a confidential workload can reach.
+        """
+        cfg = self.config.models.models.get(model_name)
+        if cfg is None:
+            return Ownership.third_party
+        provider = self.config.providers.get(cfg.provider)
+        if provider is None:
+            return Ownership.third_party
+        return provider.ownership
 
     def _rank(self, candidates: list[str]) -> list[str]:
         """Deterministic preference sort for the unknown-model branch.
@@ -404,6 +453,76 @@ class ModelSelector:
             "max_available_now": max_live,
             "max_in_catalog": max_catalog,
             "classification": "oversize_for_now" if ctx.min_context <= max_catalog else "oversize_period",
+        }
+
+    def explicit_target(self, ctx: RoutingContext) -> str | None:
+        """The concrete configured model this request NAMES, or ``None`` when the
+        request is an alias, a logical model, or an unknown id.
+
+        Naming a model by exact id is a requirement, not a hint: the caller picked
+        that specific backend for a reason (a benchmark, a capability, a tray).
+        The router uses this to answer "that model is down" plainly instead of
+        emitting a generic no-candidate, which is indistinguishable from "the
+        fleet is busy" and sends callers chasing the wrong fix.
+        """
+        req = ctx.requested_model
+        if self.is_alias(req) or self.is_logical(req):
+            return None
+        resolved = resolve_model_id(self.config.models.models, req)
+        if resolved is not None:
+            req = resolved
+        return req if req in self.config.models.models else None
+
+    def diagnose_confidentiality_block(self, ctx: RoutingContext) -> dict | None:
+        """Explain a no-candidate outcome whose binding constraint is confidentiality.
+
+        Returns a structured, actionable reason when the request WOULD have routed
+        had it declared ``non_confidential`` — i.e. everything able to serve it
+        lives on hardware CIQ does not own. Returns ``None`` when confidentiality
+        is not what is blocking (the caller already declared non_confidential, or
+        the surviving candidates fail some other constraint anyway).
+
+        This distinction matters operationally: "the fleet is busy, retry later"
+        and "you asked for borrowed hardware without stating your work is safe to
+        put there" look identical as an empty chain, but only the first is worth
+        retrying. The second is terminal and needs a human/agent config change, so
+        it must say so plainly rather than hide behind a generic 503.
+        """
+        if ctx.confidentiality != Confidentiality.confidential:
+            return None
+        candidates, _ = self._build_candidates(ctx)
+        admissible = self._apply_constraints(ctx, candidates)
+        if admissible:
+            # Some CIQ-owned model DOES satisfy this request; it is merely down or
+            # paused right now. That is an availability gap the caller should wait
+            # out, not a policy block — reporting it as one would tell them to
+            # relabel a workload when retrying is the correct remedy.
+            return None
+        relaxed = replace(ctx, confidentiality=Confidentiality.non_confidential)
+        would_serve = self._apply_constraints(relaxed, candidates)
+        if not would_serve:
+            return None
+        # Report only what confidentiality actually blocked. `would_serve` is the
+        # relaxed set; anything already admissible under the strict rule was never
+        # blocked by this axis (and `admissible` is empty here anyway, so this is
+        # belt-and-braces against future filter ordering changes).
+        blocked = [m for m in would_serve if m not in set(admissible)]
+        nodes = sorted({
+            self.config.models.models[m].provider
+            for m in blocked
+            if m in self.config.models.models
+        })
+        return {
+            "reason": "confidentiality_requires_declaration",
+            "declared": ctx.confidentiality.value,
+            "blocked_models": blocked,
+            "third_party_nodes": nodes,
+            "remedy": (
+                "This request can only be served by hardware CIQ does not fully own "
+                f"({', '.join(nodes)}). If the workload carries no CIQ-proprietary "
+                "material, send 'X-Llm-Relay-Confidentiality: non_confidential'. "
+                "Otherwise route it to CIQ-owned hardware."
+            ),
         }
 
     def is_transient_no_candidate(self, ctx: RoutingContext) -> bool:

@@ -215,8 +215,14 @@ fits no live model the relay returns 503 with an `oversize_for_now` /
 | Header | Values | Description |
 |--------|--------|-------------|
 | `X-Llm-Relay-Privacy` | `local_only`, `cloud_ok` | Privacy constraint |
+| `X-Llm-Relay-Confidentiality` | `confidential`, `non_confidential` | Workload sensitivity. Defaults to `confidential`, which restricts routing to providers marked `ownership: ciq_owned`. `non_confidential` unlocks third-party hardware and requires the `third_party` key scope. |
 | `X-Llm-Relay-Require-Tools` | `true`, `false` | Require tool_use capability |
 | `X-Llm-Relay-Min-Context` | `131072` | Minimum context window |
+
+> Adding a routing header? It must also be added to the allowlist in
+> `api/app.py` (`hint_headers`) or it is silently dropped before reaching the
+> router and the feature ships inert. Cover it with a test that asserts the
+> header arrives — see `tests/test_confidentiality.py`.
 
 ### Introspection
 

@@ -114,6 +114,35 @@ default upstream may break. Prefer `llm-mode <mode>` or `llm-mode set-default`.
    models are filtered out otherwise — that is intentional.
 5. Restart the relay.
 
+## Adding hardware CIQ does not own
+
+Every provider must declare `ownership`. The loader **raises and the relay
+refuses to start** if one omits it — deliberately, because the alternative is a
+silent default, and a wrong default here routes confidential workloads onto
+borrowed metal without anyone noticing.
+
+```yaml
+providers:
+  nvidia-lab-a:
+    type: openai
+    base_url: http://10.0.0.9
+    ownership: third_party    # borrowed / shared / vendor-hosted
+```
+
+Consequences of `third_party`, all automatic:
+
+- Every model on that provider — including runtime-discovered ones — serves only
+  requests carrying `X-Llm-Relay-Confidentiality: non_confidential`.
+- A `confidential` request that could ONLY be served there gets a terminal 503
+  naming the node and the header to set. It is never silently redirected to a
+  CIQ-owned model, and never given a misleading `Retry-After`.
+- `/v1/available-models` reports `ownership` and `requires_non_confidential` per
+  model so clients can filter before they route.
+
+To let a caller make that declaration, grant their API key the `third_party`
+scope. Without it the header is clamped back to `confidential`, so handing out
+the header alone is not enough — which is the point.
+
 ## When does a change need a restart?
 
 | Change | Restart `llm-relay`? | Restart `llm-mode`? |

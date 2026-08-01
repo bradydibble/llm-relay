@@ -53,3 +53,7 @@ docs/v2-features.md
 
 # Real API keys live off-repo (LLM_RELAY_CONFIG_DIR); never commit the local copy.
 config/api_keys.yaml
+
+# Runtime auth-audit output (written into the config dir by the auth middleware,
+# and by any test run that exercises it). Operational log, not source.
+config/audit.log

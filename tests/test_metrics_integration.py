@@ -22,7 +22,7 @@ def _make_app(tmp_path: Path):
     cfg_dir = tmp_path / "cfg"
     cfg_dir.mkdir()
     (cfg_dir / "providers.yaml").write_text(yaml.safe_dump({
-        "providers": {"local-llm": {"type": "openai", "base_url": "http://127.0.0.1", "enabled": True}}
+        "providers": {"local-llm": {"type": "openai", "base_url": "http://127.0.0.1", "ownership": "ciq_owned", "enabled": True}}
     }))
     (cfg_dir / "models.yaml").write_text(yaml.safe_dump({
         "models": {

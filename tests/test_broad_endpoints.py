@@ -12,7 +12,7 @@ from llm_relay.routing.router import RequestRouter
 
 
 def _write_cfg(tmp_path):
-    (tmp_path / "providers.yaml").write_text("providers:\n  p:\n    base_url: http://127.0.0.1\n")
+    (tmp_path / "providers.yaml").write_text("providers:\n  p:\n    base_url: http://127.0.0.1\n    ownership: ciq_owned\n")
     (tmp_path / "models.yaml").write_text("models:\n  emb:\n    provider: p\n    port: 8000\n")
 
 

@@ -10,7 +10,7 @@ import httpx
 from fastapi import HTTPException
 
 from ..config.loader import ConfigLoader
-from ..config.types import NoBackendAvailableError, Privacy, SaturationError
+from ..config.types import Confidentiality, NoBackendAvailableError, Privacy, SaturationError
 from ..discovery.endpoint import _shared_upstream_bearer
 from ..discovery.manager import DiscoveryManager
 from .keys import compose_backend_key, compose_backend_url
@@ -410,6 +410,7 @@ class RequestRouter:
         ctx = RoutingContext(
             requested_model=request_data.get("model", "") or "",
             privacy=privacy,
+            confidentiality=_parse_confidentiality(headers),
             require_tools=headers.get("X-Llm-Relay-Require-Tools", "false").lower() == "true",
             min_context=max(explicit_min, estimated_min) or None,
             min_preference=quality_floor,
@@ -438,6 +439,47 @@ class RequestRouter:
                 # 400 context_length_exceeded (rendered top-level by the API layer)
                 # so clients auto-compact instead of retrying a 5xx to death.
                 raise _context_length_exceeded_error(shortfall)
+            # Confidentiality is a terminal, actionable block, not an outage: the
+            # only models that could serve this request live on hardware CIQ does
+            # not own, and the caller did not declare the workload safe to put
+            # there. Retrying can never help, so say what to change instead of
+            # emitting a generic "no model matches constraints".
+            conf_block = self.selector.diagnose_confidentiality_block(ctx)
+            if conf_block is not None:
+                detail["error"] = "No model matches confidentiality constraints"
+                detail["confidentiality"] = conf_block
+                raise HTTPException(
+                    status_code=503,
+                    detail=detail,
+                    headers={"X-Llm-Relay-Error": "confidentiality_required"},
+                )
+            # An EXPLICITLY NAMED model that is not live is terminal and says so,
+            # naming the model. Retry-After here would be a guess dressed as a
+            # promise — the relay has no idea whether a pinned backend is 5s from
+            # returning or has been down for a week — and a generic no-candidate
+            # reads as "the fleet is busy", sending callers to fix the wrong thing.
+            # Aliases deliberately keep the transient/Retry-After path below: they
+            # are open over the fleet, so their members coming back genuinely is
+            # the expected remedy, and batch callers rely on that backpressure.
+            named = self.selector.explicit_target(ctx)
+            if named is not None:
+                detail["error"] = f"Requested model '{named}' is not available"
+                detail["named_model"] = {
+                    "model": named,
+                    "status": self.selector.discovery.get_model_state(named).value,
+                    "provider": self.config.models.models[named].provider,
+                    "remedy": (
+                        f"'{named}' was requested by exact name and is not currently "
+                        "serving. The relay does not substitute a different model for "
+                        "an explicitly named one. Bring the backend up, or request a "
+                        "category alias (e.g. 'main') to route over whatever is live."
+                    ),
+                }
+                raise HTTPException(
+                    status_code=503,
+                    detail=detail,
+                    headers={"X-Llm-Relay-Error": "named_model_unavailable"},
+                )
             # Not a context shortfall: if the constraints WOULD be met by a
             # configured model that's merely down/paused right now (a discovery
             # blip or a maintenance pause), the empty chain is a TRANSIENT
@@ -672,7 +714,11 @@ class RequestRouter:
         headers = headers or {}
         privacy_str = headers.get("X-Llm-Relay-Privacy", "local_only")
         privacy = Privacy(privacy_str if privacy_str in ("local_only", "cloud_ok") else "local_only")
-        ctx = RoutingContext(requested_model=request_data.get("model", "") or "", privacy=privacy)
+        ctx = RoutingContext(
+            requested_model=request_data.get("model", "") or "",
+            privacy=privacy,
+            confidentiality=_parse_confidentiality(headers),
+        )
         candidates = self.selector.select_chain(ctx)
         if not candidates:
             raise HTTPException(
@@ -722,6 +768,22 @@ class RequestRouter:
         raise HTTPException(status_code=503, detail={"error": "No model matches constraints"})
 
 
+def _parse_confidentiality(headers: dict) -> Confidentiality:
+    """Parse the caller's workload-sensitivity declaration. Fails CLOSED.
+
+    Only the exact token ``non_confidential`` opts a request into third-party
+    hardware. Absent, empty, misspelled, or unrecognized values all resolve to
+    ``confidential``. A data-governance control must never widen the hardware
+    pool because of a typo — the quiet failure has to be the safe one.
+    """
+    raw = (headers.get("X-Llm-Relay-Confidentiality") or "").strip().lower()
+    return (
+        Confidentiality.non_confidential
+        if raw == Confidentiality.non_confidential.value
+        else Confidentiality.confidential
+    )
+
+
 def _candidate_to_route_result(candidate: ChainCandidate, ctx: RoutingContext) -> RouteResult:
     """Build a ``RouteResult`` from a ``ChainCandidate`` for telemetry/response headers."""
     return RouteResult(
@@ -742,6 +804,7 @@ def _candidate_to_route_result(candidate: ChainCandidate, ctx: RoutingContext) -
             "candidates": ctx.candidates,
             "ranked": ctx.ranked[:5],
             "privacy": ctx.privacy.value,
+            "confidentiality": ctx.confidentiality.value,
             # quant is chosen as a side effect of preference (quality) ordering
             # among variants, not an independent cost axis -- see plan 3.
             "trace": "highest-preference variant meeting constraints",

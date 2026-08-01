@@ -193,8 +193,8 @@ def test_loader_parses_discover_ports(tmp_path):
     defaults to an empty list)."""
     (tmp_path / "providers.yaml").write_text(
         "providers:\n"
-        "  local-llm:\n    type: openai\n    base_url: http://127.0.0.1\n    discover_ports: [9001, 9002]\n"
-        "  other:\n    type: openai\n    base_url: http://127.0.0.1\n"
+        "  local-llm:\n    type: openai\n    base_url: http://127.0.0.1\n    ownership: ciq_owned\n    discover_ports: [9001, 9002]\n"
+        "  other:\n    type: openai\n    base_url: http://127.0.0.1\n    ownership: ciq_owned\n"
     )
     c = ConfigLoader(config_dir=tmp_path)
     c.load()
@@ -215,6 +215,7 @@ async def test_lifespan_registers_discover_backend_and_reconcile_task(tmp_path):
         "  local-llm:\n"
         "    type: openai\n"
         "    base_url: http://127.0.0.1\n"
+        "    ownership: ciq_owned\n"
         "    enabled: true\n"
         "    poll_interval: 30s\n"
         "    discover_ports: [9101]\n"

@@ -15,6 +15,47 @@ class Privacy(str, Enum):
     cloud_ok = "cloud_ok"
 
 
+class Confidentiality(str, Enum):
+    """Workload sensitivity, declared by the CALLER on each request.
+
+    ``confidential`` is the DEFAULT and is fail-closed: assume the workload may
+    carry CIQ-proprietary material (sales data, Fathom transcripts, Slack,
+    closed-source code — Fuzzball, Ledger Pro, ELLM, build/automation tooling),
+    so it may only be served by hardware CIQ fully owns.
+
+    ``non_confidential`` is an explicit caller assertion that the workload is
+    safe to run on metal CIQ does not own — open-source work (kernel, Warewulf,
+    Ascender base, public codebases). This is NEVER inferred: an absent or
+    unparseable header means ``confidential``. The onus is on the agent operator
+    to declare it, and the declaration is clamped against the caller's API-key
+    scopes (see ``api.app._clamp_confidentiality``).
+    """
+
+    confidential = "confidential"
+    non_confidential = "non_confidential"
+
+
+class Ownership(str, Enum):
+    """Who owns the physical hardware behind a provider.
+
+    ``ciq_owned`` — CIQ controls the machine end to end (llama-01, ciq-l4,
+    ciq-mi100). Any workload may run there, confidential or not.
+
+    ``third_party`` — borrowed, shared, or vendor-hosted metal (amd-dev, the
+    NVIDIA lab). ONLY workloads explicitly declared ``non_confidential`` may be
+    routed here.
+
+    Deliberately has NO default: ``providers.yaml`` must state ownership for
+    every provider and the loader raises if one omits it. A forgotten tag on
+    newly-added borrowed hardware would silently route confidential work onto
+    it, so this fails loudly at config load (relay refuses to start, recoverable
+    in seconds) rather than quietly at request time (a data leak, which is not).
+    """
+
+    ciq_owned = "ciq_owned"
+    third_party = "third_party"
+
+
 class ModelStatus(str, Enum):
     available = "available"
     degraded = "degraded"
@@ -39,6 +80,11 @@ class CircuitBreaker:
 class ProviderConfig:
     type: ProviderType
     base_url: str
+    # Who owns the metal behind this provider. Gates the confidentiality axis:
+    # a `confidential` request (the default) is never routed to a `third_party`
+    # provider. Required in providers.yaml — see Ownership for why there is no
+    # default.
+    ownership: Ownership
     enabled: bool = True
     auth_source: str | None = None
     health_endpoint: str = "/v1/models"

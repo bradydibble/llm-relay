@@ -94,7 +94,7 @@ def _make_cfg(tmp_path: Path) -> Path:
     cfg_dir = tmp_path / "cfg"
     cfg_dir.mkdir()
     (cfg_dir / "providers.yaml").write_text(yaml.safe_dump({
-        "providers": {"local-llm": {"type": "openai", "base_url": "http://127.0.0.1", "enabled": True}}
+        "providers": {"local-llm": {"type": "openai", "base_url": "http://127.0.0.1", "ownership": "ciq_owned", "enabled": True}}
     }))
     (cfg_dir / "models.yaml").write_text(yaml.safe_dump({
         "models": {
@@ -212,7 +212,7 @@ async def test_reasoning_model_floors_small_max_tokens(tmp_path, monkeypatch):
     cfg_dir = tmp_path / "cfg"
     cfg_dir.mkdir()
     (cfg_dir / "providers.yaml").write_text(yaml.safe_dump({
-        "providers": {"local-llm": {"type": "openai", "base_url": "http://127.0.0.1", "enabled": True}}
+        "providers": {"local-llm": {"type": "openai", "base_url": "http://127.0.0.1", "ownership": "ciq_owned", "enabled": True}}
     }))
     (cfg_dir / "models.yaml").write_text(yaml.safe_dump({
         "models": {

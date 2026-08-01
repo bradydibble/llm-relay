@@ -172,6 +172,7 @@ def _make_minimal_config(tmp_path: Path) -> Path:
             "local-llm": {
                 "type": "openai",
                 "base_url": "http://127.0.0.1",
+                "ownership": "ciq_owned",
                 "enabled": True,
                 "max_concurrent": 1,
                 "slot_wait_timeout": 5.0,

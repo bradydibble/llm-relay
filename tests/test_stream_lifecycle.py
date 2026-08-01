@@ -144,7 +144,7 @@ def _make_minimal_config(tmp_path: Path) -> Path:
     cfg_dir.mkdir()
     (cfg_dir / "providers.yaml").write_text(yaml.safe_dump({
         "providers": {
-            "local-llm": {"type": "openai", "base_url": "http://127.0.0.1", "enabled": True},
+            "local-llm": {"type": "openai", "base_url": "http://127.0.0.1", "ownership": "ciq_owned", "enabled": True},
         }
     }))
     (cfg_dir / "models.yaml").write_text(yaml.safe_dump({

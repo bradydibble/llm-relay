@@ -8,7 +8,7 @@ from llm_relay.api.app import create_app
 
 def _write_cfg(tmp_path):
     (tmp_path / "providers.yaml").write_text(
-        "providers:\n  p:\n    base_url: http://127.0.0.1\n"
+        "providers:\n  p:\n    base_url: http://127.0.0.1\n    ownership: ciq_owned\n"
     )
     (tmp_path / "models.yaml").write_text(
         "models:\n"

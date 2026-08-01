@@ -6,11 +6,25 @@
 #     export LLM_RELAY_CONFIG_DIR=/path/to/your/private/llm-relay/config
 #
 # Each provider is a host. Per-model ports/paths live in models.yaml.
+#
+# `ownership` is REQUIRED on every provider — the loader refuses to start
+# without it. It declares who owns the physical hardware:
+#
+#   ciq_owned    — you control the machine end to end. Any workload may run
+#                  there, confidential or not.
+#   third_party  — borrowed, shared, or vendor-hosted metal. Serves ONLY
+#                  requests that explicitly declare
+#                  `X-Llm-Relay-Confidentiality: non_confidential`.
+#
+# There is deliberately no default: an untagged provider would inherit a guess,
+# and guessing "we own this" about borrowed hardware silently routes
+# confidential work onto it.
 
 providers:
   local-llm:
     type: openai
     base_url: http://127.0.0.1
+    ownership: ciq_owned
     enabled: true
     health_endpoint: /v1/models
     poll_interval: 15s
@@ -22,6 +36,9 @@ providers:
   anthropic:
     type: anthropic
     base_url: https://api.anthropic.com
+    # Vendor-hosted inference — not your hardware. Reaching it therefore needs
+    # BOTH `privacy: cloud_ok` and a `non_confidential` declaration.
+    ownership: third_party
     enabled: false
     auth_source: vault
     model_overrides:
