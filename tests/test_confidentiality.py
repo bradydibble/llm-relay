@@ -373,3 +373,31 @@ async def test_absent_header_leaves_router_at_confidential_default(tmp_path, mon
     seen = await _captured_headers_for(tmp_path, monkeypatch, {})
     assert "X-Llm-Relay-Confidentiality" not in seen
     assert _parse_confidentiality(seen) is Confidentiality.confidential
+
+
+def test_trusted_listener_principal_carries_third_party_scope():
+    """The keyless trusted listener (:8090) is the deployment's own local
+    consumer — on-box and tailnet agents. It could reach the MI300X tray before
+    this axis existed and must still be able to. Without `third_party` in the
+    trusted principal's scopes, _clamp_confidentiality would silently revoke that
+    for every on-box agent, which looks exactly like the tray being down.
+    """
+    from llm_relay.api.middleware import AuthMiddleware  # noqa: F401  (import guard)
+    from llm_relay.auth import Principal
+
+    # Mirrors the construction in AuthMiddleware for a trusted port.
+    trusted = Principal(id="internal", scopes=["admin", "cloud", "third_party"])
+    h = {"X-Llm-Relay-Confidentiality": "non_confidential"}
+    _clamp_confidentiality(trusted, True, h)
+    assert h["X-Llm-Relay-Confidentiality"] == "non_confidential"
+
+
+def test_trusted_scope_list_in_middleware_includes_third_party():
+    """Pin the actual source list, not a copy of it — this is the line that would
+    regress if someone edits the trusted-principal scopes."""
+    import inspect
+
+    from llm_relay.api import middleware
+
+    src = inspect.getsource(middleware.AuthMiddleware.__call__)
+    assert '"third_party"' in src, "trusted listener must grant third_party scope"

@@ -15,8 +15,11 @@ Trust model (see also the README security model):
 - LISTENER based instead: requests arriving on a port listed in
   ``auth.trusted_ports`` (the local socket they connected to, from
   ``scope["server"]``) are implicitly the deployment's own local consumers.
-  They are attributed to ``auth.trusted_principal`` with admin+cloud scopes.
-  Bind trusted ports to loopback and never route external traffic to them.
+  They are attributed to ``auth.trusted_principal`` with admin+cloud+third_party
+  scopes — the deployment's own local consumers are fully privileged, including
+  the ability to declare a workload non-confidential and reach hardware CIQ does
+  not own. Bind trusted ports to loopback and never route external traffic to
+  them: that binding IS the access control for these scopes.
 - Every other listener enforces a key, and the ``admin`` scope gates
   ``/admin/*`` and ``/logs*`` (fleet-wide operator surfaces).
 """
@@ -53,7 +56,11 @@ class AuthMiddleware:
             state["principal"] = Principal(
                 id=cfg.trusted_principal,
                 priority_weight=1.0,
-                scopes=["admin", "cloud"],
+                # `third_party` keeps on-box/tailnet agents able to reach the
+                # MI300X tray as they could before the confidentiality axis
+                # existed. Omitting it here would have silently revoked that
+                # access for every trusted-listener consumer.
+                scopes=["admin", "cloud", "third_party"],
             )
             await self.app(scope, receive, send)
             return
