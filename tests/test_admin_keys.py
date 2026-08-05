@@ -67,3 +67,48 @@ def test_admin_keys_denied_without_admin_scope(app_two_listeners):
 def test_revoke_unknown_prefix_404(app_two_listeners):
     c = _client(app_two_listeners, 8091)
     assert c.delete("/admin/keys/ffffffffffff", headers=ADMIN).status_code == 404
+
+
+def test_admin_can_patch_scopes(app_two_listeners):
+    c = _client(app_two_listeners, 8091)
+    c.post("/admin/keys", json={"id": "patchable"}, headers=ADMIN)
+    listing = c.get("/admin/keys", headers=ADMIN).json()["keys"]
+    target = next(k for k in listing if k["id"] == "patchable")
+    r = c.patch(f"/admin/keys/{target['hash_prefix']}",
+                json={"scopes": ["third_party"]}, headers=ADMIN)
+    assert r.status_code == 200
+    assert r.json()["scopes"] == ["third_party"]
+    updated = next(k for k in c.get("/admin/keys", headers=ADMIN).json()["keys"]
+                   if k["id"] == "patchable")
+    assert updated["scopes"] == ["third_party"]
+
+
+def test_admin_patch_can_clear_scopes(app_two_listeners):
+    c = _client(app_two_listeners, 8091)
+    c.post("/admin/keys", json={"id": "clearable"}, headers=ADMIN)
+    listing = c.get("/admin/keys", headers=ADMIN).json()["keys"]
+    target = next(k for k in listing if k["id"] == "clearable")
+    c.patch(f"/admin/keys/{target['hash_prefix']}", json={"scopes": ["third_party"]}, headers=ADMIN)
+    r = c.patch(f"/admin/keys/{target['hash_prefix']}", json={"scopes": []}, headers=ADMIN)
+    assert r.status_code == 200
+    assert r.json()["scopes"] == []
+
+
+def test_admin_patch_refuses_admin_scope(app_two_listeners):
+    c = _client(app_two_listeners, 8091)
+    c.post("/admin/keys", json={"id": "target"}, headers=ADMIN)
+    listing = c.get("/admin/keys", headers=ADMIN).json()["keys"]
+    target = next(k for k in listing if k["id"] == "target")
+    r = c.patch(f"/admin/keys/{target['hash_prefix']}", json={"scopes": ["admin"]}, headers=ADMIN)
+    assert r.status_code == 400
+
+
+def test_patch_unknown_prefix_404(app_two_listeners):
+    c = _client(app_two_listeners, 8091)
+    assert c.patch("/admin/keys/ffffffffffff", json={"scopes": []}, headers=ADMIN).status_code == 404
+
+
+def test_patch_denied_without_admin_scope(app_two_listeners):
+    c = _client(app_two_listeners, 8091)
+    assert c.patch("/admin/keys/abc", json={"scopes": []},
+                   headers={"Authorization": "Bearer llmr_plain"}).status_code == 403
