@@ -874,7 +874,13 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
     # only via the on-box CLI, so a leaked admin key can manage users but
     # cannot quietly create more admins.
     from ..audit import audit as _audit
-    from ..auth import add_key_record, load_key_records, load_keys as _load_keys, revoke_hash
+    from ..auth import (
+        add_key_record,
+        load_key_records,
+        load_keys as _load_keys,
+        revoke_hash,
+        update_key_scopes,
+    )
 
     _keys_path = cfg_path / "api_keys.yaml"
 
@@ -922,6 +928,24 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
         _reload_principals()
         _audit("key_revoked", hash_prefix=hash_prefix, by=_acting(request))
         return {"revoked": n}
+
+    @app.patch("/admin/keys/{hash_prefix}")
+    async def admin_keys_scopes(hash_prefix: str, request: Request) -> dict[str, Any]:
+        """Replace the scopes on an existing key. Mirrors the mint restriction:
+        the ``admin`` scope is not grantable over HTTP, so a leaked admin key
+        can manage users but cannot quietly create more admins."""
+        body = await request.json()
+        scopes = list(body.get("scopes") or [])
+        if "admin" in scopes:
+            raise HTTPException(400, detail="admin scope is grantable only via the on-box CLI")
+        n = update_key_scopes(_keys_path, hash_prefix, scopes)
+        if n == 0:
+            raise HTTPException(404, detail="no key matches that prefix")
+        if n == -1:
+            raise HTTPException(409, detail="prefix ambiguous; use a longer one")
+        _reload_principals()
+        _audit("key_scopes", hash_prefix=hash_prefix, scopes=scopes, by=_acting(request))
+        return {"hash_prefix": hash_prefix, "scopes": scopes}
 
     @app.get("/routing-table")
     async def routing_table(request: Request) -> dict[str, list[str]]:

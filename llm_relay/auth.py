@@ -216,3 +216,18 @@ def revoke_hash(path: Path, hash_prefix: str) -> int:
     del records[matches[0]]
     write_key_records(path, records)
     return 1
+
+
+def update_key_scopes(path: Path, hash_prefix: str, scopes: list[str]) -> int:
+    """Replace the scopes on the single key whose hash starts with
+    ``hash_prefix``. Returns 1 on success, 0 when nothing matches, -1 when
+    the prefix is ambiguous (empty or matching more than one key)."""
+    records = load_key_records(path)
+    matches = [h for h in records if h.startswith(hash_prefix)]
+    if not hash_prefix or len(matches) > 1:
+        return -1
+    if not matches:
+        return 0
+    records[matches[0]]["scopes"] = list(scopes)
+    write_key_records(path, records)
+    return 1
