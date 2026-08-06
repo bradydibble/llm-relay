@@ -321,6 +321,16 @@ class DiscoveryManager:
                 if client.state.status == EndpointStatus.degraded:
                     return ModelStatus.degraded
                 return ModelStatus.unavailable
+            # A configured model is pinned to this exact backend (provider +
+            # port + path).  Do not let a similarly-named model on another
+            # backend make it appear available: for example, ``model-x`` on
+            # provider-a must not fuzzy-match ``model-x-optimized`` on
+            # provider-b.  Apart from lying to status consumers, that would
+            # select the configured
+            # backend even though it is serving a different model.
+            return ModelStatus.unavailable
+        # Unmapped names are runtime/discovery-only, so searching the reported
+        # model ids is the only way to resolve them.
         for client in self.clients.values():
             if self._serves(client, model_name):
                 if client.state.status == EndpointStatus.healthy:

@@ -212,6 +212,32 @@ def test_get_model_state_unavailable_when_serving_an_unrelated_model():
     assert disc.get_model_state("model-x") == ModelStatus.unavailable
 
 
+def test_get_model_state_does_not_fuzzy_match_a_different_backend():
+    """A configured model's assigned backend is authoritative.
+
+    The shorter model id must not become available merely because another
+    provider reports a longer id containing it.
+    """
+    disc = DiscoveryManager()
+    disc.clients["provider-a:8000"] = EndpointClient(
+        provider_name="provider-a",
+        base_url="http://127.0.0.1:8000",
+        state=EndpointState(
+            provider="provider-a", status=EndpointStatus.healthy, models=["model-y"]
+        ),
+    )
+    disc.clients["provider-b:8001"] = EndpointClient(
+        provider_name="provider-b",
+        base_url="http://127.0.0.1:8001",
+        state=EndpointState(
+            provider="provider-b", status=EndpointStatus.healthy, models=["model-x-optimized"]
+        ),
+    )
+    disc.model_to_client["model-x"] = "provider-a:8000"
+
+    assert disc.get_model_state("model-x") == ModelStatus.unavailable
+
+
 def test_loader_parses_served_model_name(tmp_path):
     """models.yaml `served_model_name` is parsed onto ModelConfig."""
     (tmp_path / "models.yaml").write_text(
