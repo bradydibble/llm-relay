@@ -1,9 +1,14 @@
 """MCP is served at exactly /mcp (no doubled /mcp/mcp)."""
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from llm_relay.api.app import create_app
+
+# The MCP SDK is optional. The CI matrix deliberately runs both without and
+# with the extra, so this transport-specific test only applies to the latter.
+pytest.importorskip("mcp")
 
 _HDRS = {
     "accept": "application/json, text/event-stream",
