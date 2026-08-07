@@ -51,9 +51,50 @@ llm-relay route qwen3.5-35b --privacy cloud_ok
 
 ## Security model
 
-llm-relay has **no inbound authentication** and binds to **`127.0.0.1`** by default (override with `--host` / `LLM_RELAY_HOST`). It is built for a trusted local network: any client that can reach the port can call `/v1/chat/completions` (proxying your backends and the shared upstream key the relay holds), and can read your backend topology through `/status`, `/metrics`, and `/v1/available-models`.
+llm-relay supports per-user **API-key authentication**, off by default. Enable it
+with `LLM_RELAY_AUTH=1` (or an `auth.enabled: true` block in `auth.yaml`). When
+enabled, every request to a non-exempt path must present a key via
+`Authorization: Bearer <key>` or `X-API-Key: <key>`. Only `/health` is exempt by
+default (configurable via `auth.exempt_paths`), and it returns a minimal body so
+it leaks no topology; give a remote Prometheus a key, or scrape a trusted
+listener (below). Mint and manage keys with `llm-relay keys add|list|revoke`
+(`revoke` takes a principal id or `--hash <prefix>` for single-key rotation, and
+`list` shows created dates and notes); keys are stored **hashed** (sha256) in
+`api_keys.yaml` in your config dir, which should live outside the repo and never
+be committed (the repo ships only `config/api_keys.example.yaml`). Each key maps
+to a principal carrying a priority weight (used by the scheduler) and scopes.
 
-If you bind it to a routable interface, put authentication in front of it — a reverse proxy, network policy, or firewall. Otherwise you have published an open proxy to your models and a map of your backends.
+**Dual-listener deployments.** One relay process can serve two loopback
+listeners: the primary (`LLM_RELAY_PORT`) and an auth listener
+(`LLM_RELAY_AUTH_PORT`). Ports listed in `auth.trusted_ports` (see
+`config/auth.example.yaml`) are implicitly trusted: their requests are
+attributed to the `auth.trusted_principal` (default `internal`) with
+`admin`+`cloud`+`third_party` scopes, and need no key. This is how a deployment lets its own
+local agents keep working keyless while a reverse proxy routes external traffic
+to the enforced listener. Trust is decided by the LISTENING socket a request
+arrived on, never the peer address: a loopback reverse proxy makes every peer
+look local, but it cannot change which port it connected to. Fail-closed: the
+auth listener refuses to start while the key store has no enabled key.
+
+**Scopes.** `admin` gates `/admin/*` (including `/admin/keys` mint/list/revoke)
+and `/logs*`. Keys minted over the HTTP API are always scope-less; scoped keys
+(admin, cloud) are mintable only via the on-box CLI, so a leaked admin key
+cannot create more admins. `cloud` is the privacy ceiling: without it, a
+request's `X-Llm-Relay-Privacy: cloud_ok` hint is clamped to `local_only`, so
+unscoped callers can never route to a cloud provider even when one is enabled.
+Async jobs are principal-scoped (you can fetch/cancel only your own), and the
+request/token metrics carry a `principal` label. Auth failures increment
+`llm_relay_auth_failures_total` and, like key mints/revokes and admin actions,
+append to a JSON-lines audit log (`LLM_RELAY_AUDIT_LOG`, default
+`<config dir>/audit.log`).
+
+With auth **disabled** (the default), llm-relay has no inbound authentication and
+binds to `127.0.0.1` (override with `--host` / `LLM_RELAY_HOST`). In that mode any
+client that can reach the port can call `/v1/chat/completions` (proxying your
+backends and the shared upstream key the relay holds) and read your backend
+topology through `/status` and `/v1/available-models`. If you bind it to a routable
+interface, enable auth or put authentication in front of it (a reverse proxy,
+network policy, or firewall).
 
 ## Configuration
 
@@ -66,15 +107,15 @@ providers:
   local-llm:
     type: openai
     base_url: http://127.0.0.1
+    ownership: ciq_owned      # required — see the confidentiality axis
     enabled: true
     poll_interval: 15s
 
-  anthropic:
-    type: anthropic
-    base_url: https://api.anthropic.com
+  example-cloud:
+    type: openai              # the only value; the relay speaks OpenAI-compatible
+    base_url: https://cloud.example.invalid
+    ownership: third_party    # someone else's hardware, on both axes
     enabled: false
-    model_overrides:
-      - claude-3-5-sonnet-20241022
 ```
 
 ### `config/models.yaml`
@@ -130,8 +171,8 @@ policy:
 
   fallback:
     graph:
-      high-quality: [qwen3.5-35b, llama-3.3-70b, claude-3-5-sonnet]
-      fast: [qwen3.5-9b, claude-3-5-haiku]
+      high-quality: [qwen3.5-35b, llama-3.3-70b, example-cloud-large]
+      fast: [qwen3.5-9b, example-cloud-fast]
 ```
 
 ### `config/modes.yaml` (optional)
@@ -174,8 +215,14 @@ fits no live model the relay returns 503 with an `oversize_for_now` /
 | Header | Values | Description |
 |--------|--------|-------------|
 | `X-Llm-Relay-Privacy` | `local_only`, `cloud_ok` | Privacy constraint |
+| `X-Llm-Relay-Confidentiality` | `confidential`, `non_confidential` | Workload sensitivity. Defaults to `confidential`, which restricts routing to providers marked `ownership: ciq_owned`. `non_confidential` unlocks third-party hardware and requires the `third_party` key scope. |
 | `X-Llm-Relay-Require-Tools` | `true`, `false` | Require tool_use capability |
 | `X-Llm-Relay-Min-Context` | `131072` | Minimum context window |
+
+> Adding a routing header? It must also be added to the allowlist in
+> `api/app.py` (`hint_headers`) or it is silently dropped before reaching the
+> router and the feature ships inert. Cover it with a test that asserts the
+> header arrives — see `tests/test_confidentiality.py`.
 
 ### Introspection
 

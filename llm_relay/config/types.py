@@ -6,13 +6,87 @@ from enum import Enum
 
 
 class ProviderType(str, Enum):
+    """Wire protocol a provider speaks.
+
+    Only ``openai`` exists: the relay forwards OpenAI-compatible chat-completions
+    and nothing in the codebase branches on this value. An ``anthropic`` member
+    was removed 2026-07-31 along with the Anthropic provider — it was decorative
+    (an anthropic-typed provider was forwarded as OpenAI chat-completions anyway),
+    and dropping it makes the policy structural: this gateway serves CIQ-operated
+    inference, so reintroducing a vendor cloud is a code change and a review, not
+    a config edit. `ProviderType("anthropic")` now raises at load.
+    """
+
     openai = "openai"
-    anthropic = "anthropic"
 
 
 class Privacy(str, Enum):
     local_only = "local_only"
     cloud_ok = "cloud_ok"
+
+
+class Confidentiality(str, Enum):
+    """Workload sensitivity, declared by the CALLER on each request.
+
+    SCOPE — this axis answers exactly one question: *may this workload run on a
+    machine CIQ does not control?* It is a HARDWARE-CUSTODY control, not a
+    general data-sensitivity policy. The relay's whole remit is CIQ-operated
+    inference (our own open-weight models on our own or borrowed metal), so that
+    is the only risk it can speak to: on borrowed hardware the box operator can
+    observe or retain anything, and no contract governs them.
+
+    It says NOTHING about sending data to a contracted vendor's inference API.
+    That is a different risk model entirely — governed by commercial agreement,
+    compliance obligations, and company authorization rather than by who racks
+    the machine — and it is deliberately out of this relay's scope. Do not
+    generalize this enum into a "can this data leave CIQ" flag.
+
+    ``confidential`` is the DEFAULT and is fail-closed: assume the workload may
+    carry CIQ-proprietary material (sales data, Fathom transcripts, Slack,
+    closed-source code — Fuzzball, Ledger Pro, ELLM, build/automation tooling),
+    so it may only run on hardware CIQ fully owns.
+
+    ``non_confidential`` is an explicit caller assertion that the workload is
+    safe to run on metal CIQ does not own — open-source work (kernel, Warewulf,
+    Ascender base, public codebases). This is NEVER inferred: an absent or
+    unparseable header means ``confidential``. The onus is on the agent operator
+    to declare it, and the declaration is clamped against the caller's API-key
+    scopes (see ``api.app._clamp_confidentiality``).
+    """
+
+    confidential = "confidential"
+    non_confidential = "non_confidential"
+
+
+class Ownership(str, Enum):
+    """Who physically controls the machine a provider's models run on.
+
+    Every provider here is CIQ-operated inference — our own models, served by us.
+    The only variable is whose rack the GPU sits in.
+
+    ``ciq_owned`` — CIQ controls the machine end to end (llama-01, ciq-l4,
+    ciq-mi100). Any workload may run there, confidential or not.
+
+    ``third_party`` — borrowed or shared metal we run our own models on
+    (amd-dev, the NVIDIA lab). We control the software; someone else controls
+    the machine, and no agreement binds what they may observe or retain. ONLY
+    workloads explicitly declared ``non_confidential`` may be routed here.
+
+    NOT what this means: a contracted vendor's inference API (Anthropic, OpenAI).
+    Those are a different trust model — the counterparty carries compliance and
+    contractual obligations — and the relay does not proxy them at all. Access to
+    vendor inference is a company-authorization question handled in the client
+    harness, not an ``Ownership`` value.
+
+    Deliberately has NO default: ``providers.yaml`` must state ownership for
+    every provider and the loader raises if one omits it. A forgotten tag on
+    newly-added borrowed hardware would silently route confidential work onto
+    it, so this fails loudly at config load (relay refuses to start, recoverable
+    in seconds) rather than quietly at request time (a data leak, which is not).
+    """
+
+    ciq_owned = "ciq_owned"
+    third_party = "third_party"
 
 
 class ModelStatus(str, Enum):
@@ -39,6 +113,11 @@ class CircuitBreaker:
 class ProviderConfig:
     type: ProviderType
     base_url: str
+    # Who owns the metal behind this provider. Gates the confidentiality axis:
+    # a `confidential` request (the default) is never routed to a `third_party`
+    # provider. Required in providers.yaml — see Ownership for why there is no
+    # default.
+    ownership: Ownership
     enabled: bool = True
     auth_source: str | None = None
     health_endpoint: str = "/v1/models"
@@ -48,6 +127,11 @@ class ProviderConfig:
     model_overrides: list[str] = field(default_factory=list)
     max_concurrent: int | None = None
     slot_wait_timeout: float = 30.0
+    # Extra ports to poll for models that have NO models.yaml entry. Anything a
+    # backend on one of these ports reports in /v1/models is auto-discovered and
+    # made name-routable (see api.app._reconcile_discovered) — for ad-hoc / bake-off
+    # models on unmanaged ports that would otherwise make the host read "down".
+    discover_ports: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -79,6 +163,26 @@ class ModelConfig:
     # the request's candidate-lane matches AND is one of 'interactive'/'batch'. An
     # empty or unset value means the model is open to both lanes (default behavior).
     candidate_lane: str | None = None
+    # Set on a runtime-discovered model (found on a provider's discover_ports, not
+    # in models.yaml). Name-routable only (carries manual_only=True), never
+    # persisted, and dropped from the registry when its port stops reporting it.
+    discovered: bool = False
+    # Variant grouping (plan 2): the logical model this entry is one variant of
+    # (e.g. `qwen3-14b` for an AWQ-on-L4 and a Q4-on-MI100 entry), and this
+    # variant's precision. Both optional; an entry with no `logical` is a
+    # standalone model. Additive: routing still keys on the concrete entry until
+    # the dispatcher (plan 3) consumes logical models.
+    logical: str | None = None
+    quant: str | None = None
+    # Request filters (plan 5): keys to strip from, and key/values to set on, the
+    # request before it is forwarded to this model's upstream (normalize sampling
+    # defaults, drop fields a backend rejects). Empty = no rewrite.
+    strip_params: list[str] = field(default_factory=list)
+    set_params: dict = field(default_factory=dict)
+    # Human-facing one-liner ("what is this model good for") surfaced through
+    # /v1/models, /v1/available-models, and the MCP list_models tool so clients
+    # and coworkers can pick by description, not just by name.
+    description: str | None = None
 
 
 @dataclass

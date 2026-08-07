@@ -1,9 +1,11 @@
 """FastAPI application for llm-relay."""
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -14,11 +16,10 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from ..config.loader import ConfigLoader
-from ..config.types import NoBackendAvailableError, SaturationError
+from ..config.types import ModelConfig, ModelStatus, NoBackendAvailableError, Privacy, SaturationError
 from ..discovery.manager import DiscoveryManager
 from ..routing.keys import compose_backend_key, compose_model_id, resolve_model_id
-from ..routing.router import RequestRouter
-from ..routing.selector import ModelSelector, RoutingContext
+from ..routing.router import ContextLengthExceededError, RequestRouter
 from .instrumentation import (
     _classify_stream_outcome,
     emit_chat_completion,
@@ -26,11 +27,208 @@ from .instrumentation import (
     sse_finished,
 )
 from ..metrics import configure_clients_from_env, did_fall_back, metrics_enabled, register_discovery_collector, render_exposition, resolve_client, set_known_routable
+from ..logbuffer import install_log_buffer
+from ..scheduler import AdmissionController
+from ..jobs import JobStore
+from ..jobworker import run_worker
+
+
+_KEEPALIVE_INTERVAL_S = 15.0
+
+
+def _mirror_reasoning(payload: dict) -> bool:
+    """Normalize reasoning field names so EITHER `reasoning` or `reasoning_content`
+    is always present on each choice (`message` for non-stream, `delta` for stream).
+
+    Why this lives in the relay and NOT in the serve (deliberate, durable):
+    vLLM RENAMED the field `reasoning_content` -> `reasoning` and deprecated the old
+    name (docs.vllm.ai reasoning_outputs: "reasoning used to be called
+    reasoning_content ... directly replace"). There is NO serve flag to emit the old
+    name — reverting it would mean forking vLLM and re-applying the patch on every
+    upgrade, the exact treadmill we avoid. Meanwhile a fleet is often MIXED-version:
+    newer vLLM builds emit `reasoning`, older builds emit `reasoning_content`, and
+    clients (pi/zed/OpenAI SDKs) variously key on one or the other. So the relay —
+    the one point that spans the whole fleet — mirrors
+    BOTH directions: whichever field the serve emits, the other is copied in. This is
+    non-breaking (a client reading either name works) and immune to vLLM renaming the
+    field in future patches. Mutates in place; returns True iff it changed anything;
+    tolerant of any shape (no-op on surprises)."""
+    changed = False
+    try:
+        for ch in payload.get("choices", []) or []:
+            if not isinstance(ch, dict):
+                continue
+            for key in ("message", "delta"):
+                node = ch.get(key)
+                if not isinstance(node, dict):
+                    continue
+                r = node.get("reasoning")
+                rc = node.get("reasoning_content")
+                if r is not None and rc is None:
+                    node["reasoning_content"] = r
+                    changed = True
+                elif rc is not None and r is None:
+                    node["reasoning"] = rc
+                    changed = True
+    except Exception:
+        pass
+    return changed
+
+
+def _mirror_reasoning_sse_frame(frame: str) -> str:
+    """Apply ``_mirror_reasoning`` to any ``data: {json}`` line in a single,
+    COMPLETE SSE frame. Keepalive comments (``: ...``), ``data: [DONE]``, and any
+    non-JSON line pass through byte-identical; a frame we do not change is returned
+    unchanged (never re-serialized). Frame boundaries (the trailing blank line) are
+    handled by the caller — this only rewrites line content."""
+    if "reasoning" not in frame:  # cheap fast-path: nothing to mirror
+        return frame
+    lines = frame.split("\n")
+    changed = False
+    for i, line in enumerate(lines):
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            continue
+        if isinstance(obj, dict) and _mirror_reasoning(obj):
+            lines[i] = "data: " + json.dumps(obj, separators=(",", ":"))
+            changed = True
+    return "\n".join(lines) if changed else frame
+
+
+async def _sse_stream_keepalive(body_iter, media_type, interval):
+    """Yield ``(payload, is_keepalive)`` from an upstream byte iterator, emitting
+    an SSE comment frame (``: ka``) whenever no upstream chunk arrives within
+    ``interval`` seconds.
+
+    Large-context ornith-397b requests spend tens of seconds in prefill before
+    the first token (observed: 120k ctx -> ~90s TTFT), during which the streaming
+    path is otherwise silent. That silent gap trips Cloudflare's ~100s edge-idle
+    timeout and client read timeouts, killing the connection before any token
+    flows. SSE comment lines are ignored by all SSE/OpenAI clients, so they keep
+    the connection warm without corrupting the stream or the token content.
+
+    Only applied to ``text/event-stream`` responses; any other media type passes
+    through untouched. Keepalive payloads are relay-injected and are NOT part of
+    the upstream body, so callers must not fold them into reassembly/usage.
+    """
+    if not (media_type or "").startswith("text/event-stream"):
+        async for chunk in body_iter:
+            yield chunk, False
+        return
+    ait = body_iter.__aiter__()
+    pending = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(ait.__anext__())
+            done, _ = await asyncio.wait({pending}, timeout=interval)
+            if pending in done:
+                nxt, pending = pending, None
+                try:
+                    chunk = nxt.result()
+                except StopAsyncIteration:
+                    return
+                yield chunk, False
+            else:
+                yield b": ka\n\n", True
+    finally:
+        if pending is not None:
+            pending.cancel()
+            with suppress(BaseException):
+                await pending
+
+
+def _backpressure_response(status_code, err_type, message, retry_after_seconds, extra=None):
+    """Well-formed backpressure response. The error goes at the TOP LEVEL
+    (``{"error": {...}}``), never nested under FastAPI's ``detail`` — clients
+    (pi, Paseo, OpenAI SDKs) parse the top-level shape and otherwise see the
+    rejection as "no body". A real ``Retry-After`` header is always set.
+
+    Status: **429** for slot saturation (too many concurrent requests on a
+    reachable backend — the caller should back off and retry the SAME model),
+    **503** only for a transient backend-down/paused gap. A 503 for saturation
+    was the bug: it reads as a server fault, not backpressure.
+    """
+    err = {"message": message, "type": err_type, "code": err_type,
+           "retry_after_seconds": retry_after_seconds}
+    if extra:
+        err.update(extra)
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": err},
+        headers={"Retry-After": str(max(1, int(retry_after_seconds))),
+                 "X-Llm-Relay-Error": err_type},
+    )
 
 
 def _resolve_base_url() -> str:
     """Externally-reachable root URL advertised in the MCP config."""
     return os.environ.get("LLM_RELAY_BASE_URL", "http://127.0.0.1:8090").rstrip("/")
+
+
+def _job_visible(job, principal, auth_enabled: bool) -> bool:
+    """Jobs are principal-scoped on the auth listener: a caller sees only its
+    own jobs unless it carries the admin scope (the trusted listener's implicit
+    principal does). Auth disabled = legacy open behavior."""
+    if not auth_enabled:
+        return True
+    pid = getattr(principal, "id", "anonymous")
+    scopes = list(getattr(principal, "scopes", []) or [])
+    return job.principal == pid or "admin" in scopes
+
+
+def _clamp_privacy(principal, auth_enabled: bool, hint_headers: dict[str, str]) -> None:
+    """Privacy ceiling: only principals carrying the ``cloud`` scope may pass
+    ``cloud_ok`` upstream (trusted-listener traffic carries it implicitly).
+    With auth disabled, legacy open-deployment behavior is preserved."""
+    if not auth_enabled:
+        return
+    scopes = list(getattr(principal, "scopes", []) or [])
+    if "cloud" in scopes:
+        return
+    if hint_headers.get("X-Llm-Relay-Privacy") == "cloud_ok":
+        hint_headers["X-Llm-Relay-Privacy"] = "local_only"
+
+
+def _ownership_value(cfg, provider_name: str) -> str:
+    """Ownership string for *provider_name*, failing closed to ``third_party``
+    when the provider cannot be resolved — mirrors ``ModelSelector._ownership_of``
+    so the discovery surface never advertises a model as safer than routing will
+    actually treat it."""
+    provider = cfg.providers.get(provider_name)
+    return provider.ownership.value if provider else "third_party"
+
+
+def _clamp_confidentiality(principal, auth_enabled: bool, hint_headers: dict[str, str]) -> None:
+    """Confidentiality ceiling: only principals carrying the ``third_party``
+    scope may declare a workload ``non_confidential`` and thereby reach hardware
+    CIQ does not own.
+
+    The declaration itself is the operator's to make — the relay cannot inspect a
+    prompt and decide whether it contains sales data or kernel patches. What it
+    CAN do is bound who is allowed to make the claim at all, so a misconfigured
+    or copy-pasted agent cannot unilaterally route CIQ-proprietary work onto
+    borrowed metal. A caller without the scope is silently clamped back to
+    ``confidential`` (fail-closed) rather than rejected, so an over-broad header
+    degrades to the safe pool instead of breaking the request.
+
+    Trusted-listener traffic (the keyless :8090 tailnet listener) carries the
+    scope implicitly, and with auth disabled the legacy open-deployment
+    behavior is preserved — matching ``_clamp_privacy`` exactly.
+    """
+    if not auth_enabled:
+        return
+    scopes = list(getattr(principal, "scopes", []) or [])
+    if "third_party" in scopes:
+        return
+    if hint_headers.get("X-Llm-Relay-Confidentiality") == "non_confidential":
+        hint_headers["X-Llm-Relay-Confidentiality"] = "confidential"
 
 
 def _resolve_config_dir(config_dir: str | Path | None) -> Path:
@@ -42,23 +240,23 @@ def _resolve_config_dir(config_dir: str | Path | None) -> Path:
     return Path(__file__).resolve().parents[2] / "config"
 
 
-def _alias_servable_ceiling(cfg: ConfigLoader, disc: DiscoveryManager, alias: str) -> int | None:
-    """Largest context window the alias can SERVE right now: the max live window
-    among the candidates ``select_chain`` currently yields (named members + open
-    fallthrough, already filtered to available + locally-admissible). ``None`` when
-    nothing servable is live.
+def _alias_current_member(cfg: ConfigLoader, disc: DiscoveryManager, alias: str) -> str | None:
+    """The member an alias routes a normally-sized request to RIGHT NOW: the first
+    declared member that discovery reports available/degraded, else the first
+    declared configured member (so the answer survives a full-fleet outage).
 
-    This drives the honest context advertisement — a client can size a request up
-    to this number and the context-fit gate guarantees it routes to a model that
-    holds it, instead of being told a down primary's nominal window it can't get.
+    This is the model whose context window the alias should advertise — see
+    ``_resolve_context_window``. It matches ``select_best`` for a request with no
+    context floor, and the ``current`` field in ``_build_available_payload``.
     """
-    sel = ModelSelector(cfg, disc)
-    windows = [
-        disc.get_live_context_window(c.model) or (cfg.models.models[c.model].context_window or 0)
-        for c in sel.select_chain(RoutingContext(requested_model=alias))
-    ]
-    windows = [w for w in windows if w]
-    return max(windows) if windows else None
+    members = cfg.models.aliases.get(alias) or []
+    for m in members:
+        if m in cfg.models.models and disc.get_model_state(m).value in ("available", "degraded"):
+            return m
+    for m in members:
+        if m in cfg.models.models:
+            return m
+    return None
 
 
 def _resolve_context_window(cfg: ConfigLoader, disc: DiscoveryManager, name: str) -> int | None:
@@ -67,13 +265,16 @@ def _resolve_context_window(cfg: ConfigLoader, disc: DiscoveryManager, name: str
     Concrete model: the backend's live ``max_model_len`` (authoritative) when it
     reports one, else the static models.yaml value.
 
-    Alias: the largest context it can SERVE right now — the max live window among
-    the models it currently routes to (named members + open fallthrough), via
-    ``_alias_servable_ceiling``. This is the honest "size a request up to here"
-    number; advertising a down primary's nominal window while a smaller model
-    actually serves is the "sized it right, still 503'd" lie. Falls back to the
-    primary (first-declared) member's window when nothing servable is live, so the
-    advertised capability survives a full-fleet outage.
+    Alias: the window of the member it routes a normally-sized request to RIGHT
+    NOW (``_alias_current_member`` — first available member, else first declared),
+    NOT the fleet-max ceiling across its open-fallthrough tail. This is the number
+    a client's autocompaction must key off: a `subagent` alias fronting the 64K 9B
+    must advertise 65536 so the harness compacts to stay on the fast model, not the
+    262K a big fallthrough model *could* serve — advertising that ceiling let a
+    66K prompt sail past pi's autocompact straight into the 9B's wall (2026-07-07).
+    A too-big prompt still escalates up the chain at request time (the selector's
+    context-fit gate + router's overflow backstop); advertisement tracks the
+    everyday routing target, escalation handles the exception.
 
     Returns None when `name` is neither a known model nor a resolvable alias.
     """
@@ -81,14 +282,10 @@ def _resolve_context_window(cfg: ConfigLoader, disc: DiscoveryManager, name: str
     if name in models:
         live = disc.get_live_context_window(name)
         return live if live is not None else models[name].context_window
-    members = cfg.models.aliases.get(name)
-    if members:
-        ceiling = _alias_servable_ceiling(cfg, disc, name)
-        if ceiling is not None:
-            return ceiling
-        for member in members:
-            if member in models:
-                return _resolve_context_window(cfg, disc, member)
+    if name in cfg.models.aliases:
+        current = _alias_current_member(cfg, disc, name)
+        if current is not None:
+            return _resolve_context_window(cfg, disc, current)
     return None
 
 
@@ -117,26 +314,47 @@ def _model_entry(
     if ctx is not None:
         entry["context_length"] = ctx
         entry["max_model_len"] = ctx
+    m = cfg.models.models.get(lookup_name if lookup_name is not None else model_id)
+    if m is not None and m.description:
+        entry["description"] = m.description
     return entry
 
 
 def _build_models_list_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[str, Any]:
-    """OpenAI-compatible ``/v1/models`` list: every concrete model and alias,
-    each enriched with context metadata so discovery clients can read it from
-    the list response (the path most OpenAI-compat resolvers hit first)."""
+    """OpenAI-compatible ``/v1/models`` list, enriched with context metadata so
+    discovery clients can read it from the list response (the path most
+    OpenAI-compat resolvers hit first).
+
+    Only models the relay can serve RIGHT NOW (status available/degraded per
+    discovery, same authority as ``/available-models``) are advertised; an
+    alias stays listed while at least one member is servable. Model pickers
+    (Open WebUI etc.) therefore show the live fleet, not the config file.
+
+    Fail-open-when-blind: if discovery reports NOTHING servable (typically a
+    just-restarted relay before its first poll, or a total fleet outage), the
+    full configured list is returned instead — an empty list would tell
+    clients the fleet doesn't exist, which is a worse lie than a stale one.
+    ``/available-models`` remains the full config-with-status view."""
+    usable = {ModelStatus.available, ModelStatus.degraded}
+    states = {name: disc.get_model_state(name) for name in cfg.models.models}
+    filtering = any(s in usable for s in states.values())
     data: list[dict[str, Any]] = []
     seen: set[str] = set()
     for name, m in cfg.models.models.items():
         if name in seen:
             continue
         seen.add(name)
+        if filtering and states[name] not in usable:
+            continue
         # Advertise the host-qualified id so the same model on different hosts is
         # distinguishable; context is still resolved by the bare name.
         data.append(_model_entry(cfg, disc, compose_model_id(m.provider, name), m.provider, lookup_name=name))
-    for alias in cfg.models.aliases.keys():
+    for alias, members in cfg.models.aliases.items():
         if alias in seen:
             continue
         seen.add(alias)
+        if filtering and not any(states.get(member) in usable for member in members):
+            continue
         data.append(_model_entry(cfg, disc, alias, "llm-relay-alias"))
     return {"object": "list", "data": data}
 
@@ -149,7 +367,12 @@ def _build_model_card(cfg: ConfigLoader, disc: DiscoveryManager, model: str) -> 
     # validated). Echo the id the caller asked for; resolve context by bare name.
     bare = resolve_model_id(cfg.models.models, model)
     if bare is not None:
-        return _model_entry(cfg, disc, model, cfg.models.models[bare].provider, lookup_name=bare)
+        entry = _model_entry(cfg, disc, model, cfg.models.models[bare].provider, lookup_name=bare)
+        # Flag runtime-discovered models so a client can tell an unmanaged
+        # bake-off model from a configured one (additive; absent otherwise).
+        if cfg.models.models[bare].discovered:
+            entry["discovered"] = True
+        return entry
     if model in cfg.models.aliases:
         return _model_entry(cfg, disc, model, "llm-relay-alias")
     return None
@@ -172,6 +395,13 @@ def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[
             "capabilities": m.capabilities,
             "tags": m.tags,
             "privacy": m.privacy.value,
+            # Who owns the metal this model runs on, inherited from its provider,
+            # plus the consequence a client actually has to act on: a model on
+            # third-party hardware is unreachable unless the request declares the
+            # workload non-confidential. Surfaced so pickers can filter up front
+            # instead of discovering it as a 503.
+            "ownership": _ownership_value(cfg, m.provider),
+            "requires_non_confidential": _ownership_value(cfg, m.provider) != "ciq_owned",
             "port": m.port,
             "path": m.path,
             # Isolated backend: reachable only by exact name, never via alias /
@@ -179,6 +409,17 @@ def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[
             # cockpit shows it; well-behaved auto-pickers should skip it.
             "manual_only": m.manual_only,
         }
+        if m.description:
+            out[name]["description"] = m.description
+        # Runtime-discovered (found on a provider's discover_ports, not configured):
+        # additive flag so the cockpit can distinguish ad-hoc bake-off models.
+        if m.discovered:
+            out[name]["discovered"] = True
+        # Variant grouping (plan 2): additive, present only when declared.
+        if m.logical:
+            out[name]["logical"] = m.logical
+        if m.quant:
+            out[name]["quant"] = m.quant
         # A deliberately-paused provider reads "paused" (not its discovered
         # status) so clients see it's intentionally out of rotation, not down.
         if disc.is_provider_paused(m.provider):
@@ -187,6 +428,10 @@ def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[
             if client is not None and client.state.paused_until is not None:
                 out[name]["paused_until"] = client.state.paused_until
     out["aliases"] = dict(cfg.models.aliases)
+    # Variant registry (plan 2): logical models -> their variant names, and the
+    # mutually-exclusive groups (models sharing a served provider+port). Additive.
+    out["logical_models"] = {k: list(v) for k, v in cfg.models.logical_models.items()}
+    out["exclusivity_groups"] = [list(g) for g in cfg.models.exclusivity_groups]
     # Enriched per-alias metadata so clients can show context_window etc. for
     # aliases (which are otherwise just names). `current` is a display
     # approximation: the first member that discovery reports as available /
@@ -196,27 +441,16 @@ def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[
     alias_info: dict[str, Any] = {}
     for alias, members in cfg.models.aliases.items():
         members_list = list(members)
-        current: str | None = None
-        for member in members_list:
-            if member not in cfg.models.models:
-                continue
-            if disc.get_model_state(member).value in ("available", "degraded"):
-                current = member
-                break
-        if current is None:
-            for member in members_list:
-                if member in cfg.models.models:
-                    current = member
-                    break
-        # `context_window` is the live-servable CEILING (max live window among the
-        # alias's currently-routable candidates, via _resolve_context_window ->
-        # _alias_servable_ceiling) — the number a client can safely size a request
-        # up to. It tracks the live fleet rather than a down primary's nominal
-        # window, so a client never sizes to context the alias cannot actually hold
-        # (the "sized it right, still 503'd" lie). Size the PROMPT as chars/3 <=
-        # context_window; max_tokens is an output ceiling, clamped to the chosen
-        # model's headroom at forward time (see _clamp_max_tokens), not counted
-        # toward eligibility (see _estimate_prompt_tokens).
+        current = _alias_current_member(cfg, disc, alias)
+        # `context_window` is the window of `current` — the member this alias routes
+        # a normally-sized request to right now (see _resolve_context_window). A
+        # client keys its autocompaction off this number, so it must be the everyday
+        # target's window, NOT the fleet-max a big fallthrough model could serve
+        # (advertising that let a 66K prompt overrun the 64K 9B on 2026-07-07). A
+        # prompt too big for `current` still escalates up the chain at request time
+        # (selector context-fit gate + router overflow backstop). Size the PROMPT
+        # under context_window; max_tokens is an output ceiling clamped per-candidate
+        # at forward time (see _clamp_max_tokens), not counted toward eligibility.
         alias_info[alias] = {
             "members": members_list,
             "current": current,
@@ -224,6 +458,71 @@ def _build_available_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[
         }
     out["alias_info"] = alias_info
     return out
+
+
+def _reconcile_discovered(
+    config: ConfigLoader,
+    discovery: DiscoveryManager,
+    discover_keys: set[str],
+    key_meta: dict[str, tuple[str, int]],
+) -> None:
+    """Sync the runtime-discovered model registry with what the discover-port
+    backends currently report.
+
+    ``discover_keys`` are the discovery-client keys registered for the providers'
+    ``discover_ports``; ``key_meta`` maps each to its ``(provider_name, port)``.
+
+    For every model id a discover-port backend reports in ``/v1/models`` that is
+    NOT already a statically-configured model, register a ``ModelConfig`` for it
+    so the selector can route to it by exact name (it carries ``manual_only`` /
+    ``discovered`` so it never joins an alias tail or open ranking). Models that
+    stop being reported are dropped. Synchronous and side-effecting on
+    ``config``/``discovery`` so the lifespan reconcile task — and unit tests —
+    can call it directly.
+    """
+    # 1. What the discover ports currently serve, keyed served_name -> backend key.
+    #    A served id that collides with a STATIC model is left to that model
+    #    (never shadow a configured entry); a previously-discovered id is fair game.
+    seen: dict[str, str] = {}
+    for key in discover_keys:
+        client = discovery.clients.get(key)
+        if client is None:
+            continue
+        for sid in client.state.models:
+            existing = config.models.models.get(sid)
+            if existing is not None and not existing.discovered:
+                continue  # static model takes precedence — don't shadow it
+            seen[sid] = key
+
+    # 2. Register anything newly seen as a discovered, name-only-routable model.
+    #    provider/port are set so compose_backend_key(provider, port, "") resolves
+    #    back to the discover key the model is served on (the selector keys off it).
+    for sid, key in seen.items():
+        provider_name, port = key_meta[key]
+        if sid not in config.models.models:
+            config.models.models[sid] = ModelConfig(
+                provider=provider_name,
+                port=port,
+                served_model_name=sid,
+                context_window=None,
+                capabilities=[],
+                tags=["discovered"],
+                use_cases={},
+                manual_only=True,
+                discovered=True,
+                privacy=Privacy.local_only,
+            )
+        # Point availability / routing at the discover backend serving it.
+        discovery.model_to_client[sid] = key
+        discovery.served_names.setdefault(sid, sid)
+
+    # 3. Drop discovered models whose port no longer reports them.
+    for name in [
+        n for n, m in config.models.models.items() if m.discovered and n not in seen
+    ]:
+        config.models.models.pop(name, None)
+        discovery.model_to_client.pop(name, None)
+        discovery.served_names.pop(name, None)
 
 
 def create_app(config_dir: str | Path | None = None) -> FastAPI:
@@ -291,12 +590,68 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                         timeout=provider.health_check_timeout,
                         max_concurrent=provider.max_concurrent,
                     )
+            # Register a bare polling client for each provider discover_port that
+            # isn't already a configured model's port. These ports carry no
+            # models_hint -- whatever they report in /v1/models is reconciled into
+            # the registry (as discovered, name-only-routable models) by the task
+            # below, so an ad-hoc / bake-off model on an unmanaged port is picked
+            # up automatically instead of making the host read "down".
+            discover_keys: set[str] = set()
+            key_meta: dict[str, tuple[str, int]] = {}
+            discover_poll_intervals: list[int] = []
+            for provider_name, provider in config.providers.items():
+                if not provider.enabled or not provider.discover_ports:
+                    continue
+                discover_poll_intervals.append(provider.poll_interval)
+                for port in provider.discover_ports:
+                    key = compose_backend_key(provider_name, port, "")
+                    if key in discovery.clients:
+                        continue  # a static model already polls this port
+                    await discovery.register_backend(
+                        key=key,
+                        provider_name=provider_name,
+                        base_url=f"{provider.base_url.rstrip('/')}:{port}",
+                        models_hint=[],
+                        health_endpoint=provider.health_endpoint,
+                        poll_interval=provider.poll_interval,
+                        circuit_breaker=provider.circuit_breaker,
+                        timeout=provider.health_check_timeout,
+                        max_concurrent=provider.max_concurrent,
+                    )
+                    discover_keys.add(key)
+                    key_meta[key] = (provider_name, port)
             # Restore any persisted maintenance pauses now that every backend is
             # registered (discovery.clients is populated). Doing this at
             # create_app time would be a no-op -- clients are empty there.
             for _prov, _info in config.load_paused_providers().items():
                 discovery.pause_provider(_prov, _info.get("until"), _info.get("reason"))
-            yield
+            # Run the discover-port reconcile on the same cadence as polling so a
+            # model appearing/disappearing on a discover port is reflected within a
+            # poll cycle. The first poll hasn't happened yet, so the loop sleeps
+            # before its first pass. Appended to discovery._tasks so the existing
+            # shutdown cancels it with the poll loops.
+            if discover_keys:
+                interval = max(5, min(discover_poll_intervals))
+
+                async def _reconcile_loop() -> None:
+                    while True:
+                        await asyncio.sleep(interval)
+                        _reconcile_discovered(config, discovery, discover_keys, key_meta)
+
+                discovery._tasks.append(asyncio.create_task(_reconcile_loop()))
+            # Async job worker (plan 4 slice 2): reconcile any jobs left running by
+            # a crash (-> interrupted, never silently re-run), then run until shutdown.
+            app.state.job_store.reconcile_on_start()
+            _job_stop = asyncio.Event()
+            _job_task = asyncio.create_task(run_worker(app.state.job_store, router, _job_stop))
+            try:
+                yield
+            finally:
+                _job_stop.set()
+                try:
+                    await asyncio.wait_for(_job_task, timeout=10)
+                except Exception:
+                    pass
         await discovery.shutdown()
 
     # --- MCP sub-app (optional dep) -----------------------------------
@@ -312,6 +667,17 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
     app.state.config = config
     app.state.discovery = discovery
     app.state.router = router
+    app.state.admission = AdmissionController()
+    # Durable async job store (plan 4 slice 2); the worker is started in lifespan.
+    app.state.job_store = JobStore(cfg_path / "jobs.json")
+
+    # Per-user API-key auth (a no-op when disabled). Installed here so it wraps
+    # every route, including the MCP mount.
+    from .middleware import install_auth_middleware
+    install_auth_middleware(app)
+
+    # In-memory log buffer for /logs and /logs/stream (plan 7), tailed by the cockpit.
+    app.state.log_buffer = install_log_buffer()
 
     async def _available(request: Request) -> dict[str, Any]:
         return _build_available_payload(
@@ -321,6 +687,10 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
     @app.get("/health")
     async def health(request: Request) -> dict[str, Any]:
         disc = request.app.state.discovery
+        # /health is auth-exempt (liveness probes). When auth is on, return a
+        # minimal body so a keyless caller cannot read backend topology here.
+        if request.app.state.config.auth.enabled:
+            return {"status": "ok"}
         return {
             "status": "ok",
             "endpoints": {
@@ -447,9 +817,17 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 entry["paused_reason"] = c.state.paused_reason
             backends[key] = entry
 
+        # Runtime-discovered models (found on a provider's discover_ports, not in
+        # models.yaml). Surfaced as a distinct list so an operator can tell an
+        # ad-hoc bake-off model from a configured one; additive (empty when none).
+        discovered_models = sorted(
+            name for name, m in cfg.models.models.items() if m.discovered
+        )
+
         return {
             "mode": matched_modes,
             "available_local_models": sorted(available_local),
+            "discovered_models": discovered_models,
             "aliases": alias_info,
             "backends": backends,
         }
@@ -491,20 +869,114 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
         cfg.save_paused_providers(persisted)
         return {"ok": True, "provider": provider, "paused": disc.is_provider_paused(provider)}
 
+    # --- Key lifecycle over HTTP (admin scope enforced by the middleware). ---
+    # API minting is deliberately scope-less: admin-scoped keys are mintable
+    # only via the on-box CLI, so a leaked admin key can manage users but
+    # cannot quietly create more admins.
+    from ..audit import audit as _audit
+    from ..auth import (
+        add_key_record,
+        load_key_records,
+        load_keys as _load_keys,
+        revoke_hash,
+        update_key_scopes,
+    )
+
+    _keys_path = cfg_path / "api_keys.yaml"
+
+    def _reload_principals() -> None:
+        config.auth.principals_by_hash = _load_keys(_keys_path)
+
+    def _acting(request: Request) -> str:
+        return getattr(getattr(request.state, "principal", None), "id", "?")
+
+    @app.get("/admin/keys")
+    async def admin_keys_list(request: Request) -> dict[str, Any]:
+        records = load_key_records(_keys_path)
+        return {"keys": [
+            {"hash_prefix": h[:12], "id": r.get("id"), "scopes": r.get("scopes", []),
+             "priority_weight": r.get("priority_weight", 1.0),
+             "enabled": r.get("enabled", True), "created": r.get("created", ""),
+             "note": r.get("note", "")}
+            for h, r in sorted(records.items())
+        ]}
+
+    @app.post("/admin/keys")
+    async def admin_keys_add(request: Request) -> dict[str, Any]:
+        body = await request.json()
+        if body.get("scopes"):
+            raise HTTPException(400, detail="scoped keys are mintable only via the on-box CLI")
+        kid = str(body.get("id") or "").strip()
+        if not kid:
+            raise HTTPException(400, detail="id required")
+        plaintext = add_key_record(
+            _keys_path, kid,
+            priority_weight=float(body.get("priority_weight", 0.5)),
+            note=str(body.get("note", "")),
+        )
+        _reload_principals()
+        _audit("key_minted", principal=kid, by=_acting(request))
+        return {"id": kid, "key": plaintext}
+
+    @app.delete("/admin/keys/{hash_prefix}")
+    async def admin_keys_revoke(hash_prefix: str, request: Request) -> dict[str, Any]:
+        n = revoke_hash(_keys_path, hash_prefix)
+        if n == 0:
+            raise HTTPException(404, detail="no key matches that prefix")
+        if n == -1:
+            raise HTTPException(409, detail="prefix ambiguous; use a longer one")
+        _reload_principals()
+        _audit("key_revoked", hash_prefix=hash_prefix, by=_acting(request))
+        return {"revoked": n}
+
+    @app.patch("/admin/keys/{hash_prefix}")
+    async def admin_keys_scopes(hash_prefix: str, request: Request) -> dict[str, Any]:
+        """Replace the scopes on an existing key. Mirrors the mint restriction:
+        the ``admin`` scope is not grantable over HTTP, so a leaked admin key
+        can manage users but cannot quietly create more admins."""
+        body = await request.json()
+        scopes = list(body.get("scopes") or [])
+        if "admin" in scopes:
+            raise HTTPException(400, detail="admin scope is grantable only via the on-box CLI")
+        n = update_key_scopes(_keys_path, hash_prefix, scopes)
+        if n == 0:
+            raise HTTPException(404, detail="no key matches that prefix")
+        if n == -1:
+            raise HTTPException(409, detail="prefix ambiguous; use a longer one")
+        _reload_principals()
+        _audit("key_scopes", hash_prefix=hash_prefix, scopes=scopes, by=_acting(request))
+        return {"hash_prefix": hash_prefix, "scopes": scopes}
+
     @app.get("/routing-table")
     async def routing_table(request: Request) -> dict[str, list[str]]:
         return dict(request.app.state.config.policy.fallback.graph)
 
     @app.get("/routing-table/{model}")
     async def routing_table_for(model: str, request: Request) -> dict[str, Any]:
-        cfg = request.app.state.config.models.models.get(model)
-        if not cfg:
-            raise HTTPException(404, detail=f"Unknown model: {model}")
-        return {
-            "model": model,
-            "provider": cfg.provider,
-            "fallback_chain": request.app.state.router.selector.get_fallback_chain(model),
-        }
+        cfg_all = request.app.state.config
+        m = cfg_all.models.models.get(model)
+        if m:
+            return {
+                "model": model,
+                "provider": m.provider,
+                "fallback_chain": request.app.state.router.selector.get_fallback_chain(model),
+            }
+        # Aliases are first-class here too ("what does this alias resolve to
+        # right now"): use-case categories are derived, not static models, and
+        # health-gate tooling probes e.g. /routing-table/main.
+        members = cfg_all.models.aliases.get(model)
+        if members:
+            disc = request.app.state.discovery
+            resolved = None
+            for member in members:
+                if member in cfg_all.models.models and disc.get_model_state(member).value in (
+                    "available",
+                    "degraded",
+                ):
+                    resolved = member
+                    break
+            return {"alias": model, "members": list(members), "resolved": resolved}
+        raise HTTPException(404, detail=f"Unknown model: {model}")
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
@@ -512,15 +984,23 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
             body = await request.json()
         except Exception:
             raise HTTPException(400, detail="Invalid JSON")
+        # NOTE: this allowlist is the door. A routing header parsed in the router
+        # but missing here is silently dropped and the axis ships inert — that is
+        # exactly how X-Llm-Relay-Candidate-Lane shipped dead. Add the header here
+        # in the same change that parses it, and cover it with a TestClient test.
         hint_headers: dict[str, str] = {}
         for key in (
             "X-Llm-Relay-Privacy",
+            "X-Llm-Relay-Confidentiality",
             "X-Llm-Relay-Require-Tools",
             "X-Llm-Relay-Min-Context",
         ):
             v = request.headers.get(key)
             if v is not None:
                 hint_headers[key] = v
+        _principal = getattr(request.state, "principal", None)
+        _clamp_privacy(_principal, request.app.state.config.auth.enabled, hint_headers)
+        _clamp_confidentiality(_principal, request.app.state.config.auth.enabled, hint_headers)
         user_agent = request.headers.get("user-agent", "")
         # Explicit X-Llm-Relay-Client header wins; else fall back to a configured
         # distinctive User-Agent pattern; else "unknown". The known-client set and
@@ -529,8 +1009,27 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
         # can be attributed with zero client-side change while others opt in via
         # the header.
         client = resolve_client(request.headers.get("X-Llm-Relay-Client"), user_agent)
+        principal_id = getattr(_principal, "id", "anonymous")
         start_ns = time.time_ns()
         is_stream = body.get("stream") is True
+
+        # QoS admission (plan 4, slice 1): shed explicitly low-urgency work under
+        # fleet contention so high-urgency / interactive work keeps flowing.
+        if request.app.state.admission.should_shed(
+            request.headers.get("X-Llm-Relay-Urgency"), request.app.state.discovery
+        ):
+            emit_chat_completion(
+                request_body=body, response_body=None, response_text=None, usage=None,
+                model_resolved=None, provider_name=None,
+                user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
+                status_code=429, streamed=is_stream, error="shed: low urgency under contention",
+                outcome="shed", client=client, principal=principal_id,
+            )
+            raise HTTPException(
+                status_code=429,
+                detail={"error": "shed under contention (low urgency); retry shortly"},
+                headers={"Retry-After": "5"},
+            )
 
         try:
             if is_stream:
@@ -538,22 +1037,132 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                     request_data=body, headers=hint_headers, stream=True,
                 )
             else:
-                upstream, result = await request.app.state.router.route_and_forward(
-                    request_data=body, headers=hint_headers, stream=False,
+                _fwd_task = asyncio.ensure_future(
+                    request.app.state.router.route_and_forward(
+                        request_data=body, headers=hint_headers, stream=False,
+                    )
                 )
+                try:
+                    upstream, result = await asyncio.wait_for(
+                        asyncio.shield(_fwd_task), timeout=60.0
+                    )
+                except asyncio.TimeoutError:
+                    # Backend needs >60s (ornith-397b etc). Drip whitespace
+                    # keepalives so Cloudflare's 100s edge timeout stays open.
+                    async def _keepalive_drip():
+                        try:
+                            while not _fwd_task.done():
+                                yield b" "
+                                done, _ = await asyncio.wait(
+                                    {_fwd_task}, timeout=30
+                                )
+                                if done:
+                                    break
+                            _up, _res = _fwd_task.result()
+                        except Exception as _exc:
+                            _err = {
+                                "error": {
+                                    "message": f"Backend error: {_exc}",
+                                    "type": "relay_error",
+                                }
+                            }
+                            emit_chat_completion(
+                                request_body=body,
+                                response_body=None,
+                                response_text=None,
+                                usage=None,
+                                model_resolved=None,
+                                provider_name=None,
+                                user_agent=user_agent,
+                                start_ns=start_ns,
+                                end_ns=time.time_ns(),
+                                status_code=502,
+                                streamed=False,
+                                error=str(_exc),
+                                outcome="backend_error",
+                                client=client,
+                                principal=principal_id,
+                            )
+                            yield json.dumps(_err).encode()
+                            return
+                        try:
+                            _content = _up.json()
+                            if isinstance(_content, dict):
+                                _content["llm-relay"] = {
+                                    "selected_model": _res.selected_model,
+                                    "selected_provider": _res.provider_name,
+                                    "decision": _res.decision,
+                                }
+                        except Exception:
+                            _content = {"raw": _up.text}
+                        emit_chat_completion(
+                            request_body=body,
+                            response_body=(
+                                _content
+                                if isinstance(_content, dict)
+                                else None
+                            ),
+                            response_text=(
+                                None
+                                if isinstance(_content, dict)
+                                else _up.text
+                            ),
+                            usage=None,
+                            model_resolved=_res.selected_model,
+                            provider_name=_res.provider_name,
+                            user_agent=user_agent,
+                            start_ns=start_ns,
+                            end_ns=time.time_ns(),
+                            status_code=_up.status_code,
+                            streamed=False,
+                            outcome=(
+                                "success"
+                                if _up.status_code < 400
+                                else "upstream_error"
+                            ),
+                            client=client,
+                            principal=principal_id,
+                            fell_back=did_fall_back(
+                                _res.selected_model,
+                                (_res.decision or {}).get("ranked") or [],
+                            ),
+                        )
+                        if isinstance(_content, dict):
+                            yield json.dumps(_content).encode()
+                        else:
+                            yield _up.text.encode()
+
+                    return StreamingResponse(
+                        _keepalive_drip(),
+                        status_code=200,
+                        media_type="application/json",
+                    )
+        except ContextLengthExceededError as e:
+            # Prompt exceeds every servable model's window. Return the OpenAI-standard
+            # top-level 400 context_length_exceeded so clients auto-compact and retry
+            # smaller, instead of treating a 5xx as transient and retry-dying.
+            emit_chat_completion(
+                request_body=body, response_body=None, response_text=None, usage=None,
+                model_resolved=None, provider_name=None,
+                user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
+                status_code=400, streamed=is_stream, error=str(e),
+                outcome="context_length_exceeded", client=client, principal=principal_id,
+            )
+            return JSONResponse(
+                status_code=400, content=e.body,
+                headers={"X-Llm-Relay-Error": "context_length_exceeded"},
+            )
         except SaturationError as e:
             emit_chat_completion(
                 request_body=body, response_body=None, response_text=None, usage=None,
                 model_resolved=None, provider_name=None,
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
-                status_code=503, streamed=is_stream, error=str(e),
-                outcome="saturated", client=client,
+                status_code=429, streamed=is_stream, error=str(e),
+                outcome="saturated", client=client, principal=principal_id,
             )
-            raise HTTPException(
-                status_code=503,
-                detail={"error": "backend saturated", "backend": e.backend_key,
-                        "retry_after_seconds": e.retry_after_seconds},
-                headers={"Retry-After": str(max(1, int(e.retry_after_seconds)))},
+            return _backpressure_response(
+                429, "backend_saturated", str(e), e.retry_after_seconds,
+                {"backend": e.backend_key},
             )
         except NoBackendAvailableError as e:
             # Transient availability gap (constraints satisfiable, every match
@@ -564,13 +1173,10 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 model_resolved=None, provider_name=None,
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=503, streamed=is_stream, error=str(e),
-                outcome="no_backend", client=client,
+                outcome="no_backend", client=client, principal=principal_id,
             )
-            raise HTTPException(
-                status_code=503,
-                detail={"error": "no backend available",
-                        "retry_after_seconds": e.retry_after_seconds},
-                headers={"Retry-After": str(max(1, int(e.retry_after_seconds)))},
+            return _backpressure_response(
+                503, "no_backend_available", str(e), e.retry_after_seconds,
             )
         except httpx.RequestError as e:
             emit_chat_completion(
@@ -578,7 +1184,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 model_resolved=None, provider_name=None,
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=502, streamed=is_stream, error=f"Backend network error: {e}",
-                outcome="network_error", client=client,
+                outcome="network_error", client=client, principal=principal_id,
             )
             raise HTTPException(502, detail=f"Backend network error: {e}")
         except HTTPException:
@@ -589,7 +1195,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 model_resolved=None, provider_name=None,
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=503, streamed=is_stream, error="No model matches constraints",
-                outcome="no_candidate", client=client,
+                outcome="no_candidate", client=client, principal=principal_id,
             )
             raise
         except Exception as e:
@@ -598,13 +1204,26 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 model_resolved=None, provider_name=None,
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=502, streamed=is_stream, error=f"Backend error: {e}",
-                outcome="backend_error", client=client,
+                outcome="backend_error", client=client, principal=principal_id,
             )
             raise HTTPException(502, detail=f"Backend error: {e}")
 
+        _dec = result.decision or {}
+        # reasoning->reasoning_content mirroring is applied ONLY for models that
+        # advertise the `reasoning` capability. For every other backend the
+        # response is passed through byte-identical (no parse, no re-serialize),
+        # so this is zero-overhead and zero-risk for the fast local fleet.
+        _sel_cfg = request.app.state.config.models.models.get(result.selected_model or "")
+        _mirror_r = bool(_sel_cfg and "reasoning" in (_sel_cfg.capabilities or []))
         relay_headers = {
             "X-Llm-Relay-Selected-Model": result.selected_model or "",
             "X-Llm-Relay-Selected-Provider": result.provider_name or "",
+            # 4-tuple decision (plan 3): quant + node + batch policy. quant is the
+            # highest-preference variant's precision (a side effect of quality
+            # ordering, not an independent cost axis). Set on BOTH response paths.
+            "X-Llm-Relay-Decision-Quant": str(_dec.get("quant") or ""),
+            "X-Llm-Relay-Decision-Node": str(_dec.get("node") or ""),
+            "X-Llm-Relay-Decision-Batch": str(_dec.get("batch") or ""),
         }
 
         if is_stream:
@@ -615,12 +1234,38 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 chunks: list[bytes] = []
                 exc: BaseException | None = None
                 first_chunk_ns: int | None = None
+                carry = b""  # partial trailing SSE frame awaiting its blank-line terminator
                 try:
-                    async for chunk in body_iter:
+                    async for chunk, _is_ka in _sse_stream_keepalive(
+                        body_iter, media_type, _KEEPALIVE_INTERVAL_S
+                    ):
+                        if _is_ka:
+                            yield chunk
+                            continue
                         if first_chunk_ns is None:
                             first_chunk_ns = time.time_ns()
-                        chunks.append(chunk)
-                        yield chunk
+                        if not _mirror_r:
+                            # Non-reasoning model: byte-identical passthrough.
+                            chunks.append(chunk)
+                            yield chunk
+                            continue
+                        # Reasoning model: mirror reasoning->reasoning_content on
+                        # COMPLETE frames only (split on the blank-line terminator),
+                        # buffering any partial tail so a JSON payload is never split
+                        # mid-frame or mid-codepoint. Keepalives are handled above and
+                        # never enter this buffer.
+                        carry += chunk
+                        while b"\n\n" in carry:
+                            fb, carry = carry.split(b"\n\n", 1)
+                            out = (_mirror_reasoning_sse_frame(fb.decode("utf-8", "replace"))
+                                   + "\n\n").encode("utf-8")
+                            chunks.append(out)
+                            yield out
+                    if _mirror_r and carry:
+                        # Flush a trailing frame that lacked its terminator (rare).
+                        out = _mirror_reasoning_sse_frame(carry.decode("utf-8", "replace")).encode("utf-8")
+                        chunks.append(out)
+                        yield out
                 except BaseException as e:
                     # Capture HOW the stream ended so the outcome is honest, then
                     # always re-raise: a swallowed CancelledError/GeneratorExit would
@@ -643,7 +1288,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                         user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                         status_code=upstream_status, streamed=True,
                         outcome=outcome,
-                        client=client,
+                        client=client, principal=principal_id,
                         fell_back=did_fall_back(result.selected_model, (result.decision or {}).get("ranked") or []),
                         ttft_ns=ttft_ns,
                     )
@@ -664,6 +1309,8 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
         try:
             content = upstream.json()
             if isinstance(content, dict):
+                if _mirror_r:
+                    _mirror_reasoning(content)
                 content["llm-relay"] = {
                     "selected_model": result.selected_model,
                     "selected_provider": result.provider_name,
@@ -680,10 +1327,139 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
             user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
             status_code=upstream.status_code, streamed=False,
             outcome="success" if upstream.status_code < 400 else "upstream_error",
-            client=client,
+            client=client, principal=principal_id,
             fell_back=did_fall_back(result.selected_model, (result.decision or {}).get("ranked") or []),
         )
         return JSONResponse(status_code=upstream.status_code, content=content, headers=relay_headers)
+
+    async def _simple_proxy(request: Request, upstream_path: str):
+        """Shared handler for simple non-streaming endpoints (embeddings, rerank).
+        Routes by the requested model and forwards to ``upstream_path`` (plan 6)."""
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, detail="Invalid JSON")
+        hint_headers = {
+            k: request.headers[k]
+            for k in ("X-Llm-Relay-Privacy", "X-Llm-Relay-Confidentiality")
+            if k in request.headers
+        }
+        _clamp_privacy(
+            getattr(request.state, "principal", None),
+            request.app.state.config.auth.enabled,
+            hint_headers,
+        )
+        _clamp_confidentiality(
+            getattr(request.state, "principal", None),
+            request.app.state.config.auth.enabled,
+            hint_headers,
+        )
+        try:
+            upstream, result = await request.app.state.router.route_simple(
+                body, headers=hint_headers, upstream_path=upstream_path,
+            )
+        except SaturationError as e:
+            return _backpressure_response(
+                429, "backend_saturated", str(e), e.retry_after_seconds,
+            )
+        except NoBackendAvailableError as e:
+            return _backpressure_response(
+                503, "no_backend_available", str(e), e.retry_after_seconds,
+            )
+        except httpx.RequestError as e:
+            raise HTTPException(502, detail=f"Backend network error: {e}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(502, detail=f"Backend error: {e}")
+        try:
+            content = upstream.json()
+        except Exception:
+            content = {"raw": upstream.text}
+        return JSONResponse(
+            status_code=upstream.status_code, content=content,
+            headers={"X-Llm-Relay-Selected-Model": result.selected_model or ""},
+        )
+
+    @app.post("/v1/embeddings")
+    async def embeddings(request: Request):
+        return await _simple_proxy(request, "embeddings")
+
+    @app.post("/v1/rerank")
+    async def rerank(request: Request):
+        return await _simple_proxy(request, "rerank")
+
+    @app.get("/logs")
+    async def logs(request: Request) -> Response:
+        """Recent buffered relay log lines (plain text), for the cockpit (plan 7)."""
+        buf = request.app.state.log_buffer
+        return Response(content="\n".join(buf.recent(limit=500)), media_type="text/plain")
+
+    @app.get("/logs/stream")
+    async def logs_stream(request: Request) -> StreamingResponse:
+        """SSE of relay log lines: recent history first, then new lines as they
+        arrive (poll-based over a monotonic sequence). Stops on client disconnect."""
+        buf = request.app.state.log_buffer
+
+        async def gen():
+            last = 0
+            for s, line in buf.since(0)[-200:]:
+                yield f"data: {line}\n\n"
+                last = max(last, s)
+            while True:
+                if await request.is_disconnected():
+                    break
+                for s, line in buf.since(last):
+                    yield f"data: {line}\n\n"
+                    last = s
+                await asyncio.sleep(1.0)
+
+        return StreamingResponse(
+            gen(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no"}
+        )
+
+    @app.post("/v1/jobs")
+    async def submit_job(request: Request):
+        """Submit an agentic chat job to the async lane (plan 4 slice 2). Returns a
+        job id; poll GET /v1/jobs/{id} for status and result. The job survives a
+        relay restart (durable store)."""
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, detail="Invalid JSON")
+        principal = getattr(request.state, "principal", None)
+        job = request.app.state.job_store.create(
+            principal=getattr(principal, "id", "anonymous"),
+            body=body,
+            sla_class=request.headers.get("X-Llm-Relay-SLA-Class"),
+            urgency=request.headers.get("X-Llm-Relay-Urgency"),
+            priority_weight=getattr(principal, "priority_weight", 1.0),
+            created_ts=time.time(),
+        )
+        return JSONResponse(status_code=202, content={"job_id": job.id, "status": job.status})
+
+    @app.get("/v1/jobs/{job_id}")
+    async def get_job(job_id: str, request: Request) -> dict[str, Any]:
+        job = request.app.state.job_store.get(job_id)
+        if job is None or not _job_visible(
+            job, getattr(request.state, "principal", None),
+            request.app.state.config.auth.enabled,
+        ):
+            # 404 (not 403) for another principal's job: don't leak existence.
+            raise HTTPException(404, detail=f"Unknown job: {job_id}")
+        return job.public()
+
+    @app.post("/v1/jobs/{job_id}/cancel")
+    async def cancel_job(job_id: str, request: Request) -> dict[str, Any]:
+        store = request.app.state.job_store
+        job = store.get(job_id)
+        if job is None or not _job_visible(
+            job, getattr(request.state, "principal", None),
+            request.app.state.config.auth.enabled,
+        ):
+            raise HTTPException(404, detail=f"Unknown job: {job_id}")
+        cancelled = store.cancel(job_id)
+        return {"job_id": job_id, "cancelled": cancelled, "status": store.get(job_id).status}
 
     # Mount MCP at /mcp
     if _mcp_app is not None:
@@ -704,7 +1480,60 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
     return app
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("LLM_RELAY_PORT", 8090))
+def build_sockets(host: str, port: int, auth_port: int | None, auth_cfg) -> tuple[list, list[str]]:
+    """Listener sockets for :func:`serve`. Fail-closed: the auth listener is
+    refused (with a warning) when auth is enabled but the key store has no
+    enabled key, so a misconfigured deployment cannot expose a keyless "auth"
+    port. The trusted/primary listener always binds so local consumers stay up.
+    """
+    import socket as _socket
+
+    def _bind(p: int):
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        s.bind((host, p))
+        s.listen(2048)
+        return s
+
+    sockets, warnings = [_bind(port)], []
+    if auth_port is not None:
+        has_key = any(p.enabled for p in auth_cfg.principals_by_hash.values())
+        if auth_cfg.enabled and not has_key:
+            warnings.append(
+                f"auth listener :{auth_port} REFUSED: auth enabled but api_keys.yaml has no enabled key"
+            )
+        else:
+            sockets.append(_bind(auth_port))
+    return sockets, warnings
+
+
+async def serve(config_dir: str | Path | None = None) -> None:
+    """Run one relay process on one or two listeners (single lifespan).
+
+    ``LLM_RELAY_PORT`` is the primary listener (typically a trusted loopback
+    port, see auth.trusted_ports); ``LLM_RELAY_AUTH_PORT``, when set, adds the
+    key-enforced listener a reverse proxy routes external traffic to.
+    """
+    import logging
+
+    log = logging.getLogger("llm_relay")
     host = os.environ.get("LLM_RELAY_HOST", "127.0.0.1")
-    uvicorn.run("llm_relay.api.app:create_app", host=host, port=port, factory=True)
+    port = int(os.environ.get("LLM_RELAY_PORT", 8090))
+    auth_port_raw = os.environ.get("LLM_RELAY_AUTH_PORT", "")
+    auth_port = int(auth_port_raw) if auth_port_raw else None
+    app = create_app(config_dir)
+    sockets, warnings = build_sockets(host, port, auth_port, app.state.config.auth)
+    for w in warnings:
+        log.error(w)
+    log.info(
+        "listeners: %s (primary=%s auth=%s trusted_ports=%s)",
+        [s.getsockname()[1] for s in sockets], port, auth_port,
+        app.state.config.auth.trusted_ports,
+    )
+    config = uvicorn.Config(app, log_level=os.environ.get("LLM_RELAY_LOG_LEVEL", "info"))
+    server = uvicorn.Server(config)
+    await server.serve(sockets=sockets)
+
+
+if __name__ == "__main__":
+    asyncio.run(serve())

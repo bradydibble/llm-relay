@@ -21,18 +21,49 @@ def _load_config() -> ConfigLoader:
     return config
 
 
-def cmd_run(args: argparse.Namespace) -> int:
-    import uvicorn
+def _insecure_bind_warning(host: str, auth_enabled: bool) -> str | None:
+    """Warn when binding to a non-loopback interface with auth disabled (an open
+    proxy to your models and backend topology). None when the bind is safe."""
+    loopback = {"127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"}
+    if host not in loopback and not auth_enabled:
+        return (
+            f"binding to {host} with auth DISABLED: anyone who can reach this port "
+            "has an open proxy to your models and your backend topology. Set "
+            "LLM_RELAY_AUTH=1 and mint keys with `llm-relay keys add` before exposing it."
+        )
+    return None
 
+
+def cmd_run(args: argparse.Namespace) -> int:
     port = args.port or int(os.environ.get("LLM_RELAY_PORT", 8090))
     host = args.host or os.environ.get("LLM_RELAY_HOST", "127.0.0.1")
-    uvicorn.run(
-        "llm_relay.api.app:create_app",
-        host=host,
-        port=port,
-        factory=True,
-        reload=args.reload,
-    )
+    try:
+        auth_enabled = _load_config().auth.enabled
+    except Exception:
+        auth_enabled = False
+    warning = _insecure_bind_warning(host, auth_enabled)
+    if warning:
+        Console(stderr=True).print(f"[bold red]WARNING:[/bold red] {warning}")
+    if args.reload:
+        # Dev mode: uvicorn's reloader needs an import string; single listener.
+        import uvicorn
+
+        uvicorn.run(
+            "llm_relay.api.app:create_app",
+            host=host,
+            port=port,
+            factory=True,
+            reload=True,
+        )
+        return 0
+    # Production path: one process, one or two listeners (LLM_RELAY_AUTH_PORT).
+    import asyncio
+
+    from .api.app import serve
+
+    os.environ["LLM_RELAY_HOST"] = host
+    os.environ["LLM_RELAY_PORT"] = str(port)
+    asyncio.run(serve())
     return 0
 
 
@@ -122,6 +153,69 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_keys(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from .audit import audit
+    from .auth import add_key_record, load_key_records, revoke_hash, revoke_id
+
+    config_dir = Path(os.environ.get("LLM_RELAY_CONFIG_DIR", "config"))
+    path = config_dir / "api_keys.yaml"
+    console = Console()
+    action = getattr(args, "keys_action", None)
+    if action == "add":
+        config_dir.mkdir(parents=True, exist_ok=True)
+        plaintext = add_key_record(
+            path, args.id, priority_weight=args.priority, scopes=args.scopes,
+            note=getattr(args, "note", None),
+        )
+        audit("key_minted", principal=args.id, scopes=args.scopes, by="cli")
+        console.print(
+            f"[green]Key for {args.id}[/green] (store securely, shown once): [bold]{plaintext}[/bold]"
+        )
+        return 0
+    if action == "list":
+        records = load_key_records(path)
+        table = Table(title="API key principals")
+        table.add_column("hash", style="dim")
+        table.add_column("id", style="cyan")
+        table.add_column("priority")
+        table.add_column("scopes")
+        table.add_column("enabled")
+        table.add_column("created")
+        table.add_column("note")
+        for h, r in sorted(records.items()):
+            table.add_row(
+                h[:12], str(r.get("id", "?")), str(r.get("priority_weight", 1.0)),
+                ", ".join(r.get("scopes") or []) or "-", str(r.get("enabled", True)),
+                str(r.get("created", "")), str(r.get("note", "")),
+            )
+        console.print(table)
+        return 0
+    if action == "revoke":
+        hash_prefix = getattr(args, "hash_prefix", None)
+        if hash_prefix:
+            n = revoke_hash(path, hash_prefix)
+            if n == 1:
+                audit("key_revoked", hash_prefix=hash_prefix, by="cli")
+                console.print(f"[yellow]Revoked key {hash_prefix}...[/yellow]")
+                return 0
+            console.print(
+                "[red]Prefix ambiguous; use a longer one[/red]" if n == -1
+                else "[red]No key matches that prefix[/red]"
+            )
+            return 1
+        if not args.id:
+            console.print("[red]Give a principal id or --hash <prefix>[/red]")
+            return 1
+        removed = revoke_id(path, args.id)
+        audit("key_revoked", principal=args.id, count=removed, by="cli")
+        console.print(f"[yellow]Revoked {removed} key(s) for {args.id}[/yellow]")
+        return 0
+    console.print("[red]Usage: llm-relay keys {add|list|revoke}[/red]")
+    return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="llm-relay", description="LLM relay routing control plane")
     subparsers = parser.add_subparsers(dest="command")
@@ -145,6 +239,18 @@ def main() -> int:
 
     subparsers.add_parser("config", help="Print loaded configuration")
 
+    p_keys = subparsers.add_parser("keys", help="Manage per-user API keys")
+    keys_sub = p_keys.add_subparsers(dest="keys_action")
+    k_add = keys_sub.add_parser("add", help="Mint a new key for a user/agent")
+    k_add.add_argument("id")
+    k_add.add_argument("--priority", type=float, default=1.0)
+    k_add.add_argument("--scope", action="append", default=[], dest="scopes")
+    k_add.add_argument("--note", default=None)
+    keys_sub.add_parser("list", help="List key principals (never prints keys)")
+    k_rev = keys_sub.add_parser("revoke", help="Revoke keys by principal id or --hash prefix")
+    k_rev.add_argument("id", nargs="?")
+    k_rev.add_argument("--hash", dest="hash_prefix", default=None)
+
     args = parser.parse_args()
     if args.command == "run":
         return cmd_run(args)
@@ -158,6 +264,8 @@ def main() -> int:
         return cmd_route(args)
     if args.command == "config":
         return cmd_config(args)
+    if args.command == "keys":
+        return cmd_keys(args)
     parser.print_help()
     return 1
 

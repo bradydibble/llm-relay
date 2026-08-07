@@ -68,11 +68,11 @@ def _sanitize_client(raw: str) -> str:
 
 # End-to-end latency buckets (seconds): sub-second routing overhead through
 # multi-minute large-model generations on the local fleet.
-_DURATION_BUCKETS = (0.1, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, float("inf"))
+_DURATION_BUCKETS = (0.1, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600, 1800, 3600, float("inf"))
 
 # Time-to-first-token buckets (seconds): snappy small models through slow
 # prompt-processing on large-context requests, which dominates streaming TTFT.
-_TTFT_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, float("inf"))
+_TTFT_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600, float("inf"))
 
 # Dedicated registry for relay metrics — kept off the global default REGISTRY so
 # repeated create_app() calls (tests, reloads) never collide, and the relay's
@@ -250,13 +250,13 @@ class RelayMetrics:
         self.requests = Counter(
             "llm_relay_requests",
             "Chat-completion requests routed by the relay.",
-            ["provider", "model", "alias", "outcome", "client"],
+            ["provider", "model", "alias", "outcome", "client", "principal"],
             registry=self.registry,
         )
         self.tokens = Counter(
             "llm_relay_tokens",
             "Prompt/completion tokens routed by the relay.",
-            ["provider", "model", "direction", "client"],
+            ["provider", "model", "direction", "client", "principal"],
             registry=self.registry,
         )
         self.fallbacks = Counter(
@@ -268,7 +268,7 @@ class RelayMetrics:
         self.duration = Histogram(
             "llm_relay_request_duration_seconds",
             "End-to-end relay request duration in seconds.",
-            ["provider", "model"],
+            ["provider", "model", "alias", "client"],
             buckets=_DURATION_BUCKETS,
             registry=self.registry,
         )
@@ -276,8 +276,20 @@ class RelayMetrics:
             "llm_relay_ttft_seconds",
             "Streaming time-to-first-token (first chunk) in seconds, end-to-end "
             "including routing. Observed only for streamed responses.",
-            ["provider", "model"],
+            ["provider", "model", "alias", "client"],
             buckets=_TTFT_BUCKETS,
+            registry=self.registry,
+        )
+        self.auth_failures = Counter(
+            "llm_relay_auth_failures",
+            "Requests rejected by API-key auth (missing/unknown/disabled key).",
+            registry=self.registry,
+        )
+
+        self.cache_tokens = Counter(
+            "llm_relay_cache_tokens_total",
+            "Prompt tokens served from llama.cpp prefix cache (cache_n from timings).",
+            ["model", "client", "principal"],
             registry=self.registry,
         )
 
@@ -294,24 +306,33 @@ class RelayMetrics:
         duration_s: float | None,
         fell_back: bool,
         ttft_s: float | None = None,
+        principal: str | None = None,
     ) -> None:
         if not metrics_enabled():
             return
         prov, mdl, ali, cli = _safe(provider), _safe(model), normalize_alias(alias), normalize_client(client)
-        self.requests.labels(provider=prov, model=mdl, alias=ali, outcome=outcome, client=cli).inc()
+        # Principal cardinality is bounded by the key store (plus
+        # internal/anonymous), so no dynamic cap: sanitize only.
+        pri = _sanitize_client(principal) if principal else "anonymous"
+        self.requests.labels(provider=prov, model=mdl, alias=ali, outcome=outcome, client=cli, principal=pri).inc()
 
         eff = _extract_usage(usage, response_body)
         pt, ct = eff.get("prompt_tokens"), eff.get("completion_tokens")
         if pt:
-            self.tokens.labels(provider=prov, model=mdl, direction="prompt", client=cli).inc(int(pt))
+            self.tokens.labels(provider=prov, model=mdl, direction="prompt", client=cli, principal=pri).inc(int(pt))
         if ct:
-            self.tokens.labels(provider=prov, model=mdl, direction="completion", client=cli).inc(int(ct))
+            self.tokens.labels(provider=prov, model=mdl, direction="completion", client=cli, principal=pri).inc(int(ct))
+
+        # Prefix-cache reuse: extract cache_n from llama.cpp timings if present.
+        cache_n = (response_body or {}).get("timings", {}).get("cache_n", 0)
+        if cache_n:
+            self.cache_tokens.labels(model=mdl, client=cli, principal=pri).inc(int(cache_n))
 
         if duration_s is not None and duration_s >= 0:
-            self.duration.labels(provider=prov, model=mdl).observe(duration_s)
+            self.duration.labels(provider=prov, model=mdl, alias=ali, client=cli).observe(duration_s)
 
         if ttft_s is not None and ttft_s >= 0:
-            self.ttft.labels(provider=prov, model=mdl).observe(ttft_s)
+            self.ttft.labels(provider=prov, model=mdl, alias=ali, client=cli).observe(ttft_s)
 
         if fell_back:
             self.fallbacks.labels(alias=ali, model=mdl, client=cli).inc()
@@ -381,6 +402,16 @@ def get_metrics() -> RelayMetrics:
     if _METRICS is None:
         _METRICS = RelayMetrics(RELAY_REGISTRY)
     return _METRICS
+
+
+def record_auth_failure() -> None:
+    """Count one rejected request. Best-effort; never raises into the gate."""
+    if not metrics_enabled():
+        return
+    try:
+        get_metrics().auth_failures.inc()
+    except Exception:
+        pass
 
 
 def register_discovery_collector(discovery: Any) -> DiscoveryCollector:

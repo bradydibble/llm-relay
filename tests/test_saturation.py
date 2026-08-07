@@ -172,6 +172,7 @@ def _make_minimal_config(tmp_path: Path) -> Path:
             "local-llm": {
                 "type": "openai",
                 "base_url": "http://127.0.0.1",
+                "ownership": "ciq_owned",
                 "enabled": True,
                 "max_concurrent": 1,
                 "slot_wait_timeout": 5.0,
@@ -190,7 +191,7 @@ def _make_minimal_config(tmp_path: Path) -> Path:
     return cfg_dir
 
 
-async def test_chat_completions_returns_503_retry_after_on_saturation(tmp_path, monkeypatch):
+async def test_chat_completions_returns_429_retry_after_on_saturation(tmp_path, monkeypatch):
     """When the router raises SaturationError, /v1/chat/completions returns
     503 with a Retry-After header hinting the retry window.
 
@@ -218,13 +219,16 @@ async def test_chat_completions_returns_503_retry_after_on_saturation(tmp_path, 
             json={"model": "test-model", "messages": [{"role": "user", "content": "hi"}]},
         )
 
-    assert resp.status_code == 503
+    # Saturation is backpressure (too many concurrent), NOT a server fault: 429.
+    assert resp.status_code == 429
     assert "Retry-After" in resp.headers
     retry_after = int(resp.headers["Retry-After"])
     assert retry_after >= 1
     body = resp.json()
-    assert body["detail"]["error"] == "backend saturated"
-    assert body["detail"]["backend"] == "local-llm"
+    # Top-level error shape (never nested under `detail`, which clients don't parse).
+    assert "detail" not in body
+    assert body["error"]["type"] == "backend_saturated"
+    assert body["error"]["backend"] == "local-llm"
 
 
 async def test_register_backend_propagates_max_concurrent_from_provider_config():
@@ -608,8 +612,10 @@ async def test_chat_completions_returns_503_retry_after_on_transient_no_backend(
             json={"model": "test-model", "messages": [{"role": "user", "content": "hi"}]},
         )
 
+    # Transient backend-down/paused gap stays 503 + Retry-After, but top-level body.
     assert resp.status_code == 503
     assert "Retry-After" in resp.headers
     assert int(resp.headers["Retry-After"]) >= 1
     body = resp.json()
-    assert body["detail"]["error"] == "no backend available"
+    assert "detail" not in body
+    assert body["error"]["type"] == "no_backend_available"

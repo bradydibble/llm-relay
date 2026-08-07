@@ -212,6 +212,32 @@ def test_get_model_state_unavailable_when_serving_an_unrelated_model():
     assert disc.get_model_state("model-x") == ModelStatus.unavailable
 
 
+def test_get_model_state_does_not_fuzzy_match_a_different_backend():
+    """A configured model's assigned backend is authoritative.
+
+    The shorter model id must not become available merely because another
+    provider reports a longer id containing it.
+    """
+    disc = DiscoveryManager()
+    disc.clients["provider-a:8000"] = EndpointClient(
+        provider_name="provider-a",
+        base_url="http://127.0.0.1:8000",
+        state=EndpointState(
+            provider="provider-a", status=EndpointStatus.healthy, models=["model-y"]
+        ),
+    )
+    disc.clients["provider-b:8001"] = EndpointClient(
+        provider_name="provider-b",
+        base_url="http://127.0.0.1:8001",
+        state=EndpointState(
+            provider="provider-b", status=EndpointStatus.healthy, models=["model-x-optimized"]
+        ),
+    )
+    disc.model_to_client["model-x"] = "provider-a:8000"
+
+    assert disc.get_model_state("model-x") == ModelStatus.unavailable
+
+
 def test_loader_parses_served_model_name(tmp_path):
     """models.yaml `served_model_name` is parsed onto ModelConfig."""
     (tmp_path / "models.yaml").write_text(
@@ -226,7 +252,7 @@ def test_privacy_local_only_excludes_cloud():
     c = _load()
     disc = DiscoveryManager()
     sel = ModelSelector(c, disc)
-    ctx = RoutingContext(requested_model="claude-3-5-sonnet")
+    ctx = RoutingContext(requested_model="example-cloud-large")
     # Default privacy is local_only — cloud-only model should not survive filter.
     pick = sel.select_best(ctx)
     assert pick is None
@@ -537,11 +563,28 @@ def test_explicit_aliases_block_is_ignored_in_favor_of_tags(tmp_path, caplog):
         "an ignored aliases block must warn so a legacy config can migrate"
 
 
+def _write_ciq_owned_providers(tmp_path, *names: str) -> None:
+    """Write a minimal providers.yaml declaring each name as CIQ-owned hardware.
+
+    `ownership` is required on every provider, so a synthetic config that writes
+    only models.yaml now has no resolvable ownership and — by the fail-closed
+    rule in ModelSelector._ownership_of — every model reads as third_party and is
+    dropped for a default (confidential) request. Tests that are not about the
+    confidentiality axis declare CIQ-owned metal here so that axis stays neutral.
+    """
+    body = "providers:\n" + "".join(
+        f"  {n}:\n    type: openai\n    base_url: http://127.0.0.1\n    ownership: ciq_owned\n"
+        for n in names
+    )
+    (tmp_path / "providers.yaml").write_text(body)
+
+
 def test_reasoning_floor_refuses_sub_floor_models(tmp_path):
     """A category with `reasoning_floor` (opt-in, off by default) only admits models
     whose preference clears the floor — the quality gate. A sub-floor model is
     refused even when it's the only thing live (better an honest no-candidate than
     quality below the bar); a model clearing the floor is selected normally."""
+    _write_ciq_owned_providers(tmp_path, "local-llm")
     (tmp_path / "models.yaml").write_text(
         "models:\n"
         "  weak:\n    provider: local-llm\n    port: 8080\n    preference: 0.5\n    use_cases: {smart: 1}\n"
@@ -561,6 +604,7 @@ def test_reasoning_floor_refuses_sub_floor_models(tmp_path):
 def test_no_reasoning_floor_is_open_by_default(tmp_path):
     """Without a reasoning_floor, a category admits any live model in priority order
     — the floor is strictly opt-in."""
+    _write_ciq_owned_providers(tmp_path, "local-llm")
     (tmp_path / "models.yaml").write_text(
         "models:\n"
         "  weak:\n    provider: local-llm\n    port: 8080\n    preference: 0.5\n    use_cases: {smart: 1}\n"

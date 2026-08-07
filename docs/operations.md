@@ -100,7 +100,9 @@ default upstream may break. Prefer `llm-mode <mode>` or `llm-mode set-default`.
 
 1. Enable in `config/providers.yaml`:
    ```yaml
-   anthropic:
+   example-cloud:
+     type: openai          # the only wire protocol the relay speaks
+     ownership: third_party
      enabled: true
      auth_source: vault    # see README for credential handling
    ```
@@ -113,6 +115,40 @@ default upstream may break. Prefer `llm-mode <mode>` or `llm-mode set-default`.
    `X-Llm-Relay-Privacy: cloud_ok`. The default is `local_only` and cloud
    models are filtered out otherwise — that is intentional.
 5. Restart the relay.
+
+## Adding hardware CIQ does not own
+
+This is about **running our own models on someone else's machine** — a borrowed
+lab box, a shared tray. It is not about vendor inference APIs; the relay does not
+proxy those, and access to them is a company-authorization question handled in
+the client harness, not an `ownership` value here.
+
+Every provider must declare `ownership`. The loader **raises and the relay
+refuses to start** if one omits it — deliberately, because the alternative is a
+silent default, and a wrong default here routes confidential workloads onto
+borrowed metal without anyone noticing.
+
+```yaml
+providers:
+  nvidia-lab-a:
+    type: openai
+    base_url: http://10.0.0.9
+    ownership: third_party    # our models, someone else's machine
+```
+
+Consequences of `third_party`, all automatic:
+
+- Every model on that provider — including runtime-discovered ones — serves only
+  requests carrying `X-Llm-Relay-Confidentiality: non_confidential`.
+- A `confidential` request that could ONLY be served there gets a terminal 503
+  naming the node and the header to set. It is never silently redirected to a
+  CIQ-owned model, and never given a misleading `Retry-After`.
+- `/v1/available-models` reports `ownership` and `requires_non_confidential` per
+  model so clients can filter before they route.
+
+To let a caller make that declaration, grant their API key the `third_party`
+scope. Without it the header is clamped back to `confidential`, so handing out
+the header alone is not enough — which is the point.
 
 ## When does a change need a restart?
 

@@ -56,6 +56,41 @@ entirely:
 - **Privacy**: `local_only` (the default) excludes any model with
   `privacy: cloud_ok`. Cross this boundary by setting the
   `X-Llm-Relay-Privacy: cloud_ok` header.
+- **Confidentiality**: `confidential` (the default) excludes every model whose
+  **provider** is `ownership: third_party` — borrowed or shared machines that CIQ
+  runs its own models on (the AMD MI300X tray, the NVIDIA lab). Cross this
+  boundary by setting the `X-Llm-Relay-Confidentiality: non_confidential` header,
+  which asserts the workload carries no CIQ-proprietary material (open-source
+  work: kernel, Warewulf, Ascender base, public codebases).
+
+  **What this axis is, and is not.** It answers exactly one question: *may this
+  workload run on a machine CIQ does not control?* The risk it addresses is
+  hardware custody — on borrowed metal the box operator can observe or retain
+  anything, and no agreement binds them. It is **not** a general "may this data
+  leave CIQ" policy, and it says nothing about a contracted vendor's inference
+  API, where the counterparty carries compliance and contractual obligations.
+  That is a different and separately-governed trust model; this relay serves only
+  CIQ-operated inference and does not proxy vendors at all.
+
+  Three properties make this a control rather than a suggestion:
+
+  1. **Ownership is a property of the metal, not the weights.** It is declared
+     once per provider in `providers.yaml` and inherited by every model on that
+     host, including runtime-discovered ones. It is a *required* key — the loader
+     refuses to start without it, because an untagged provider would otherwise
+     inherit a guess.
+  2. **It fails closed everywhere.** An absent header, a misspelled value
+     (`non-confidential`, `nonconfidential`), or a model naming a provider that
+     does not exist all resolve to the restrictive answer.
+  3. **The declaration is bounded by the caller's key.** Only principals carrying
+     the `third_party` scope may pass `non_confidential`; others are clamped back
+     to `confidential` (see `_clamp_confidentiality`). The relay cannot read a
+     prompt and judge its sensitivity, but it can bound who is allowed to make
+     the claim, so a misconfigured agent cannot unilaterally route proprietary
+     work onto borrowed metal.
+
+  A request blocked by this axis is **terminal, never retried**, and the 503 names
+  the third-party nodes involved and the header to set.
 - **Tool requirement**: with `X-Llm-Relay-Require-Tools: true`, models without
   `tool_use` in their capabilities are dropped.
 - **Context window**: models whose **live** `context_window` cannot hold the
@@ -187,12 +222,12 @@ request time, with no human intervention.
 ### Category spanning local and cloud, default privacy
 
 `POST /v1/chat/completions { "model": "fast" }`
-with `fast` tagged on `[qwen3.5-9b, claude-3-5-haiku]` and default
+with `fast` tagged on `[qwen3.5-9b, example-cloud-fast]` and default
 `privacy: local_only`:
 
-1. Build: `[qwen3.5-9b, claude-3-5-haiku]` + open-fallthrough tail (other live
+1. Build: `[qwen3.5-9b, example-cloud-fast]` + open-fallthrough tail (other live
    local models, preference-ranked)
-2. Filter: claude drops out (cloud_ok under local_only)
+2. Filter: `example-cloud-fast` drops out (cloud_ok under local_only)
 3. Order: `[qwen3.5-9b, <other live local models that fit>]`
 4. Select: `qwen3.5-9b` if up; otherwise fall through to the next live local
    model. Only 503s if no live local model can serve the request — and then with

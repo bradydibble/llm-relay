@@ -1,0 +1,13 @@
+# Example auth config. Copy to your off-repo LLM_RELAY_CONFIG_DIR as auth.yaml.
+auth:
+  enabled: true
+  # Loopback listeners whose callers are trusted implicitly (attributed as
+  # principal `internal` with admin+cloud scopes, no key required). Run the
+  # relay with LLM_RELAY_PORT set to a trusted port and LLM_RELAY_AUTH_PORT
+  # set to the enforced listener your reverse proxy routes external traffic
+  # to. NEVER route public traffic to a trusted port.
+  trusted_ports: [8090]
+  trusted_principal: internal
+  # Paths served without a key on the enforced listener. /health returns a
+  # minimal body; everything else (including /metrics) needs a key there.
+  exempt_paths: ["/health"]

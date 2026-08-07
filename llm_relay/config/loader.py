@@ -16,12 +16,14 @@ from .types import (
     ModelConfig,
     ModeConfig,
     ModeHint,
+    Ownership,
     PolicyConfig,
     PrivacyConstraints,
     Privacy,
     ProviderConfig,
     ProviderType,
 )
+from ..auth import AuthConfig, load_keys
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,29 @@ class ModelRegistry:
         self.models: dict[str, ModelConfig] = {}
         self.aliases: dict[str, list[str]] = {}
         self.categories: dict[str, CategoryConfig] = {}
+        # Variant grouping (plan 2): logical_models[L] = [variant config names],
+        # derived from each model's optional `logical` field at load.
+        self.logical_models: dict[str, list[str]] = {}
+        # Per-host exclusivity (plan 2): groups of model names that cannot be hot
+        # at once because they share a served (provider, port). Derived at load.
+        self.exclusivity_groups: list[list[str]] = []
+
+    def variants_of(self, logical: str) -> list[str]:
+        """Variant config names grouped under a logical model (empty if none)."""
+        return list(self.logical_models.get(logical, []))
+
+    def logical_of(self, name: str) -> str | None:
+        """The logical model a config entry is a variant of, or None."""
+        m = self.models.get(name)
+        return m.logical if m else None
+
+    def exclusive_with(self, name: str) -> list[str]:
+        """Model names mutually exclusive with ``name`` (they share its served
+        provider+port), excluding itself. Empty when ``name`` shares no port."""
+        for group in self.exclusivity_groups:
+            if name in group:
+                return [n for n in group if n != name]
+        return []
 
 
 class ConfigLoader:
@@ -55,12 +80,35 @@ class ConfigLoader:
         self._models = ModelRegistry()
         self._modes: dict[str, ModeConfig] = {}
         self._policy: PolicyConfig | None = None
+        # Always present so middleware reading config.auth never hits an
+        # AttributeError before load() runs; load() overwrites it.
+        self.auth: AuthConfig = AuthConfig()
 
     def load(self) -> None:
         self._load_providers()
         self._load_models()
         self._load_modes()
         self._load_policy()
+        self._load_auth()
+
+    def _load_auth(self) -> None:
+        """Load the per-user API-key store into ``self.auth``. Enabled by the
+        ``LLM_RELAY_AUTH=1`` env flag or an ``auth.enabled: true`` block in an
+        optional ``auth.yaml``; principals come from ``api_keys.yaml`` (kept
+        off-repo in the config dir, never committed)."""
+        auth_file = self.config_dir / "api_keys.yaml"
+        auth_block: dict = {}
+        auth_yaml = self.config_dir / "auth.yaml"
+        if auth_yaml.exists():
+            auth_block = (yaml.safe_load(auth_yaml.read_text()) or {}).get("auth", {}) or {}
+        enabled = os.environ.get("LLM_RELAY_AUTH") == "1" or bool(auth_block.get("enabled", False))
+        self.auth = AuthConfig(
+            enabled=enabled,
+            exempt_paths=list(auth_block.get("exempt_paths", ["/health"])),
+            trusted_ports=[int(p) for p in (auth_block.get("trusted_ports") or [])],
+            trusted_principal=str(auth_block.get("trusted_principal", "internal")),
+            principals_by_hash=load_keys(auth_file),
+        )
 
     # --- Maintenance-pause persistence (so a paused provider survives a relay
     # restart). {provider: {"until": str|null, "reason": str|null}} in
@@ -91,9 +139,24 @@ class ConfigLoader:
             data = yaml.safe_load(f) or {}
         for name, cfg in (data.get("providers") or {}).items():
             cb = cfg.get("circuit_breaker") or {}
+            # Hardware ownership is REQUIRED — no default. An untagged provider
+            # would otherwise inherit a guess, and guessing "CIQ owns this" about
+            # borrowed metal silently routes confidential workloads onto it. Fail
+            # loudly at load (the relay refuses to start, fixed in seconds) rather
+            # than quietly at request time.
+            if "ownership" not in cfg:
+                raise ValueError(
+                    f"provider {name!r} in {path} is missing required key 'ownership'. "
+                    f"Set 'ownership: ciq_owned' for hardware CIQ fully owns, or "
+                    f"'ownership: third_party' for a borrowed/shared machine we run "
+                    f"our own models on (which may then serve ONLY workloads declared "
+                    f"non-confidential). This is about who controls the box, not about "
+                    f"vendor inference APIs — the relay does not proxy those."
+                )
             self._providers[name] = ProviderConfig(
                 type=ProviderType(cfg.get("type", "openai")),
                 base_url=cfg["base_url"],
+                ownership=Ownership(cfg["ownership"]),
                 enabled=cfg.get("enabled", True),
                 auth_source=cfg.get("auth_source"),
                 health_endpoint=cfg.get("health_endpoint", "/v1/models"),
@@ -106,6 +169,7 @@ class ConfigLoader:
                 model_overrides=cfg.get("model_overrides", []) or [],
                 max_concurrent=cfg.get("max_concurrent"),
                 slot_wait_timeout=float(cfg.get("slot_wait_timeout", 30.0)),
+                discover_ports=cfg.get("discover_ports", []) or [],
             )
 
     def _load_models(self) -> None:
@@ -144,8 +208,15 @@ class ConfigLoader:
                 use_cases={k: float(v) for k, v in (cfg.get("use_cases") or {}).items()},
                 manual_only=bool(cfg.get("manual_only", False)),
                 candidate_lane=cfg.get("candidate_lane") if cfg.get("candidate_lane") else None,
+                logical=cfg.get("logical"),
+                quant=cfg.get("quant"),
+                strip_params=cfg.get("strip_params", []) or [],
+                set_params=cfg.get("set_params", {}) or {},
+                description=cfg.get("description"),
             )
         self._derive_aliases_from_use_cases()
+        self._derive_logical_models()
+        self._derive_exclusivity()
 
     def _derive_aliases_from_use_cases(self) -> None:
         """Transpose per-model ``use_cases`` tags into the alias map: for each
@@ -167,6 +238,33 @@ class ConfigLoader:
                 n,
             ))
             self._models.aliases[uc] = names
+
+    def _derive_logical_models(self) -> None:
+        """Group variants by their ``logical`` field:
+        ``logical_models[L] = sorted [variant config names]``. Entries with no
+        ``logical`` are standalone models and are not grouped. Additive: the flat
+        ``models`` dict is unchanged, so existing routing is unaffected."""
+        derived: dict[str, list[str]] = {}
+        for name, m in self._models.models.items():
+            if m.logical:
+                derived.setdefault(m.logical, []).append(name)
+        for names in derived.values():
+            names.sort()
+        self._models.logical_models = derived
+
+    def _derive_exclusivity(self) -> None:
+        """Models sharing the same served ``(provider, port)`` are mutually
+        exclusive: one served instance per port. Derive groups of size > 1.
+        ``port=None`` entries (e.g. cloud) are never grouped, since they serve
+        concurrently rather than swapping on a physical port."""
+        by_port: dict[tuple[str, int], list[str]] = {}
+        for name, m in self._models.models.items():
+            if m.port is None:
+                continue
+            by_port.setdefault((m.provider, m.port), []).append(name)
+        self._models.exclusivity_groups = [
+            sorted(names) for names in by_port.values() if len(names) > 1
+        ]
 
     def _load_modes(self) -> None:
         path = self.config_dir / "modes.yaml"

@@ -6,11 +6,32 @@
 #     export LLM_RELAY_CONFIG_DIR=/path/to/your/private/llm-relay/config
 #
 # Each provider is a host. Per-model ports/paths live in models.yaml.
+#
+# `ownership` is REQUIRED on every provider — the loader refuses to start
+# without it. It declares who physically controls the machine your models run on:
+#
+#   ciq_owned    — you control the machine end to end. Any workload may run
+#                  there, confidential or not.
+#   third_party  — borrowed or shared metal you run YOUR OWN models on. You
+#                  control the software; someone else controls the box, and no
+#                  agreement binds what they may observe or retain. Serves ONLY
+#                  requests that explicitly declare
+#                  `X-Llm-Relay-Confidentiality: non_confidential`.
+#
+# SCOPE: this is a hardware-custody control, not a general "may this data leave"
+# policy. It says nothing about a contracted vendor's inference API — a different
+# trust model, where the counterparty carries compliance obligations. The relay
+# serves self-hosted inference only and does not proxy vendors.
+#
+# There is deliberately no default: an untagged provider would inherit a guess,
+# and guessing "we own this" about borrowed hardware silently routes
+# confidential work onto it.
 
 providers:
   local-llm:
     type: openai
     base_url: http://127.0.0.1
+    ownership: ciq_owned
     enabled: true
     health_endpoint: /v1/models
     poll_interval: 15s
@@ -19,11 +40,17 @@ providers:
       failure_threshold: 3
       recovery_timeout: 30s
 
-  anthropic:
-    type: anthropic
-    base_url: https://api.anthropic.com
+  # Vendor-neutral example of a CLOUD tier, kept disabled. Deliberately generic:
+  # this template ships no real vendor, and `type:` has only one value (`openai`)
+  # because the relay speaks OpenAI-compatible chat-completions to everything.
+  # Present so the privacy axis (`X-Llm-Relay-Privacy: cloud_ok` + the `cloud` key
+  # scope) has something to gate — see tests/test_selector.py.
+  #
+  # Reaching a provider like this needs BOTH `privacy: cloud_ok` AND a
+  # `non_confidential` declaration: it is someone else's hardware on both axes.
+  example-cloud:
+    type: openai
+    base_url: https://cloud.example.invalid
+    ownership: third_party
     enabled: false
     auth_source: vault
-    model_overrides:
-      - claude-3-5-sonnet-20241022
-      - claude-3-5-haiku-20241022

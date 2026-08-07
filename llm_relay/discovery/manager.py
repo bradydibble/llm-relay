@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -14,6 +15,23 @@ from ..config.types import CircuitBreaker, EndpointState, EndpointStatus, ModelS
 from .endpoint import EndpointClient
 
 logger = logging.getLogger(__name__)
+
+
+def _default_unavailable_alert_seconds() -> float:
+    """Seconds a backend must stay continuously unavailable before the poll
+    loop emits a WARNING (default 300s / ~5min). Env-overridable via
+    ``LLM_RELAY_UNAVAILABLE_ALERT_SECONDS``. Purely observability: does NOT
+    affect availability, routing, or gating.
+    """
+    raw = os.environ.get("LLM_RELAY_UNAVAILABLE_ALERT_SECONDS")
+    if raw:
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+    return 300.0
 
 
 def _default_reconcile_idle() -> float:
@@ -206,6 +224,16 @@ class DiscoveryManager:
         )
 
     async def _poll_loop(self, client: EndpointClient, interval: int) -> None:
+        # Observability only: warn once a backend has been continuously
+        # unavailable for >= _default_unavailable_alert_seconds(), and again on
+        # recovery. This does NOT touch availability/routing/gating -- a long-
+        # down backend is still just ``unavailable`` to the selector; this only
+        # makes a silent, prolonged outage visible in the logs.
+        alert_after_polls = max(
+            1, math.ceil(_default_unavailable_alert_seconds() / max(interval, 1))
+        )
+        unavailable_streak = 0
+        alerted = False
         while True:
             try:
                 models = await client.fetch_models()
@@ -218,6 +246,29 @@ class DiscoveryManager:
                     client.state.models = []
             except Exception:
                 client.state.status = EndpointStatus.unavailable
+            # Prolonged-unreachability alert (fires once per outage, plus a
+            # recovery line). Tracked in loop-local state so no shared field or
+            # routing state is touched.
+            if client.state.status == EndpointStatus.unavailable:
+                unavailable_streak += 1
+                if unavailable_streak == alert_after_polls:
+                    alerted = True
+                    logger.warning(
+                        "backend %s (%s) unreachable for %d consecutive poll(s) "
+                        "(>= %.0fs): its models are undiscoverable until it recovers",
+                        client.provider_name, client.base_url,
+                        unavailable_streak, unavailable_streak * interval,
+                    )
+            else:
+                if alerted:
+                    logger.warning(
+                        "backend %s (%s) recovered after %d unavailable poll(s) "
+                        "(~%.0fs down)",
+                        client.provider_name, client.base_url,
+                        unavailable_streak, unavailable_streak * interval,
+                    )
+                unavailable_streak = 0
+                alerted = False
             # Containment sweep each cycle: free any slot stranded by a missed
             # release so a leak can't permanently shrink capacity.
             self._reconcile_stuck_slots(client)
@@ -270,6 +321,16 @@ class DiscoveryManager:
                 if client.state.status == EndpointStatus.degraded:
                     return ModelStatus.degraded
                 return ModelStatus.unavailable
+            # A configured model is pinned to this exact backend (provider +
+            # port + path).  Do not let a similarly-named model on another
+            # backend make it appear available: for example, ``model-x`` on
+            # provider-a must not fuzzy-match ``model-x-optimized`` on
+            # provider-b.  Apart from lying to status consumers, that would
+            # select the configured
+            # backend even though it is serving a different model.
+            return ModelStatus.unavailable
+        # Unmapped names are runtime/discovery-only, so searching the reported
+        # model ids is the only way to resolve them.
         for client in self.clients.values():
             if self._serves(client, model_name):
                 if client.state.status == EndpointStatus.healthy:

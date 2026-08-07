@@ -131,7 +131,8 @@ def test_records_one_request_against_provider_model_alias_outcome_client():
     v = rm.registry.get_sample_value(
         "llm_relay_requests_total",
         {"provider": "prov-a", "model": "qwen3.5-35b",
-         "alias": "balanced", "outcome": "success", "client": "claude-code"},
+         "alias": "balanced", "outcome": "success", "client": "claude-code",
+         "principal": "anonymous"},
     )
     assert v == 1.0
 
@@ -145,11 +146,13 @@ def test_counts_prompt_and_completion_tokens_from_streaming_usage():
     )
     prompt = rm.registry.get_sample_value(
         "llm_relay_tokens_total",
-        {"provider": "prov-a", "model": "m", "direction": "prompt", "client": "unknown"},
+        {"provider": "prov-a", "model": "m", "direction": "prompt", "client": "unknown",
+         "principal": "anonymous"},
     )
     completion = rm.registry.get_sample_value(
         "llm_relay_tokens_total",
-        {"provider": "prov-a", "model": "m", "direction": "completion", "client": "unknown"},
+        {"provider": "prov-a", "model": "m", "direction": "completion", "client": "unknown",
+         "principal": "anonymous"},
     )
     assert prompt == 100.0
     assert completion == 40.0
@@ -167,7 +170,8 @@ def test_non_streaming_tokens_extracted_from_response_body_usage():
     )
     completion = rm.registry.get_sample_value(
         "llm_relay_tokens_total",
-        {"provider": "prov-a", "model": "m", "direction": "completion", "client": "unknown"},
+        {"provider": "prov-a", "model": "m", "direction": "completion", "client": "unknown",
+         "principal": "anonymous"},
     )
     assert completion == 12.0
 
@@ -180,9 +184,36 @@ def test_records_request_duration_observation():
     )
     count = rm.registry.get_sample_value(
         "llm_relay_request_duration_seconds_count",
-        {"provider": "prov-a", "model": "m"},
+        {"provider": "prov-a", "model": "m", "alias": "a", "client": "unknown"},
     )
     assert count == 1.0
+
+
+def test_duration_histogram_is_sliceable_by_client_and_alias():
+    # The latency histograms carry client + alias so latency is sliceable
+    # per-agent / per-use-case, not just per provider/model. Two different
+    # agents must land in DISTINCT series (not conflated).
+    rm = _rm()
+    rm.record_request(
+        alias="balanced", model="m", provider="prov-a", outcome="success",
+        client="agent-a", usage=None, response_body=None, duration_s=1.0, fell_back=False,
+    )
+    rm.record_request(
+        alias="fast", model="m", provider="prov-a", outcome="success",
+        client="agent-b", usage=None, response_body=None, duration_s=2.0, fell_back=False,
+    )
+    a = rm.registry.get_sample_value(
+        "llm_relay_request_duration_seconds_count",
+        {"provider": "prov-a", "model": "m", "alias": "balanced", "client": "agent-a"})
+    b = rm.registry.get_sample_value(
+        "llm_relay_request_duration_seconds_count",
+        {"provider": "prov-a", "model": "m", "alias": "fast", "client": "agent-b"})
+    assert a == 1.0 and b == 1.0
+    # agent-a's request must NOT show up under agent-b's series
+    conflated = rm.registry.get_sample_value(
+        "llm_relay_request_duration_seconds_count",
+        {"provider": "prov-a", "model": "m", "alias": "balanced", "client": "agent-b"})
+    assert conflated is None
 
 
 def test_records_ttft_observation_when_provided():
@@ -195,7 +226,8 @@ def test_records_ttft_observation_when_provided():
         ttft_s=0.25,
     )
     count = rm.registry.get_sample_value(
-        "llm_relay_ttft_seconds_count", {"provider": "prov-a", "model": "m"})
+        "llm_relay_ttft_seconds_count",
+        {"provider": "prov-a", "model": "m", "alias": "a", "client": "unknown"})
     assert count == 1.0
 
 
@@ -210,7 +242,8 @@ def test_ttft_not_observed_when_none():
         ttft_s=None,
     )
     count = rm.registry.get_sample_value(
-        "llm_relay_ttft_seconds_count", {"provider": "prov-a", "model": "m"})
+        "llm_relay_ttft_seconds_count",
+        {"provider": "prov-a", "model": "m", "alias": "a", "client": "unknown"})
     assert count is None
 
 
@@ -231,9 +264,11 @@ def test_emit_chat_completion_threads_ttft_ns_to_histogram(monkeypatch):
     )
 
     count = rm.registry.get_sample_value(
-        "llm_relay_ttft_seconds_count", {"provider": "prov-a", "model": "m"})
+        "llm_relay_ttft_seconds_count",
+        {"provider": "prov-a", "model": "m", "alias": "main", "client": "unknown"})
     s = rm.registry.get_sample_value(
-        "llm_relay_ttft_seconds_sum", {"provider": "prov-a", "model": "m"})
+        "llm_relay_ttft_seconds_sum",
+        {"provider": "prov-a", "model": "m", "alias": "main", "client": "unknown"})
     assert count == 1.0
     assert abs(s - 0.25) < 1e-9
 
@@ -260,9 +295,11 @@ def test_emit_chat_completion_derives_ttft_from_timings_when_not_provided(monkey
     )
 
     count = rm.registry.get_sample_value(
-        "llm_relay_ttft_seconds_count", {"provider": "prov-a", "model": "m"})
+        "llm_relay_ttft_seconds_count",
+        {"provider": "prov-a", "model": "m", "alias": "main", "client": "unknown"})
     s = rm.registry.get_sample_value(
-        "llm_relay_ttft_seconds_sum", {"provider": "prov-a", "model": "m"})
+        "llm_relay_ttft_seconds_sum",
+        {"provider": "prov-a", "model": "m", "alias": "main", "client": "unknown"})
     assert count == 1.0
     assert abs(s - 1.5) < 1e-9  # 1500 ms -> 1.5 s
 
@@ -288,7 +325,8 @@ def test_explicit_ttft_ns_wins_over_timings(monkeypatch):
     )
 
     s = rm.registry.get_sample_value(
-        "llm_relay_ttft_seconds_sum", {"provider": "prov-a", "model": "m"})
+        "llm_relay_ttft_seconds_sum",
+        {"provider": "prov-a", "model": "m", "alias": "main", "client": "unknown"})
     assert abs(s - 0.25) < 1e-9  # 0.25 s, NOT 9.0 s from prompt_ms
 
 
@@ -324,7 +362,7 @@ def test_none_provider_and_model_coerced_to_label_safe_string():
     v = rm.registry.get_sample_value(
         "llm_relay_requests_total",
         {"provider": "none", "model": "none", "alias": "balanced",
-         "outcome": "no_candidate", "client": "unknown"},
+         "outcome": "no_candidate", "client": "unknown", "principal": "anonymous"},
     )
     assert v == 1.0
 

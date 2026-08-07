@@ -1,4 +1,4 @@
-.PHONY: install venv run run-server cli lint test clean help
+.PHONY: install venv run run-server cli lint test conformance clean help
 
 VENV ?= .venv
 PY ?= $(VENV)/bin/python
@@ -24,6 +24,12 @@ lint:
 
 test:
 	$(PY) -m pytest tests/ -v
+
+# Live policy check against a RUNNING relay and its REAL config. `test` uses
+# synthetic fixtures and so can never catch a config mistake; this can.
+# Override the target with ENDPOINT=... (default: the homelab relay).
+conformance:
+	$(PY) scripts/policy-conformance.py $(if $(ENDPOINT),--endpoint $(ENDPOINT),) --verbose
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
