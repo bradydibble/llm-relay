@@ -890,16 +890,130 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
     def _acting(request: Request) -> str:
         return getattr(getattr(request.state, "principal", None), "id", "?")
 
+    def _owner_email(body: dict[str, Any]) -> str:
+        email = str(body.get("owner_email") or "").strip().lower()
+        local, separator, domain = email.partition("@")
+        if not local or separator != "@" or domain != "ciq.com":
+            raise HTTPException(400, detail="valid CIQ owner email required")
+        return email
+
+    def _owner_key_view(key_hash: str, record: dict[str, Any]) -> dict[str, Any]:
+        """Metadata safe to show to the owner or a portal administrator.
+
+        The key hash and plaintext bearer value deliberately never cross this
+        API. The short hash prefix exists only to identify a record for a later
+        revoke request.
+        """
+        return {
+            "hash_prefix": key_hash[:12],
+            "id": record.get("id"),
+            "owner_email": record.get("owner_email", ""),
+            "scopes": list(record.get("scopes", []) or []),
+            "priority_weight": record.get("priority_weight", 1.0),
+            "enabled": record.get("enabled", True),
+            "created": record.get("created", ""),
+            "note": record.get("note", ""),
+        }
+
+    def _require_key_issuer(request: Request) -> None:
+        principal = getattr(request.state, "principal", None)
+        if "key_issuer" not in list(getattr(principal, "scopes", []) or []):
+            raise HTTPException(403, detail="key issuer scope required")
+
+    @app.post("/portal/owner-keys/list")
+    async def portal_owner_keys_list(request: Request) -> dict[str, Any]:
+        """List one verified owner's key metadata for the portal service.
+
+        The relay authenticates the service with ``key_issuer``. The portal is
+        responsible for deriving ``owner_email`` from its Okta identity, never
+        accepting it from browser input.
+        """
+        _require_key_issuer(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, detail="invalid JSON")
+        email = _owner_email(body)
+        records = load_key_records(_keys_path)
+        keys = [
+            _owner_key_view(key_hash, record)
+            for key_hash, record in sorted(records.items())
+            if str(record.get("owner_email") or "").strip().lower() == email
+        ]
+        return {"keys": keys}
+
+    def _owner_principal(records: dict[str, dict[str, Any]], email: str) -> str:
+        ids = {
+            str(record.get("id") or "").strip()
+            for record in records.values()
+            if str(record.get("owner_email") or "").strip().lower() == email
+        }
+        ids.discard("")
+        if not ids:
+            # New user: derive principal from email slug (same logic as the portal's
+            # slug_from_email). This lets first-time CIQ users self-provision.
+            import re
+            local = email.split("@", 1)[0].strip().lower()
+            local = local.split("+", 1)[0].replace(".", "")
+            slug = re.sub(r"[^a-z0-9-]+", "-", local).strip("-")[:32]
+            if not slug:
+                raise HTTPException(400, detail="cannot derive principal from email")
+            return slug
+        if len(ids) != 1:
+            raise HTTPException(409, detail="owner has conflicting principals")
+        return ids.pop()
+
+    @app.post("/portal/owner-keys")
+    async def portal_owner_keys_add(request: Request) -> dict[str, Any]:
+        """Mint one non-admin default token for a mapped portal user."""
+        _require_key_issuer(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, detail="invalid JSON")
+        email = _owner_email(body)
+        principal = _owner_principal(load_key_records(_keys_path), email)
+        scopes = ["cloud", "third_party"]
+        plaintext = add_key_record(
+            _keys_path, principal, priority_weight=1.0, scopes=scopes,
+            note="self-provisioned", owner_email=email,
+        )
+        _reload_principals()
+        _audit("owner_key_minted", principal=principal, owner_email=email, by=_acting(request))
+        return {"id": principal, "key": plaintext, "scopes": scopes}
+
+    @app.delete("/portal/owner-keys/{hash_prefix}")
+    async def portal_owner_keys_revoke(hash_prefix: str, request: Request) -> dict[str, Any]:
+        """Revoke one mapped user's non-admin key, never an operator key."""
+        _require_key_issuer(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, detail="invalid JSON")
+        email = _owner_email(body)
+        records = load_key_records(_keys_path)
+        matches = [key_hash for key_hash in records if hash_prefix and key_hash.startswith(hash_prefix)]
+        if not matches:
+            raise HTTPException(404, detail="no owner key matches that prefix")
+        if len(matches) != 1:
+            raise HTTPException(409, detail="prefix ambiguous; use a longer one")
+        record = records[matches[0]]
+        if str(record.get("owner_email") or "").strip().lower() != email:
+            raise HTTPException(404, detail="no owner key matches that prefix")
+        if "admin" in list(record.get("scopes", []) or []):
+            raise HTTPException(403, detail="admin key cannot be self-revoked")
+        n = revoke_hash(_keys_path, hash_prefix)
+        if n != 1:  # Defensive, the exact-match check above makes this unreachable.
+            raise HTTPException(409, detail="key changed before revoke")
+        _reload_principals()
+        _audit("owner_key_revoked", hash_prefix=hash_prefix, owner_email=email, by=_acting(request))
+        return {"revoked": 1}
+
     @app.get("/admin/keys")
     async def admin_keys_list(request: Request) -> dict[str, Any]:
         records = load_key_records(_keys_path)
-        return {"keys": [
-            {"hash_prefix": h[:12], "id": r.get("id"), "scopes": r.get("scopes", []),
-             "priority_weight": r.get("priority_weight", 1.0),
-             "enabled": r.get("enabled", True), "created": r.get("created", ""),
-             "note": r.get("note", "")}
-            for h, r in sorted(records.items())
-        ]}
+        return {"keys": [_owner_key_view(key_hash, record)
+                         for key_hash, record in sorted(records.items())]}
 
     @app.post("/admin/keys")
     async def admin_keys_add(request: Request) -> dict[str, Any]:
@@ -909,14 +1023,18 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
         kid = str(body.get("id") or "").strip()
         if not kid:
             raise HTTPException(400, detail="id required")
+        owner_email = _owner_email(body) if body.get("owner_email") else None
+        scopes = ["cloud", "third_party"]
         plaintext = add_key_record(
             _keys_path, kid,
             priority_weight=float(body.get("priority_weight", 0.5)),
+            scopes=scopes,
             note=str(body.get("note", "")),
+            owner_email=owner_email,
         )
         _reload_principals()
         _audit("key_minted", principal=kid, by=_acting(request))
-        return {"id": kid, "key": plaintext}
+        return {"id": kid, "key": plaintext, "scopes": scopes}
 
     @app.delete("/admin/keys/{hash_prefix}")
     async def admin_keys_revoke(hash_prefix: str, request: Request) -> dict[str, Any]:

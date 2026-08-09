@@ -183,6 +183,7 @@ def add_key_record(
     priority_weight: float = 1.0,
     scopes: list[str] | None = None,
     note: str | None = None,
+    owner_email: str | None = None,
 ) -> str:
     """Mint a key and persist its record (hash only). Returns the plaintext,
     which is shown once by the caller and never stored."""
@@ -190,7 +191,7 @@ def add_key_record(
 
     plaintext, principal = mint_key(id, priority_weight=priority_weight, scopes=scopes)
     records = load_key_records(path)
-    records[hash_key(plaintext)] = {
+    record = {
         "id": principal.id,
         "priority_weight": principal.priority_weight,
         "scopes": principal.scopes,
@@ -198,6 +199,9 @@ def add_key_record(
         "created": datetime.date.today().isoformat(),
         "note": note or "",
     }
+    if owner_email:
+        record["owner_email"] = owner_email
+    records[hash_key(plaintext)] = record
     write_key_records(path, records)
     return plaintext
 

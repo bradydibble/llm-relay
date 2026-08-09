@@ -18,7 +18,9 @@ def app_two_listeners(tmp_path, monkeypatch):
     (tmp_path / "api_keys.yaml").write_text(
         "keys:\n"
         f"  {hash_key('llmr_plain')}:\n    id: jdoe\n    priority_weight: 0.5\n"
-        f"  {hash_key('llmr_admin')}:\n    id: brady\n    scopes: [admin]\n"
+        f"    owner_email: jdoe@ciq.com\n"
+        f"  {hash_key('llmr_admin')}:\n    id: brady\n    owner_email: brady@ciq.com\n    scopes: [admin]\n"
+        f"  {hash_key('llmr_portal')}:\n    id: svc-portal\n    scopes: [key_issuer]\n"
     )
     return create_app(config_dir=tmp_path)
 
@@ -28,6 +30,90 @@ def _client(app, port):
 
 
 ADMIN = {"Authorization": "Bearer llmr_admin"}
+PORTAL = {"Authorization": "Bearer llmr_portal"}
+
+
+def test_key_issuer_lists_only_the_requested_owner_records(app_two_listeners):
+    """A service lacking the owner-key route must never expose the key store.
+
+    The portal will supply this address only after deriving it from its Okta
+    identity header. The relay returns record metadata, never a bearer value.
+    """
+    c = _client(app_two_listeners, 8091)
+    r = c.post("/portal/owner-keys/list", json={"owner_email": "jdoe@ciq.com"}, headers=PORTAL)
+    assert r.status_code == 200
+    assert r.json() == {"keys": [{
+        "hash_prefix": hash_key("llmr_plain")[:12],
+        "id": "jdoe",
+        "owner_email": "jdoe@ciq.com",
+        "scopes": [],
+        "priority_weight": 0.5,
+        "enabled": True,
+        "created": "",
+        "note": "",
+    }]}
+
+
+def test_key_issuer_mints_and_revokes_only_its_owners_non_admin_token(app_two_listeners):
+    """A user-provisioned key is usable, scoped by default, and self-revocable."""
+    c = _client(app_two_listeners, 8091)
+    minted = c.post("/portal/owner-keys", json={"owner_email": "jdoe@ciq.com"}, headers=PORTAL)
+    assert minted.status_code == 200
+    body = minted.json()
+    key = body["key"]
+    assert key.startswith("llmr_")
+    assert body["id"] == "jdoe"
+    assert body["scopes"] == ["cloud", "third_party"]
+    assert c.get("/status", headers={"Authorization": f"Bearer {key}"}).status_code == 200
+
+    listed = c.post("/portal/owner-keys/list", json={"owner_email": "jdoe@ciq.com"}, headers=PORTAL)
+    issued = next(record for record in listed.json()["keys"] if record["created"])
+    assert issued["scopes"] == ["cloud", "third_party"]
+    assert "key" not in issued
+
+    revoked = c.request(
+        "DELETE", f"/portal/owner-keys/{issued['hash_prefix']}",
+        json={"owner_email": "jdoe@ciq.com"}, headers=PORTAL,
+    )
+    assert revoked.status_code == 200 and revoked.json() == {"revoked": 1}
+    assert c.get("/status", headers={"Authorization": f"Bearer {key}"}).status_code == 401
+
+
+def test_admin_key_listing_includes_owner_email_without_bearer_value(app_two_listeners):
+    c = _client(app_two_listeners, 8091)
+    listing = c.get("/admin/keys", headers=ADMIN)
+    assert listing.status_code == 200
+    record = next(item for item in listing.json()["keys"] if item["id"] == "jdoe")
+    assert record["owner_email"] == "jdoe@ciq.com"
+    assert "key" not in record
+
+
+def test_admin_mint_defaults_to_cloud_and_third_party_for_an_owner(app_two_listeners):
+    c = _client(app_two_listeners, 8091)
+    minted = c.post(
+        "/admin/keys",
+        json={"id": "newuser", "owner_email": "newuser@ciq.com"}, headers=ADMIN,
+    )
+    assert minted.status_code == 200
+    listing = c.get("/admin/keys", headers=ADMIN).json()["keys"]
+    record = next(item for item in listing if item["id"] == "newuser")
+    assert record["owner_email"] == "newuser@ciq.com"
+    assert record["scopes"] == ["cloud", "third_party"]
+
+
+def test_owner_key_routes_require_key_issuer_and_protect_admin_keys(app_two_listeners):
+    c = _client(app_two_listeners, 8091)
+    forbidden = c.post(
+        "/portal/owner-keys/list", json={"owner_email": "jdoe@ciq.com"},
+        headers={"Authorization": "Bearer llmr_plain"},
+    )
+    assert forbidden.status_code == 403
+
+    revoke_admin = c.request(
+        "DELETE", f"/portal/owner-keys/{hash_key('llmr_admin')[:12]}",
+        json={"owner_email": "brady@ciq.com"}, headers=PORTAL,
+    )
+    assert revoke_admin.status_code == 403
 
 
 def test_admin_can_mint_and_new_key_works(app_two_listeners):
