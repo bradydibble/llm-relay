@@ -51,3 +51,10 @@ harness is how a claim in `/v1/models` earns the right to be published.
 `--expect` compares the run against a committed baseline and exits non-zero on any
 regression, so this can gate a backend or template change. Record a new baseline
 only with a deliberate note about what changed and why.
+
+Baseline recorded 2026-08-12, after reasoning separation (`set_params:
+reasoning_format=deepseek` on ornith-35b), body-derived tool routing, and the
+removal of the max_tokens floor: main, fast, and trinity all clean. Known flake:
+`tool_parallel` on `main` occasionally emits one call instead of two (model
+nondeterminism, 4/4 on retry) — if it is the only regression in a run, retry
+before treating the run as red.

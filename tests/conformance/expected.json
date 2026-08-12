@@ -1,0 +1,152 @@
+{
+  "main": {
+    "chat": {
+      "status": "PASS",
+      "detail": ""
+    },
+    "content_clean": {
+      "status": "PASS",
+      "detail": ""
+    },
+    "reasoning_separated": {
+      "status": "PASS",
+      "detail": "reasoning+reasoning_content"
+    },
+    "stream_content": {
+      "status": "PASS",
+      "detail": "14 deltas"
+    },
+    "tool_single": {
+      "status": "PASS",
+      "detail": ""
+    },
+    "tool_forced": {
+      "status": "PASS",
+      "detail": ""
+    },
+    "tool_parallel": {
+      "status": "PASS",
+      "detail": "2 call(s)"
+    },
+    "tool_stream": {
+      "status": "PASS",
+      "detail": "1 call(s) assembled"
+    },
+    "tool_loop": {
+      "status": "PASS",
+      "detail": ""
+    },
+    "structured_output": {
+      "status": "PASS",
+      "detail": ""
+    },
+    "max_tokens_honoured": {
+      "status": "PASS",
+      "detail": "16 tokens"
+    },
+    "max_completion_tokens_honoured": {
+      "status": "PASS",
+      "detail": "16 tokens"
+    }
+  },
+  "fast": {
+    "chat": {
+      "status": "PASS",
+      "detail": ""
+    },
+    "content_clean": {
+      "status": "PASS",
+      "detail": ""
+    },
+    "reasoning_separated": {
+      "status": "PASS",
+      "detail": "reasoning"
+    },
+    "stream_content": {
+      "status": "PASS",
+      "detail": "12 deltas"
+    },
+    "tool_single": {
+      "status": "PASS",
+      "detail": ""
+    },
+    "tool_forced": {
+      "status": "PASS",
+      "detail": ""
+    },
+    "tool_parallel": {
+      "status": "PASS",
+      "detail": "2 call(s)"
+    },
+    "tool_stream": {
+      "status": "PASS",
+      "detail": "1 call(s) assembled"
+    },
+    "tool_loop": {
+      "status": "PASS",
+      "detail": ""
+    },
+    "structured_output": {
+      "status": "PASS",
+      "detail": ""
+    },
+    "max_tokens_honoured": {
+      "status": "PASS",
+      "detail": "16 tokens"
+    },
+    "max_completion_tokens_honoured": {
+      "status": "PASS",
+      "detail": "16 tokens"
+    }
+  },
+  "amd-mi300x:trinity-large-thinking": {
+    "chat": {
+      "status": "PASS",
+      "detail": ""
+    },
+    "content_clean": {
+      "status": "PASS",
+      "detail": ""
+    },
+    "reasoning_separated": {
+      "status": "PASS",
+      "detail": "reasoning+reasoning_content"
+    },
+    "stream_content": {
+      "status": "PASS",
+      "detail": "15 deltas"
+    },
+    "tool_single": {
+      "status": "PASS",
+      "detail": ""
+    },
+    "tool_forced": {
+      "status": "PASS",
+      "detail": ""
+    },
+    "tool_parallel": {
+      "status": "PASS",
+      "detail": "2 call(s)"
+    },
+    "tool_stream": {
+      "status": "PASS",
+      "detail": "1 call(s) assembled"
+    },
+    "tool_loop": {
+      "status": "PASS",
+      "detail": ""
+    },
+    "structured_output": {
+      "status": "PASS",
+      "detail": ""
+    },
+    "max_tokens_honoured": {
+      "status": "PASS",
+      "detail": "16 tokens"
+    },
+    "max_completion_tokens_honoured": {
+      "status": "PASS",
+      "detail": "16 tokens"
+    }
+  }
+}
