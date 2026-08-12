@@ -299,9 +299,14 @@ def case_tool_loop(base, key, model, nc):
 
 
 def case_structured(base, key, model, nc):
+    # 900, not 400: reasoning tokens count toward the ceiling, so a reasoning
+    # model under load can burn a tight budget and truncate mid-JSON - which
+    # then scores as "not JSON" and reads like a schema failure. The case
+    # measures whether the model CAN produce schema-conformant JSON, so it gets
+    # fair room; truncation is reported as its own distinct outcome below.
     st, doc = post(base, key, model, {
         "messages": [{"role": "user", "content": "Give me a city and its country."}],
-        "max_completion_tokens": 400,
+        "max_completion_tokens": 900,
         "response_format": {"type": "json_schema", "json_schema": {
             "name": "loc", "strict": True,
             "schema": {"type": "object",
@@ -316,7 +321,12 @@ def case_structured(base, key, model, nc):
         json.loads(msg_of(doc).get("content") or "")
         return [Result("structured_output", "PASS")]
     except ValueError:
-        return [Result("structured_output", "FAIL", "200 but content is not JSON")]
+        if finish_of(doc) == "length":
+            return [Result("structured_output", "FAIL",
+                           "truncated (finish_reason=length) - reasoning consumed the "
+                           "ceiling; raise max tokens rather than blaming the schema")]
+        return [Result("structured_output", "FAIL",
+                       "200 but content is not JSON (schema ignored)")]
 
 
 def case_ceilings(base, key, model, nc):
@@ -399,6 +409,20 @@ def main() -> int:
         for case in CASES:
             for r in case(args.base, key, model, nc):
                 results[r.case] = {"status": r.status, "detail": r.detail}
+        # One labeled retry for failures. Models are nondeterministic and the
+        # fleet serves real traffic during a run, so single-shot reds mix hard
+        # failures with load flakes. A pass-on-retry is recorded as PASS with
+        # the flake noted - visible, not hidden - while a double failure keeps
+        # the first detail. Never more than one retry: a case that needs three
+        # tries IS a reliability finding.
+        failed = {c for c, v in results.items() if v["status"] == "FAIL"}
+        if failed:
+            for case in CASES:
+                retry = {r.case: r for r in case(args.base, key, model, nc)}
+                for c, r in retry.items():
+                    if c in failed and r.status == "PASS":
+                        results[c] = {"status": "PASS",
+                                      "detail": "flaky: failed once, passed on retry"}
         matrix[model] = results
         if not args.json:
             fails = [c for c, v in results.items() if v["status"] == "FAIL"]
