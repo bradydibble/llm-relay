@@ -137,9 +137,14 @@ def case_chat(base, key, model, nc):
 
 
 def case_stream(base, key, model, nc):
+    # 900 for the same reason as case_structured: heavy-reasoning aliases
+    # (code_heavy burns ~150 reasoning deltas on "count to 5") can consume a
+    # tight ceiling before the first content delta, which scores as "no content
+    # deltas" and reads like a streaming bug. Measured twice on code_heavy
+    # before this was raised.
     st, raw = post(base, key, model, {
         "messages": [{"role": "user", "content": "Count from 1 to 5."}],
-        "max_completion_tokens": 400, "stream": True,
+        "max_completion_tokens": 900, "stream": True,
     }, nc, stream=True)
     if st != 200 or not isinstance(raw, str):
         return [Result("stream_content", "FAIL", f"http {st}")]
@@ -159,7 +164,11 @@ def case_stream(base, key, model, nc):
             continue
     joined = "".join(text)
     if not joined.strip():
-        return [Result("stream_content", "FAIL", "no content deltas")]
+        detail = "no content deltas"
+        if '"finish_reason":"length"' in raw or '"finish_reason": "length"' in raw:
+            detail = ("truncated (finish_reason=length) before any content - "
+                      "reasoning consumed the ceiling; raise max tokens")
+        return [Result("stream_content", "FAIL", detail)]
     leak = leaks(joined)
     return [Result("stream_content", "FAIL" if leak else "PASS",
                    f"leaked {leak!r} into deltas" if leak else f"{len(text)} deltas")]
