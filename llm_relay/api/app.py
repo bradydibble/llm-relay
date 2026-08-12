@@ -295,8 +295,13 @@ def _model_entry(
     model_id: str,
     owned_by: str,
     lookup_name: str | None = None,
+    members: list[str] | None = None,
 ) -> dict[str, Any]:
     """One OpenAI ``/v1/models`` entry, enriched with context metadata.
+
+    ``members`` (aliases only) names the models the alias can route to, so the
+    capabilities block can be their intersection; None means "this is a concrete
+    model, use its own config".
 
     ``model_id`` is the advertised id (a host-qualified ``provider:model`` for a
     concrete model, or the alias name). ``lookup_name`` is the bare model/alias
@@ -314,10 +319,44 @@ def _model_entry(
     if ctx is not None:
         entry["context_length"] = ctx
         entry["max_model_len"] = ctx
+        # The schema OpenAI-compat pickers (ciq-harness among them) actually read.
+        # Publishing context ONLY as context_length/max_model_len left that client
+        # filling in a 131072 default for every model - overstating the 32k models
+        # and halving the 262k ones. One value, every spelling a client looks for.
+        entry["limit"] = {"context": ctx}
     m = cfg.models.models.get(lookup_name if lookup_name is not None else model_id)
     if m is not None and m.description:
         entry["description"] = m.description
+    caps = _capabilities_block(cfg, members if members is not None
+                               else [lookup_name if lookup_name is not None else model_id])
+    if caps is not None:
+        entry["capabilities"] = caps
     return entry
+
+
+def _capabilities_block(cfg: ConfigLoader, names: list[str]) -> dict[str, bool] | None:
+    """Capability claims for a model or alias, as booleans a picker can act on.
+
+    For an alias, the INTERSECTION across its members: an alias only advertises
+    what EVERY member delivers, because the client cannot know which member will
+    answer. If `main` can fall through to a model without tool support, then
+    `main` does not support tools - advertising the union is how a tool-bearing
+    request ends up "succeeding" with empty content.
+
+    A capability listed here is a routable claim (require_tools filters on
+    tool_use), so publishing it and enforcing it use the same source of truth.
+    Returns None when no named member exists in config (unknown/discovered-only),
+    on the additive-fields principle: absent, not fabricated."""
+    configs = [cfg.models.models[n] for n in names if n in cfg.models.models]
+    if not configs:
+        return None
+    def every(cap: str) -> bool:
+        return all(cap in c.capabilities for c in configs)
+    return {
+        "toolcall": every("tool_use"),
+        "reasoning": every("reasoning"),
+        "structured_output": every("structured_output"),
+    }
 
 
 def _build_models_list_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dict[str, Any]:
@@ -355,7 +394,7 @@ def _build_models_list_payload(cfg: ConfigLoader, disc: DiscoveryManager) -> dic
         seen.add(alias)
         if filtering and not any(states.get(member) in usable for member in members):
             continue
-        data.append(_model_entry(cfg, disc, alias, "llm-relay-alias"))
+        data.append(_model_entry(cfg, disc, alias, "llm-relay-alias", members=list(members)))
     return {"object": "list", "data": data}
 
 
@@ -374,7 +413,8 @@ def _build_model_card(cfg: ConfigLoader, disc: DiscoveryManager, model: str) -> 
             entry["discovered"] = True
         return entry
     if model in cfg.models.aliases:
-        return _model_entry(cfg, disc, model, "llm-relay-alias")
+        return _model_entry(cfg, disc, model, "llm-relay-alias",
+                            members=list(cfg.models.aliases[model]))
     return None
 
 

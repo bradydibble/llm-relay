@@ -61,31 +61,28 @@ def test_clamp_noops_without_max_tokens_or_window():
     assert _clamp_max_tokens(leave, 10000, 0) is leave       # unknown window -> leave
 
 
-# --- reasoning floor: raise a too-small ceiling for reasoning models ----------
+# --- the ceiling is the client's: cap down, NEVER inflate ---------------------
+# REASONING_OUTPUT_FLOOR was removed 2026-08-11 (see the tombstone in router.py):
+# it silently rewrote a client's cost ceiling (asked 16, forwarded 2048 -
+# measured). Reasoning is separated at the source now, so a small ceiling gives
+# the honest OpenAI-style outcome instead: finish_reason=length, reasoning in
+# reasoning_content, content possibly empty. These tests pin the ceiling as
+# untouchable so the floor cannot quietly return.
 
-def test_clamp_floors_small_max_tokens_for_reasoning_model():
-    # Tiny client ceiling on a reasoning model: reasoning would consume it all, so
-    # floor up to the reasoning floor (well under the 262k window headroom).
-    out = _clamp_max_tokens({"max_tokens": 400, "messages": []}, 3750, 262144, reasoning_floor=2048)
-    assert out["max_tokens"] == 2048
-
-
-def test_clamp_floor_never_exceeds_headroom():
-    # Floor is capped by the window headroom — fit always wins over floor.
-    out = _clamp_max_tokens({"max_tokens": 100, "messages": []}, 15500, 16000, reasoning_floor=2048)
-    assert out["max_tokens"] == 500  # headroom 16000 - 15500, not 2048
-
-
-def test_clamp_floor_noop_when_already_above():
-    src = {"max_tokens": 4000, "messages": []}
-    # already above the floor and fits the window -> unchanged, same object.
-    assert _clamp_max_tokens(src, 3750, 262144, reasoning_floor=2048) is src
+def test_clamp_never_raises_small_max_tokens():
+    src = {"max_tokens": 16, "messages": []}
+    # Plenty of headroom: the tiny ceiling is the client's choice; forwarded as-is.
+    assert _clamp_max_tokens(src, 3750, 262144) is src
 
 
-def test_clamp_floor_zero_is_legacy_downclamp_only():
-    # reasoning_floor=0 (every non-reasoning model) -> pure down-clamp, no floor.
+def test_clamp_caps_down_to_headroom():
+    out = _clamp_max_tokens({"max_tokens": 4000, "messages": []}, 15500, 16000)
+    assert out["max_tokens"] == 500  # 16000 - 15500; fit still wins
+
+
+def test_clamp_noop_returns_same_object():
     src = {"max_tokens": 400, "messages": []}
-    assert _clamp_max_tokens(src, 3750, 262144, reasoning_floor=0) is src
+    assert _clamp_max_tokens(src, 3750, 262144) is src
 
 
 # --- integration: a big max_tokens no longer pins to the largest backend ------
@@ -202,12 +199,12 @@ async def test_big_max_tokens_degrades_with_clamp_streaming(tmp_path, monkeypatc
     assert captured["max_tokens"] == 12250, "output clamped on the streaming path too (16000 - 3750)"
 
 
-async def test_reasoning_model_floors_small_max_tokens(tmp_path, monkeypatch):
-    """A model advertising the `reasoning` capability floors a too-small client
-    max_tokens up to REASONING_OUTPUT_FLOOR, so the chain-of-thought cannot
-    consume the whole ceiling and leave the answer empty (the ornith-397b failure
-    mode). Proves the capability gating + call-site wiring, not just the helper."""
-    from llm_relay.routing.router import REASONING_OUTPUT_FLOOR
+async def test_reasoning_model_gets_client_ceiling_unchanged(tmp_path, monkeypatch):
+    """A reasoning model receives the client's max_tokens UNCHANGED. The old
+    floor inflated it to REASONING_OUTPUT_FLOOR; that rewrite of the client's
+    cost ceiling was removed 2026-08-11 (reasoning is separated at the serve,
+    so a starved answer is now an honest finish_reason=length, not a mystery).
+    Proves the call-site wiring end to end, not just the helper."""
 
     cfg_dir = tmp_path / "cfg"
     cfg_dir.mkdir()
@@ -250,4 +247,4 @@ async def test_reasoning_model_floors_small_max_tokens(tmp_path, monkeypatch):
         stream=False,
     )
     assert resp.status_code == 200
-    assert captured["max_tokens"] == REASONING_OUTPUT_FLOOR, "small ceiling floored for reasoning model"
+    assert captured["max_tokens"] == 400, "the client's ceiling reaches the backend untouched"
