@@ -1,5 +1,5 @@
 {
-  "main": {
+  "llama-01:ornith-35b": {
     "chat": {
       "status": "PASS",
       "detail": ""
@@ -14,7 +14,7 @@
     },
     "stream_content": {
       "status": "PASS",
-      "detail": "14 deltas"
+      "detail": "9 deltas"
     },
     "tool_single": {
       "status": "PASS",
@@ -49,7 +49,7 @@
       "detail": "16 tokens"
     }
   },
-  "fast": {
+  "ciq-l4:qwen3-14b-awq": {
     "chat": {
       "status": "PASS",
       "detail": ""
@@ -64,7 +64,7 @@
     },
     "stream_content": {
       "status": "PASS",
-      "detail": "12 deltas"
+      "detail": "16 deltas"
     },
     "tool_single": {
       "status": "PASS",

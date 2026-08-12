@@ -218,8 +218,15 @@ def case_tool_forced(base, key, model, nc):
 
 def case_tool_parallel(base, key, model, nc):
     st, doc = post(base, key, model, {
+        # Explicit on purpose: this case measures whether the serve CAN return two
+        # calls in one response, not whether the model spontaneously parallelises
+        # a vague ask. The soft phrasing scored glimmer (and occasionally ornith)
+        # as incapable when a firm instruction yields 2/2 every time - a harness
+        # must not report prompt sensitivity as a missing capability.
         "messages": [{"role": "user",
-                      "content": "Weather in Denver and Austin? Call the tool for both."}],
+                      "content": "Get the weather for Denver AND Austin. "
+                                 "You must call get_weather twice, once per city, "
+                                 "in a single response."}],
         "tools": WEATHER_TOOL, "max_completion_tokens": 700,
     }, nc)
     if st != 200:

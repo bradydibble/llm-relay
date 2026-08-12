@@ -52,9 +52,20 @@ harness is how a claim in `/v1/models` earns the right to be published.
 regression, so this can gate a backend or template change. Record a new baseline
 only with a deliberate note about what changed and why.
 
-Baseline recorded 2026-08-12, after reasoning separation (`set_params:
-reasoning_format=deepseek` on ornith-35b), body-derived tool routing, and the
-removal of the max_tokens floor: main, fast, and trinity all clean. Known flake:
-`tool_parallel` on `main` occasionally emits one call instead of two (model
-nondeterminism, 4/4 on retry) — if it is the only regression in a run, retry
-before treating the run as red.
+Baseline recorded 2026-08-12 on CONCRETE models (ornith-35b, qwen3-14b-awq,
+trinity-large-thinking), all clean. Concrete on purpose: an alias inherits
+whichever member answers, so an alias-level red can be member variance rather
+than a regression — measured live when `fast` failed `structured_output` once
+because that single request fell through to another member while qwen's two
+slots were busy. Aliases still appear in the nightly full-fleet matrix, where
+day-to-day variance is honest signal rather than gate noise.
+
+The qwen tool cases went red -> green by fixing the SERVE, not the test: its
+vLLM ran `--tool-call-parser qwen3_coder` (the parser for Qwen3-Coder models);
+plain Qwen3 emits Hermes-format calls, so every call was silently eaten. One
+word (`hermes`) restored the whole feature. When a model family is documented
+as tool-capable and the matrix says otherwise, suspect the serve config before
+believing the model is the problem.
+
+Transient reds happen under load (trinity returned empty content while its tray
+was saturated); retry before treating a single-model regression as real.
