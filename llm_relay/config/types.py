@@ -234,6 +234,14 @@ class PolicyConfig:
     fallback: FallbackGraph = field(default_factory=FallbackGraph)
     explicit: ExplicitBehavior = field(default_factory=ExplicitBehavior)
     mode_hints: list[ModeHint] = field(default_factory=list)
+    # Default max_tokens applied to NON-STREAMING requests when the client set
+    # none. Prevents unbounded generation on large-context models (vLLM defaults
+    # to max_model_len - prompt = hours). Only applies when the client set NO
+    # ceiling; a client-set max_tokens is always forwarded unchanged. Streaming
+    # is unaffected (the client sees tokens and can disconnect). Set to 0 to
+    # disable (restore unbounded generation); None means not configured (use
+    # the code default).
+    default_max_tokens: int | None = 8192
 
 
 @dataclass

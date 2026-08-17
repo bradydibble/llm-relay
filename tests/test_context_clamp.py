@@ -69,7 +69,7 @@ def test_clamp_applies_default_when_no_max_tokens():
     """A non-streaming request with no max_tokens gets a default cap so vLLM
     doesn't generate for hours (262K context default at 10 tok/s = ~7h).
     The default is applied, then capped to headroom if needed."""
-    out = _clamp_max_tokens({"messages": []}, 10000, 16000,
+    out = _clamp_max_tokens({"messages": []}, 10000, 262144,
                             default=DEFAULT_NON_STREAM_MAX_TOKENS)
     assert out["max_tokens"] == DEFAULT_NON_STREAM_MAX_TOKENS
 
@@ -396,3 +396,103 @@ async def test_stream_no_max_tokens_gets_no_default(tmp_path, monkeypatch):
     assert upstream.status_code == 200
     assert captured["max_tokens"] is None, \
         "streaming without max_tokens must NOT get a default — client controls duration"
+
+
+async def test_policy_default_max_tokens_override(tmp_path, monkeypatch):
+    """policy.yaml can set default_max_tokens to tune the non-streaming cap
+    without a code change. Set to 0 to disable (restore unbounded generation)."""
+
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    (cfg_dir / "providers.yaml").write_text(yaml.safe_dump({
+        "providers": {"local-llm": {"type": "openai", "base_url": "http://127.0.0.1",
+                         "ownership": "ciq_owned", "enabled": True}}
+    }))
+    (cfg_dir / "models.yaml").write_text(yaml.safe_dump({
+        "models": {
+            "big-model": {"provider": "local-llm", "class": "unknown",
+                          "privacy": "local_only", "port": 8080, "context_window": 262144,
+                          "use_cases": {"main": 1}},
+        },
+    }))
+    (cfg_dir / "policy.yaml").write_text(yaml.safe_dump(
+        {"policy": {"fallback": {"retry_on": ["502", "503", "504", "connection_error"]},
+                     "default_max_tokens": 4096}}
+    ))
+
+    app = create_app(config_dir=cfg_dir)
+    disc = app.state.discovery
+    disc.clients["local-llm:8080"] = EndpointClient(
+        provider_name="local-llm", base_url="http://127.0.0.1:8080",
+        state=EndpointState(provider="local-llm", status=EndpointStatus.healthy, models=["big-model"]),
+        circuit_breaker=CircuitBreaker(),
+    )
+    disc.model_to_client["big-model"] = "local-llm:8080"
+    router = app.state.router
+
+    captured: dict = {}
+
+    async def _fake_forward(backend_url, model_name, request_data, *args, **kwargs):
+        captured["max_tokens"] = request_data.get("max_tokens")
+        return httpx.Response(200, json={"choices": []})
+
+    monkeypatch.setattr(router, "forward_request", _fake_forward)
+
+    resp, result = await router.route_and_forward(
+        request_data={"model": "big-model",
+                      "messages": [{"role": "user", "content": "hi"}]},
+        stream=False,
+    )
+    assert resp.status_code == 200
+    assert captured["max_tokens"] == 4096, \
+        "policy.yaml default_max_tokens override must reach the backend"
+
+
+async def test_policy_default_max_tokens_disabled(tmp_path, monkeypatch):
+    """Setting default_max_tokens: 0 in policy.yaml disables the cap entirely
+    (restores unbounded generation for clients that set no max_tokens)."""
+
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    (cfg_dir / "providers.yaml").write_text(yaml.safe_dump({
+        "providers": {"local-llm": {"type": "openai", "base_url": "http://127.0.0.1",
+                         "ownership": "ciq_owned", "enabled": True}}
+    }))
+    (cfg_dir / "models.yaml").write_text(yaml.safe_dump({
+        "models": {
+            "big-model": {"provider": "local-llm", "class": "unknown",
+                          "privacy": "local_only", "port": 8080, "context_window": 262144,
+                          "use_cases": {"main": 1}},
+        },
+    }))
+    (cfg_dir / "policy.yaml").write_text(yaml.safe_dump(
+        {"policy": {"fallback": {"retry_on": ["502", "503", "504", "connection_error"]},
+                     "default_max_tokens": 0}}
+    ))
+
+    app = create_app(config_dir=cfg_dir)
+    disc = app.state.discovery
+    disc.clients["local-llm:8080"] = EndpointClient(
+        provider_name="local-llm", base_url="http://127.0.0.1:8080",
+        state=EndpointState(provider="local-llm", status=EndpointStatus.healthy, models=["big-model"]),
+        circuit_breaker=CircuitBreaker(),
+    )
+    disc.model_to_client["big-model"] = "local-llm:8080"
+    router = app.state.router
+
+    captured: dict = {}
+
+    async def _fake_forward(backend_url, model_name, request_data, *args, **kwargs):
+        captured["max_tokens"] = request_data.get("max_tokens")
+        return httpx.Response(200, json={"choices": []})
+
+    monkeypatch.setattr(router, "forward_request", _fake_forward)
+
+    resp, result = await router.route_and_forward(
+        request_data={"model": "big-model",
+                      "messages": [{"role": "user", "content": "hi"}]},
+        stream=False,
+    )
+    assert resp.status_code == 200
+    assert captured["max_tokens"] is None, \
+        "default_max_tokens: 0 disables the cap — client's none stays none"

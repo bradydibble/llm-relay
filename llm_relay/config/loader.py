@@ -303,6 +303,8 @@ class ConfigLoader:
             explicit=ExplicitBehavior(
                 strict=(policy_data.get("explicit") or {}).get("strict", False),
             ),
+            default_max_tokens=int(policy_data.get("default_max_tokens", 8192))
+                if policy_data.get("default_max_tokens") is not None else 8192,
             mode_hints=[
                 ModeHint(
                     when_requesting=h["when_requesting"],
