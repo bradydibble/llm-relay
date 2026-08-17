@@ -33,6 +33,20 @@ MIN_OUTPUT_HEADROOM = 1024
 # rewrites a client's cost ceiling without saying so betrays the client's
 # budget; do not bring the floor back - fix the serve instead.
 
+# DEFAULT_NON_STREAM_MAX_TOKENS: applied when a NON-STREAMING request sets no
+# max_tokens at all. This is NOT the removed REASONING_OUTPUT_FLOOR (which
+# inflated a client-SET value). Here the client set NO ceiling — vLLM's
+# default is max_model_len - prompt (262144 - ~15K = ~247K tokens = ~7 HOURS
+# at 10 tok/s on qwen3.6-35b). The relay buffers the entire non-streaming
+# response before sending the body, so the client gets nothing but keepalive
+# whitespace for hours — a silent indefinite hang, deterministic per request
+# content (the 2026-08-16 narf-agent incident: amd-mi300x:qwen3.6-35b and
+# llama-01:ornith-35b, 25+ affected CVE-remediation campaigns). 1024 tokens
+# at 10 tok/s = ~2 min, well within the relay's 900s read timeout; the
+# keepalive drip bridges the 60s wait_for -> response gap. Streaming requests
+# are unaffected (the client sees tokens flowing and can disconnect).
+DEFAULT_NON_STREAM_MAX_TOKENS = 1024
+
 # Prompt-size estimation is a heuristic (no server tokenizer). It must be a true
 # UPPER bound: under-counting routes a request to a backend too small to hold it
 # and the upstream hard-rejects at the boundary (the 2026-07-07 subagent incident:
@@ -640,7 +654,8 @@ class RequestRouter:
                     )
                 continue
             try:
-                fwd = _clamp_max_tokens(request_data, prompt_est, candidate.context_window)
+                fwd = _clamp_max_tokens(request_data, prompt_est, candidate.context_window,
+                                        default=DEFAULT_NON_STREAM_MAX_TOKENS)
                 resp = await self.forward_request(
                     candidate.backend_url, candidate.model, fwd,
                     headers=headers,
@@ -914,7 +929,8 @@ def _estimate_prompt_tokens(request_data: dict) -> int | None:
         return None
 
 
-def _clamp_max_tokens(request_data: dict, prompt_est: int | None, window: int) -> dict:
+def _clamp_max_tokens(request_data: dict, prompt_est: int | None, window: int,
+                      default: int | None = None) -> dict:
     """Fit a request's ``max_tokens`` to the chosen model: cap DOWN to the window
     headroom. Never raises the ceiling - a client's max_tokens is a cost and
     latency budget, and inflating it silently is a lie about money (the old
@@ -926,6 +942,13 @@ def _clamp_max_tokens(request_data: dict, prompt_est: int | None, window: int) -
     exceeds the window would overflow it - silently truncated by llama.cpp, hard
     400-rejected by vLLM. So the ceiling is capped to ``window - prompt``.
 
+    ``default``: when the client set NO ``max_tokens`` (None or <=0) and
+    ``default`` is provided, it is applied as the ceiling. This is NOT
+    inflation (the client set nothing); it prevents unbounded non-streaming
+    generation (vLLM defaults to max_model_len - prompt = hours on large-context
+    models). Only the non-streaming call site passes ``default``; streaming
+    leaves it unset (the client sees tokens and can disconnect).
+
     Returns the request unchanged (same object) when the cap doesn't move
     ``max_tokens``; otherwise a shallow copy - never mutating the caller's dict,
     which is shared across the candidate chain. A down-clamp can still yield a
@@ -933,9 +956,14 @@ def _clamp_max_tokens(request_data: dict, prompt_est: int | None, window: int) -
     degradation, far better than dead-ending the fallthrough in a 503.
     """
     max_tokens = request_data.get("max_tokens")
-    if not isinstance(max_tokens, int) or max_tokens <= 0:
-        return request_data
+    has_client_ceiling = isinstance(max_tokens, int) and max_tokens > 0
+    if not has_client_ceiling:
+        if default is None:
+            return request_data
+        max_tokens = default
     headroom = (window - prompt_est) if (prompt_est and window) else None
-    if headroom is None or max_tokens <= headroom:
+    if headroom is not None and max_tokens > headroom:
+        return {**request_data, "max_tokens": headroom}
+    if has_client_ceiling:
         return request_data
-    return {**request_data, "max_tokens": headroom}
+    return {**request_data, "max_tokens": max_tokens}

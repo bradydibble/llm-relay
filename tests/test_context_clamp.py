@@ -17,6 +17,7 @@ from llm_relay.api.app import create_app
 from llm_relay.config.types import CircuitBreaker, EndpointState, EndpointStatus
 from llm_relay.discovery.endpoint import EndpointClient
 from llm_relay.routing.router import (
+    DEFAULT_NON_STREAM_MAX_TOKENS,
     MIN_OUTPUT_HEADROOM,
     _clamp_max_tokens,
     _estimate_prompt_tokens,
@@ -55,10 +56,48 @@ def test_clamp_does_not_mutate_caller_dict():
 
 def test_clamp_noops_without_max_tokens_or_window():
     no_mt = {"messages": []}
-    assert _clamp_max_tokens(no_mt, 10000, 16000) is no_mt   # no ceiling to clamp
+    # no max_tokens, no default -> unchanged (streaming path: client sees progress)
+    assert _clamp_max_tokens(no_mt, 10000, 16000) is no_mt
     leave = {"max_tokens": 32768}
     assert _clamp_max_tokens(leave, 0, 16000) is leave       # trivially-small prompt -> leave
     assert _clamp_max_tokens(leave, 10000, 0) is leave       # unknown window -> leave
+
+
+# --- default max_tokens for non-streaming (unbounded-generation protection) ---
+
+def test_clamp_applies_default_when_no_max_tokens():
+    """A non-streaming request with no max_tokens gets a default cap so vLLM
+    doesn't generate for hours (262K context default at 10 tok/s = ~7h).
+    The default is applied, then capped to headroom if needed."""
+    out = _clamp_max_tokens({"messages": []}, 10000, 16000,
+                            default=DEFAULT_NON_STREAM_MAX_TOKENS)
+    assert out["max_tokens"] == DEFAULT_NON_STREAM_MAX_TOKENS
+
+
+def test_clamp_default_capped_to_headroom():
+    """The default itself is capped to the model's headroom — a small-context
+    model gets a smaller effective cap."""
+    out = _clamp_max_tokens({"messages": []}, 15500, 16000,
+                            default=DEFAULT_NON_STREAM_MAX_TOKENS)
+    assert out["max_tokens"] == 500  # 16000 - 15500 < default
+
+
+def test_clamp_default_does_not_override_client_ceiling():
+    """A client-set max_tokens is NEVER raised toward the default. The default
+    only applies when the client set NOTHING. This is NOT the removed
+    REASONING_OUTPUT_FLOOR (which inflated 16 -> 2048)."""
+    src = {"max_tokens": 16, "messages": []}
+    # client asked for 16; default is 1024; forwarded value is 16, NOT 1024
+    out = _clamp_max_tokens(src, 3750, 262144, default=DEFAULT_NON_STREAM_MAX_TOKENS)
+    assert out is src  # same object, unchanged — client ceiling untouched
+
+
+def test_clamp_default_not_applied_for_streaming():
+    """Streaming path passes no default — the client sees tokens flowing and
+    can disconnect, so unbounded generation is the client's choice."""
+    src = {"messages": []}
+    out = _clamp_max_tokens(src, 10000, 16000)  # no default= kwarg
+    assert out is src  # unchanged
 
 
 # --- the ceiling is the client's: cap down, NEVER inflate ---------------------
@@ -248,3 +287,112 @@ async def test_reasoning_model_gets_client_ceiling_unchanged(tmp_path, monkeypat
     )
     assert resp.status_code == 200
     assert captured["max_tokens"] == 400, "the client's ceiling reaches the backend untouched"
+
+
+async def test_non_stream_no_max_tokens_gets_default(tmp_path, monkeypatch):
+    """A non-streaming request with NO max_tokens must get a default cap
+    forwarded to the backend. Without this, vLLM defaults to max_model_len -
+    prompt (~247K tokens = ~7 hours at 10 tok/s on qwen3.6-35b), the relay
+    buffers the whole response, and the client gets nothing but keepalive
+    whitespace — the 2026-08-16 narf-agent indefinite-hang incident."""
+
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    (cfg_dir / "providers.yaml").write_text(yaml.safe_dump({
+        "providers": {"local-llm": {"type": "openai", "base_url": "http://127.0.0.1",
+                         "ownership": "ciq_owned", "enabled": True}}
+    }))
+    (cfg_dir / "models.yaml").write_text(yaml.safe_dump({
+        "models": {
+            "big-model": {"provider": "local-llm", "class": "unknown",
+                          "privacy": "local_only", "port": 8080, "context_window": 262144,
+                          "use_cases": {"main": 1}},
+        },
+    }))
+    (cfg_dir / "policy.yaml").write_text(yaml.safe_dump(
+        {"policy": {"fallback": {"retry_on": ["502", "503", "504", "connection_error"]}}}
+    ))
+
+    app = create_app(config_dir=cfg_dir)
+    disc = app.state.discovery
+    disc.clients["local-llm:8080"] = EndpointClient(
+        provider_name="local-llm", base_url="http://127.0.0.1:8080",
+        state=EndpointState(provider="local-llm", status=EndpointStatus.healthy, models=["big-model"]),
+        circuit_breaker=CircuitBreaker(),
+    )
+    disc.model_to_client["big-model"] = "local-llm:8080"
+    router = app.state.router
+
+    captured: dict = {}
+
+    async def _fake_forward(backend_url, model_name, request_data, *args, **kwargs):
+        captured["max_tokens"] = request_data.get("max_tokens")
+        return httpx.Response(200, json={"choices": []})
+
+    monkeypatch.setattr(router, "forward_request", _fake_forward)
+
+    resp, result = await router.route_and_forward(
+        request_data={"model": "big-model",
+                      "messages": [{"role": "user", "content": "hi"}]},
+        stream=False,
+    )
+    assert resp.status_code == 200
+    assert captured["max_tokens"] == DEFAULT_NON_STREAM_MAX_TOKENS, \
+        "non-streaming without max_tokens must get the default cap, not vLLM's unbounded default"
+
+
+async def test_stream_no_max_tokens_gets_no_default(tmp_path, monkeypatch):
+    """Streaming without max_tokens must NOT get a default — the client sees
+    tokens flowing and can disconnect; the default is a non-streaming protection
+    only (prevents the buffered-response hang)."""
+
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    (cfg_dir / "providers.yaml").write_text(yaml.safe_dump({
+        "providers": {"local-llm": {"type": "openai", "base_url": "http://127.0.0.1",
+                         "ownership": "ciq_owned", "enabled": True}}
+    }))
+    (cfg_dir / "models.yaml").write_text(yaml.safe_dump({
+        "models": {
+            "big-model": {"provider": "local-llm", "class": "unknown",
+                          "privacy": "local_only", "port": 8080, "context_window": 262144,
+                          "use_cases": {"main": 1}},
+        },
+    }))
+    (cfg_dir / "policy.yaml").write_text(yaml.safe_dump(
+        {"policy": {"fallback": {"retry_on": ["502", "503", "504", "connection_error"]}}}
+    ))
+
+    app = create_app(config_dir=cfg_dir)
+    disc = app.state.discovery
+    disc.clients["local-llm:8080"] = EndpointClient(
+        provider_name="local-llm", base_url="http://127.0.0.1:8080",
+        state=EndpointState(provider="local-llm", status=EndpointStatus.healthy, models=["big-model"]),
+        circuit_breaker=CircuitBreaker(),
+    )
+    disc.model_to_client["big-model"] = "local-llm:8080"
+    router = app.state.router
+
+    captured: dict = {}
+
+    async def _fake_body_iter():
+        yield b"data: {}\n\ndata: [DONE]\n\n"
+
+    async def _fake_cleanup():
+        return None
+
+    async def _fake_stream(backend_url, model_name, request_data, *args, **kwargs):
+        captured["max_tokens"] = request_data.get("max_tokens")
+        return httpx.Response(200, content=b""), _fake_body_iter(), _fake_cleanup
+
+    monkeypatch.setattr(router, "stream_request", _fake_stream)
+
+    upstream, body_iter, result, cleanup = await router.route_and_forward(
+        request_data={"model": "big-model",
+                      "messages": [{"role": "user", "content": "hi"}],
+                      "stream": True},
+        stream=True,
+    )
+    assert upstream.status_code == 200
+    assert captured["max_tokens"] is None, \
+        "streaming without max_tokens must NOT get a default — client controls duration"
