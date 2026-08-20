@@ -242,6 +242,15 @@ class PolicyConfig:
     # disable (restore unbounded generation); None means not configured (use
     # the code default).
     default_max_tokens: int | None = 8192
+    # Default repetition_penalty applied to NON-STREAMING requests when the
+    # client set none. vLLM's default is 1.0 (no penalty); Ollama's is 1.1.
+    # Without a penalty, certain prompts (e.g. diff-marker C declarations)
+    # trigger repetition loops where the model generates the same token
+    # sequence forever — the 2026-08-16 narf-agent hang. 1.1 matches Ollama's
+    # default and breaks the loop. Only applies when the client set NO
+    # repetition_penalty; a client-set value is always forwarded unchanged.
+    # Set to 0 to disable; None means not configured (use the code default).
+    default_repetition_penalty: float | None = 1.1
 
 
 @dataclass

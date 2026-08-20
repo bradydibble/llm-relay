@@ -18,7 +18,9 @@ from llm_relay.config.types import CircuitBreaker, EndpointState, EndpointStatus
 from llm_relay.discovery.endpoint import EndpointClient
 from llm_relay.routing.router import (
     DEFAULT_NON_STREAM_MAX_TOKENS,
+    DEFAULT_REPETITION_PENALTY,
     MIN_OUTPUT_HEADROOM,
+    _apply_repetition_penalty_default,
     _clamp_max_tokens,
     _estimate_prompt_tokens,
 )
@@ -496,3 +498,36 @@ async def test_policy_default_max_tokens_disabled(tmp_path, monkeypatch):
     assert resp.status_code == 200
     assert captured["max_tokens"] is None, \
         "default_max_tokens: 0 disables the cap — client's none stays none"
+
+
+# --- default repetition_penalty for non-streaming (repetition-loop protection) ---
+
+def test_repetition_penalty_applied_when_unset():
+    """A non-streaming request with no repetition_penalty gets the default
+    (1.1, matching Ollama) so the model doesn't loop forever on certain
+    prompts (the 2026-08-16 narf-agent hang: diff-marker C declaration
+    triggered an infinite 'int64 vs int64' repetition loop)."""
+    out = _apply_repetition_penalty_default({"messages": []}, default=1.1)
+    assert out["repetition_penalty"] == 1.1
+
+
+def test_repetition_penalty_not_overriding_client_value():
+    """A client-set repetition_penalty is NEVER overridden — the default only
+    applies when the client set nothing."""
+    src = {"repetition_penalty": 1.3, "messages": []}
+    out = _apply_repetition_penalty_default(src, default=1.1)
+    assert out["repetition_penalty"] == 1.3
+
+
+def test_repetition_penalty_disabled_when_zero():
+    """default=0 disables the feature (no penalty applied)."""
+    src = {"messages": []}
+    out = _apply_repetition_penalty_default(src, default=0)
+    assert out is src  # unchanged
+
+
+def test_repetition_penalty_disabled_when_none():
+    """default=None disables the feature."""
+    src = {"messages": []}
+    out = _apply_repetition_penalty_default(src, default=None)
+    assert out is src  # unchanged

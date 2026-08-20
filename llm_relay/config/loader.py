@@ -305,6 +305,8 @@ class ConfigLoader:
             ),
             default_max_tokens=int(policy_data.get("default_max_tokens", 8192))
                 if policy_data.get("default_max_tokens") is not None else 8192,
+            default_repetition_penalty=float(policy_data.get("default_repetition_penalty", 1.1))
+                if policy_data.get("default_repetition_penalty") is not None else 1.1,
             mode_hints=[
                 ModeHint(
                     when_requesting=h["when_requesting"],

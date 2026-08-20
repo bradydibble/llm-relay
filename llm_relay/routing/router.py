@@ -37,6 +37,13 @@ MIN_OUTPUT_HEADROOM = 1024
 # default_max_tokens. See PolicyConfig.default_max_tokens for full doc.
 DEFAULT_NON_STREAM_MAX_TOKENS = 8192
 
+# Default repetition_penalty for non-streaming requests when the client set
+# none. vLLM defaults to 1.0 (no penalty); Ollama defaults to 1.1. Without a
+# penalty, certain prompts trigger repetition loops (the 2026-08-16 narf-agent
+# hang: a diff-marker C declaration caused the model to repeat "int64 vs
+# int64" forever). 1.1 matches Ollama's default and breaks the loop.
+DEFAULT_REPETITION_PENALTY = 1.1
+
 # Prompt-size estimation is a heuristic (no server tokenizer). It must be a true
 # UPPER bound: under-counting routes a request to a backend too small to hold it
 # and the upstream hard-rejects at the boundary (the 2026-07-07 subagent incident:
@@ -648,6 +655,9 @@ class RequestRouter:
                 _default_mt = _cfg_default if _cfg_default is not None else DEFAULT_NON_STREAM_MAX_TOKENS
                 fwd = _clamp_max_tokens(request_data, prompt_est, candidate.context_window,
                                         default=_default_mt)
+                _cfg_rp = self.config.policy.default_repetition_penalty
+                _default_rp = _cfg_rp if _cfg_rp is not None else DEFAULT_REPETITION_PENALTY
+                fwd = _apply_repetition_penalty_default(fwd, default=_default_rp)
                 resp = await self.forward_request(
                     candidate.backend_url, candidate.model, fwd,
                     headers=headers,
@@ -961,3 +971,26 @@ def _clamp_max_tokens(request_data: dict, prompt_est: int | None, window: int,
     if has_client_ceiling:
         return request_data
     return {**request_data, "max_tokens": max_tokens}
+
+
+def _apply_repetition_penalty_default(
+    request_data: dict, default: float | None = None
+) -> dict:
+    """Apply a default ``repetition_penalty`` when the client set none.
+
+    vLLM's default is 1.0 (no penalty); Ollama's is 1.1. Without a penalty,
+    certain prompts trigger repetition loops where the model generates the
+    same token sequence indefinitely (the 2026-08-16 narf-agent hang: a
+    diff-marker C declaration caused the model to repeat "int64 vs int64"
+    forever). 1.1 matches Ollama's default and breaks the loop.
+
+    Only applies when the client set NO ``repetition_penalty``; a client-set
+    value is always forwarded unchanged. Returns the same object when no
+    change is needed; otherwise a shallow copy.
+    """
+    if not default or default <= 0:
+        return request_data
+    existing = request_data.get("repetition_penalty")
+    if existing is not None:
+        return request_data
+    return {**request_data, "repetition_penalty": default}
