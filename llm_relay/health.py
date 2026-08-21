@@ -117,8 +117,16 @@ class L2HealthProbe:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _probe_one(self, key: str, client):
-        """Send a tiny completion to one backend with a hard timeout.
-        Timeout or error = failure. Natural termination with short output = success."""
+        """Send a tiny STREAMING completion to one backend with a hard timeout.
+
+        Uses stream=true so the probe gets the first token quickly even on a
+        busy model (non-streaming queues behind other requests; streaming gets
+        the first token as soon as the model starts generating). The failure
+        mode we're catching is a wedged slot — which produces 0 tokens in any
+        timeout. A healthy but busy model produces its first token within the
+        TTFT deadline even if it's serving other requests.
+
+        Timeout or error = failure. At least 1 token received = success."""
         health = self._health.setdefault(key, _BackendHealth())
         health.last_probe_ns = time.time_ns()
 
@@ -132,27 +140,28 @@ class L2HealthProbe:
             "messages": [{"role": "user", "content": PROBE_PROMPT}],
             "max_tokens": PROBE_MAX_TOKENS,
             "temperature": 0,
+            "stream": True,
         }
 
         try:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(connect=3.0, read=PROBE_TIMEOUT, write=3.0, pool=3.0)
             ) as c:
-                resp = await c.post(
-                    f"{client.base_url}/v1/chat/completions",
-                    json=body,
-                )
-                if resp.status_code != 200:
-                    raise RuntimeError(f"HTTP {resp.status_code}")
-                data = resp.json()
-                ch = data.get("choices", [{}])[0]
-                fr = ch.get("finish_reason")
-                ct = data.get("usage", {}).get("completion_tokens", 0)
-                # Success = model produced at least 1 token. finish_reason
-                # can be "length" (capped at 1) or "stop" — both are healthy.
-                # The failure mode we're catching is timeout (0 tokens).
-                if ct < 1:
-                    raise RuntimeError(f"no tokens generated: finish={fr} tokens={ct}")
+                # Use stream to get first token fast, not wait for full response
+                async with c.stream("POST", f"{client.base_url}/v1/chat/completions", json=body) as resp:
+                    if resp.status_code != 200:
+                        raise RuntimeError(f"HTTP {resp.status_code}")
+                    # Read just enough to confirm the model is generating.
+                    # We don't need the full response — first SSE chunk with
+                    # a content delta proves the slot is not wedged.
+                    got_token = False
+                    async for chunk in resp.aiter_text():
+                        if "data:" in chunk and "[DONE]" not in chunk:
+                            # Got a streaming event — model is alive and generating
+                            got_token = True
+                            break
+                    if not got_token:
+                        raise RuntimeError("no SSE data received")
                 # Success
                 self._on_success(key, client)
         except Exception as e:

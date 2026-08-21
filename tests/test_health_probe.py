@@ -1,6 +1,7 @@
 """Tests for the L2 inference health probe (circuit breaker for wedged backends)."""
 import asyncio
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -29,14 +30,22 @@ def _make_config():
     return cfg
 
 
-def _mock_response(status_code=200, finish_reason="stop", completion_tokens=5):
+def _mock_stream_response(status_code=200, has_data=True):
+    """Mock a streaming SSE response for the L2 probe."""
     resp = MagicMock()
     resp.status_code = status_code
-    resp.json.return_value = {
-        "choices": [{"finish_reason": finish_reason, "message": {"content": "OK"}}],
-        "usage": {"completion_tokens": completion_tokens},
-    }
-    return resp
+    # Simulate an async context manager for c.stream()
+    # The probe reads the first chunk and checks for "data:" 
+    async def _aiter_text():
+        if has_data:
+            yield 'data: {"choices":[{"delta":{"content":"OK"}}]}\n\n'
+        yield 'data: [DONE]\n\n'
+    resp.aiter_text = _aiter_text
+    # The async context manager itself
+    mock_cm = AsyncMock()
+    mock_cm.__aenter__ = AsyncMock(return_value=resp)
+    mock_cm.__aexit__ = AsyncMock(return_value=None)
+    return mock_cm
 
 
 async def test_l2_probe_success_keeps_backend_healthy():
@@ -45,7 +54,7 @@ async def test_l2_probe_success_keeps_backend_healthy():
     probe = L2HealthProbe(disc, _make_config())
     with patch("httpx.AsyncClient") as mock_client_cls:
         mock_client = AsyncMock()
-        mock_client.post = AsyncMock(return_value=_mock_response())
+        mock_client.stream = MagicMock(return_value=_mock_stream_response())
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=None)
         mock_client_cls.return_value = mock_client
@@ -60,7 +69,7 @@ async def test_l2_probe_timeout_marks_degraded():
     probe = L2HealthProbe(disc, _make_config())
     with patch("httpx.AsyncClient") as mock_client_cls:
         mock_client = AsyncMock()
-        mock_client.post = AsyncMock(side_effect=httpx.ReadTimeout("timed out"))
+        mock_client.stream = MagicMock(side_effect=httpx.ReadTimeout("timed out"))
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=None)
         mock_client_cls.return_value = mock_client
@@ -79,7 +88,7 @@ async def test_l2_probe_error_counts_as_failure():
     probe = L2HealthProbe(disc, _make_config())
     with patch("httpx.AsyncClient") as mock_client_cls:
         mock_client = AsyncMock()
-        mock_client.post = AsyncMock(side_effect=httpx.ConnectError("refused"))
+        mock_client.stream = MagicMock(side_effect=httpx.ConnectError("refused"))
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=None)
         mock_client_cls.return_value = mock_client
@@ -88,13 +97,13 @@ async def test_l2_probe_error_counts_as_failure():
     assert disc.clients["test:8080"].state.status == EndpointStatus.degraded
 
 
-async def test_l2_probe_abnormal_termination_counts_as_failure():
-    """A response with 0 completion tokens (model didn't generate) is a failure."""
+async def test_l2_probe_no_sse_data_counts_as_failure():
+    """A response with no SSE data (model didn't generate) is a failure."""
     disc = _make_discovery()
     probe = L2HealthProbe(disc, _make_config())
     with patch("httpx.AsyncClient") as mock_client_cls:
         mock_client = AsyncMock()
-        mock_client.post = AsyncMock(return_value=_mock_response(finish_reason="length", completion_tokens=0))
+        mock_client.stream = MagicMock(return_value=_mock_stream_response(has_data=False))
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=None)
         mock_client_cls.return_value = mock_client
@@ -112,11 +121,12 @@ async def test_l2_circuit_recovery():
     health = probe._health.setdefault(key, _BackendHealth())
     health.circuit_open = True
     health.consecutive_failures = FAILURES_TO_OPEN
+    health.last_failure_ns = time.time_ns() - 120_000_000_000  # 120s ago (past cooldown)
     disc.clients[key].state.status = EndpointStatus.degraded
 
     with patch("httpx.AsyncClient") as mock_client_cls:
         mock_client = AsyncMock()
-        mock_client.post = AsyncMock(return_value=_mock_response())
+        mock_client.stream = MagicMock(return_value=_mock_stream_response())
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=None)
         mock_client_cls.return_value = mock_client
