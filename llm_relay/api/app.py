@@ -31,6 +31,7 @@ from ..logbuffer import install_log_buffer
 from ..scheduler import AdmissionController
 from ..jobs import JobStore
 from ..jobworker import run_worker
+from ..health import L2HealthProbe
 
 
 _KEEPALIVE_INTERVAL_S = 15.0
@@ -684,10 +685,18 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
             app.state.job_store.reconcile_on_start()
             _job_stop = asyncio.Event()
             _job_task = asyncio.create_task(run_worker(app.state.job_store, router, _job_stop))
+            # L2 inference health probe: background loop that sends a tiny
+            # completion to each healthy backend every 30s with a 10s hard
+            # timeout. Catches wedged generation slots that /v1/models can't
+            # detect (process alive, slot stuck). On 2 consecutive failures,
+            # marks the backend degraded and excludes it from routing.
+            _l2_probe = L2HealthProbe(discovery, config)
+            _l2_task = _l2_probe.start()
             try:
                 yield
             finally:
                 _job_stop.set()
+                await _l2_probe.stop()
                 try:
                     await asyncio.wait_for(_job_task, timeout=10)
                 except Exception:
