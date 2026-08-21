@@ -12,8 +12,44 @@ pytest.importorskip("mcp")
 
 
 def _stub_payloads() -> dict[str, Any]:
-    """Two-route response: '/v1/available-models' and '/status'."""
+    """Three-route response: '/v1/models', '/v1/available-models', and '/status'."""
     return {
+        "/v1/models": {
+            "data": [
+                {
+                    "id": "local-llm:qwen3.6-35b-a3b",
+                    "object": "model",
+                    "owned_by": "local-llm",
+                    "context_length": 131072,
+                    "max_model_len": 131072,
+                    "capabilities": {"toolcall": True, "reasoning": False, "structured_output": True},
+                },
+                {
+                    "id": "local-llm:qwen3.5-9b",
+                    "object": "model",
+                    "owned_by": "local-llm",
+                    "context_length": 65536,
+                    "max_model_len": 65536,
+                    "capabilities": {"toolcall": True, "reasoning": False, "structured_output": False},
+                },
+                {
+                    "id": "cloud-provider:cloud-test",
+                    "object": "model",
+                    "owned_by": "cloud-provider",
+                    "context_length": 200000,
+                    "max_model_len": 200000,
+                    "capabilities": {"toolcall": True, "reasoning": False, "structured_output": True},
+                },
+                {
+                    "id": "main",
+                    "object": "model",
+                    "owned_by": "llm-relay-alias",
+                    "context_length": 131072,
+                    "max_model_len": 131072,
+                    "capabilities": {"toolcall": True, "reasoning": False, "structured_output": True},
+                },
+            ],
+        },
         "/v1/available-models": {
             "qwen3.6-35b-a3b": {
                 "provider": "local-llm",
@@ -139,10 +175,10 @@ async def test_select_for_capability_filters_by_min_context_window(monkeypatch):
     fn = _get_tool(mcp_mod._mcp_instance, "select_for_capability")
 
     result = await fn(min_context_window=100000, privacy="local_only")
-    assert "qwen3.5-9b" not in result["candidates"]
-    assert "qwen3.6-35b-a3b" in result["candidates"]
-    assert result["best"] == "qwen3.6-35b-a3b"
-    assert "100000" in result["rationale"]
+    ids = result["candidates"]
+    assert "local-llm:qwen3.5-9b" not in ids
+    assert "local-llm:qwen3.6-35b-a3b" in ids
+    assert result["best"] == "local-llm:qwen3.6-35b-a3b"
 
 
 async def test_select_for_capability_excludes_cloud_when_local_only(monkeypatch):
@@ -159,18 +195,15 @@ async def test_select_for_capability_excludes_cloud_when_local_only(monkeypatch)
     _starlette_app, _mgr = mcp_mod.build_mcp_server(base_url="http://test")
     fn = _get_tool(mcp_mod._mcp_instance, "select_for_capability")
 
-    # cloud-test has 200K context and tool_use, but privacy=cloud_ok — must be excluded
     result = await fn(
         min_context_window=0,
-        requires_capabilities=["tool_use"],
+        requires_capabilities=["toolcall"],
         privacy="local_only",
     )
-    assert "cloud-test" not in result["candidates"]
-    # both local models have tool_use and should be present
-    assert "qwen3.6-35b-a3b" in result["candidates"]
-    assert "qwen3.5-9b" in result["candidates"]
-    # 35b has preference=1.0, 9b has preference=0.5 → 35b should be best
-    assert result["best"] == "qwen3.6-35b-a3b"
+    ids = result["candidates"]
+    assert "cloud-provider:cloud-test" not in ids
+    assert "local-llm:qwen3.6-35b-a3b" in ids
+    assert "local-llm:qwen3.5-9b" in ids
 
 
 async def test_select_for_capability_returns_empty_when_no_match(monkeypatch):

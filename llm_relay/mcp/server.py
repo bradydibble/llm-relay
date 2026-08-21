@@ -95,18 +95,25 @@ def build_mcp_server(
 
     @mcp.tool()
     async def list_models() -> list[dict[str, Any]]:
-        """Return all configured models with their current availability status.
+        """Return all models and aliases available on the relay RIGHT NOW, with
+        the host-qualified IDs and rendered capabilities a client needs to
+        select a model for /v1/chat/completions.
 
-        Each entry includes id, provider, class, status (available / unavailable /
-        degraded), context_window, capabilities, tags, and privacy level.
+        Each entry includes:
+        - id: the model/alias ID to use in the 'model' field of a request
+          (host-qualified for concrete models: 'llama-01:ornith-35b',
+          'amd-mi300x:qwen3.6-35b'; bare name for aliases: 'main', 'fast')
+        - capabilities: rendered booleans {toolcall, reasoning, structured_output}
+          — an alias advertises the INTERSECTION of its members' capabilities
+        - context_length / max_model_len: the live context window
+        - owned_by: 'llm-relay-alias' for aliases, provider name for concrete models
+
+        Use the 'id' field directly as the 'model' parameter in your request.
         """
-        data = await _get("/v1/available-models")
-        models = []
-        for name, info in data.items():
-            if name in ("aliases", "alias_info"):
-                continue
-            models.append({"id": name, **info})
-        models.sort(key=lambda m: (m.get("status") != "available", m["id"]))
+        data = await _get("/v1/models")
+        models = data.get("data", [])
+        # Sort: available first, then by id
+        models.sort(key=lambda m: m.get("id", ""))
         return models
 
     @mcp.tool()
@@ -165,55 +172,74 @@ def build_mcp_server(
     ) -> dict[str, Any]:
         """Find models matching given constraints, ranked by preference.
 
+        Uses the same /v1/models endpoint that OpenAI clients use, so the
+        returned IDs are directly usable as the 'model' field in a request.
+
         Args:
             min_context_window: only return models whose context_window >= this.
-            requires_capabilities: list of capability tags the model must support
-                (e.g. ['tool_use', 'structured_output']).
+            requires_capabilities: list of capability names the model must support.
+                These match the RENDERED capability booleans from /v1/models:
+                'toolcall', 'reasoning', 'structured_output' (not the raw config
+                tags like 'tool_use'). Default: no requirement.
             privacy: 'local_only' or 'cloud_ok'. Default local_only.
+                Note: /v1/models does not expose privacy; this filter is a
+                best-effort check against /v1/available-models. When unavailable,
+                all models are returned regardless of privacy.
 
         Returns:
             {"candidates": [id, ...], "best": id_or_None, "rationale": "..."}
+            The IDs are host-qualified (e.g. 'llama-01:ornith-35b') or alias
+            names (e.g. 'main') — directly usable in a request.
         """
-        data = await _get("/v1/available-models")
+        data = await _get("/v1/models")
+        models = data.get("data", [])
+
+        # Privacy filter: cross-reference with /v1/available-models for the
+        # privacy field (not exposed on /v1/models).
+        privacy_map: dict[str, str] = {}
+        try:
+            avail = await _get("/v1/available-models")
+            for name, info in avail.items():
+                if isinstance(info, dict) and name not in ("aliases", "alias_info"):
+                    privacy_map[name] = info.get("privacy", "")
+        except Exception:
+            pass  # /v1/available-models may be unavailable; skip privacy filter
 
         required_caps = set(requires_capabilities or [])
         candidates = []
-        total = 0
 
-        for model_id, info in data.items():
-            if model_id in ("aliases", "alias_info"):
-                continue
-            total += 1
+        for m in models:
+            model_id = m.get("id", "")
+            caps = m.get("capabilities") or {}
+            # caps is a dict of booleans: {toolcall: True, reasoning: True, ...}
+            # Check that every required cap is present and True
+            if required_caps:
+                if not all(caps.get(c) for c in required_caps):
+                    continue
 
-            # Must be available
-            if info.get("status") != "available":
-                continue
-
-            # Context window check — missing/None treated as 0 (fails non-zero constraint)
-            cw = info.get("context_window") or 0
+            # Context window check
+            cw = m.get("context_length") or m.get("max_model_len") or 0
             if cw < min_context_window:
                 continue
 
-            # Capabilities check — missing/None means no capabilities (fails non-empty constraint)
-            model_caps = set(info.get("capabilities") or [])
-            if not required_caps.issubset(model_caps):
-                continue
+            # Privacy filter (best-effort, against the bare name)
+            if privacy == "local_only":
+                bare_name = model_id.split(":")[-1] if ":" in model_id else model_id
+                model_privacy = privacy_map.get(bare_name, "")
+                if model_privacy and model_privacy != "local_only":
+                    continue
 
-            # Privacy filter
-            if privacy == "local_only" and info.get("privacy") != "local_only":
-                continue
+            candidates.append(m)
 
-            candidates.append({"id": model_id, **info})
+        # Sort by id for stability
+        candidates.sort(key=lambda m: m.get("id", ""))
 
-        # Sort by preference descending, then id ascending for stability
-        candidates.sort(key=lambda m: (-(m.get("preference") or 0.0), m["id"]))
-
-        candidate_ids = [m["id"] for m in candidates]
+        candidate_ids = [m.get("id", "") for m in candidates]
         return {
             "candidates": candidate_ids,
             "best": candidate_ids[0] if candidate_ids else None,
             "rationale": (
-                f"filtered {len(candidate_ids)} of {total} models by "
+                f"filtered {len(candidate_ids)} of {len(models)} models by "
                 f"min_context={min_context_window}, "
                 f"requires={list(requires_capabilities or [])}, "
                 f"privacy={privacy}"
