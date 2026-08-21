@@ -39,8 +39,14 @@ _log = logging.getLogger("llm_relay.health")
 
 # Probe config
 PROBE_INTERVAL = 30.0  # seconds between probe cycles
-PROBE_TIMEOUT = 10.0   # hard timeout per probe; timeout = unhealthy
-PROBE_PROMPT = "Reply with exactly: OK"
+PROBE_TIMEOUT = 15.0   # hard timeout per probe; timeout = unhealthy
+PROBE_PROMPT = "OK"
+# max_tokens=1: the probe only checks the model can START generating (L1 decode
+# smoke). A wedged slot produces 0 tokens in 15s. A healthy reasoning model
+# produces at least 1 token in 15s even if full response takes 30s+. Using a
+# tiny max_tokens avoids false positives on slow-reasoning models that take
+# >10s before their first content token.
+PROBE_MAX_TOKENS = 1
 FAILURES_TO_OPEN = 2   # consecutive failures before circuit opens
 RECOVERY_PROBES = 2    # consecutive successes before circuit closes
 COOLDOWN_S = 60.0      # min time between open -> half-open transition
@@ -120,7 +126,7 @@ class L2HealthProbe:
         body = {
             "model": model_name,
             "messages": [{"role": "user", "content": PROBE_PROMPT}],
-            "max_tokens": 8,
+            "max_tokens": PROBE_MAX_TOKENS,
             "temperature": 0,
         }
 
@@ -138,9 +144,11 @@ class L2HealthProbe:
                 ch = data.get("choices", [{}])[0]
                 fr = ch.get("finish_reason")
                 ct = data.get("usage", {}).get("completion_tokens", 0)
-                # Must terminate naturally with short output
-                if fr != "stop" or ct > 16:
-                    raise RuntimeError(f"abnormal: finish={fr} tokens={ct}")
+                # Success = model produced at least 1 token. finish_reason
+                # can be "length" (capped at 1) or "stop" — both are healthy.
+                # The failure mode we're catching is timeout (0 tokens).
+                if ct < 1:
+                    raise RuntimeError(f"no tokens generated: finish={fr} tokens={ct}")
                 # Success
                 self._on_success(key, client)
         except Exception as e:

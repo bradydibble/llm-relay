@@ -89,16 +89,15 @@ async def test_l2_probe_error_counts_as_failure():
 
 
 async def test_l2_probe_abnormal_termination_counts_as_failure():
-    """A response with finish_reason=length (not natural stop) is a failure —
-    the model may be in a repetition loop."""
+    """A response with 0 completion tokens (model didn't generate) is a failure."""
     disc = _make_discovery()
     probe = L2HealthProbe(disc, _make_config())
     with patch("httpx.AsyncClient") as mock_client_cls:
         mock_client = AsyncMock()
-        mock_client.post = AsyncMock(return_value=_mock_response(finish_reason="length", completion_tokens=100))
+        mock_client.post = AsyncMock(return_value=_mock_response(finish_reason="length", completion_tokens=0))
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=None)
-        mock_client_cls.return_value =mock_client
+        mock_client_cls.return_value = mock_client
         await probe._probe_one("test:8080", disc.clients["test:8080"])
         await probe._probe_one("test:8080", disc.clients["test:8080"])
     assert disc.clients["test:8080"].state.status == EndpointStatus.degraded
