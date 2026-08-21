@@ -32,6 +32,8 @@ from ..scheduler import AdmissionController
 from ..jobs import JobStore
 from ..jobworker import run_worker
 from ..health import L2HealthProbe
+from ..degeneracy import is_degenerate, degeneracy_score
+from ..config_drift import ConfigDriftDetector
 
 
 _KEEPALIVE_INTERVAL_S = 15.0
@@ -692,11 +694,14 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
             # marks the backend degraded and excludes it from routing.
             _l2_probe = L2HealthProbe(discovery, config)
             _l2_task = _l2_probe.start()
+            _drift_detector = ConfigDriftDetector(discovery, config)
+            _drift_task = _drift_detector.start()
             try:
                 yield
             finally:
                 _job_stop.set()
                 await _l2_probe.stop()
+                await _drift_detector.stop()
                 try:
                     await asyncio.wait_for(_job_task, timeout=10)
                 except Exception:
@@ -1402,6 +1407,13 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 exc: BaseException | None = None
                 first_chunk_ns: int | None = None
                 carry = b""  # partial trailing SSE frame awaiting its blank-line terminator
+                # In-band degeneracy detector: check the accumulated content
+                # every ~64 tokens for repetition loops. If detected, abort
+                # the stream with a terminal error event instead of piping
+                # thousands of repeating tokens to the client.
+                _deg_check_text = ""
+                _deg_check_count = 0
+                _deg_aborted = False
                 try:
                     async for chunk, _is_ka in _sse_stream_keepalive(
                         body_iter, media_type, _KEEPALIVE_INTERVAL_S
@@ -1415,6 +1427,26 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                             # Non-reasoning model: byte-identical passthrough.
                             chunks.append(chunk)
                             yield chunk
+                            # Degeneracy check: extract content from SSE chunks
+                            # and check every ~256 chars (~64 tokens)
+                            try:
+                                for line in chunk.decode("utf-8", "replace").split("\n"):
+                                    if line.startswith("data:") and "[DONE]" not in line:
+                                        d = json.loads(line[5:].strip())
+                                        delta = (d.get("choices", [{}])[0].get("delta") or {})
+                                        c = delta.get("content", "") or ""
+                                        if c:
+                                            _deg_check_text += c
+                                            _deg_check_count += 1
+                                            if _deg_check_count >= 64 and len(_deg_check_text) > 256:
+                                                if is_degenerate(_deg_check_text):
+                                                    _deg_aborted = True
+                                                    err = {"error": {"message": "generation degenerate (repetition loop detected); aborting", "type": "degenerate"}}
+                                                    yield b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n"
+                                                    return
+                                                _deg_check_count = 0
+                            except Exception:
+                                pass  # don't let degeneracy checking crash the stream
                             continue
                         # Reasoning model: mirror reasoning->reasoning_content on
                         # COMPLETE frames only (split on the blank-line terminator),
@@ -1446,6 +1478,8 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                     # status: a 200 that stalls mid-stream is not a success. Only
                     # synchronous calls here — under GeneratorExit we must not await.
                     outcome = _classify_stream_outcome(upstream_status, exc, sse_finished(raw))
+                    if _deg_aborted:
+                        outcome = "degenerate"
                     # End-to-end TTFT (first chunk ~= first byte, includes routing);
                     # None when no chunk ever flowed.
                     ttft_ns = (first_chunk_ns - start_ns) if first_chunk_ns is not None else None
