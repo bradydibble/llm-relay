@@ -39,7 +39,11 @@ _log = logging.getLogger("llm_relay.health")
 
 # Probe config
 PROBE_INTERVAL = 30.0  # seconds between probe cycles
-PROBE_TIMEOUT = 15.0   # hard timeout per probe; timeout = unhealthy
+PROBE_TIMEOUT = 30.0   # hard timeout per probe; timeout = unhealthy.
+# 30s is fast enough to catch a wedged slot (hangs for 900s, not 30s) but
+# slow enough to avoid false positives on busy reasoning models (a vLLM
+# backend with all slots busy can take >15s to admit a probe; a reasoning
+# model can spend 20s in thinking before producing 1 token).
 PROBE_PROMPT = "OK"
 # max_tokens=1: the probe only checks the model can START generating (L1 decode
 # smoke). A wedged slot produces 0 tokens in 15s. A healthy reasoning model
@@ -158,6 +162,12 @@ class L2HealthProbe:
         health = self._health.get(key)
         if not health:
             return
+        # Don't start half-open recovery immediately after the circuit opens —
+        # enforce a cooldown so a flaky backend doesn't flap (open/close/open).
+        if health.circuit_open and health.last_failure_ns:
+            elapsed_s = (time.time_ns() - health.last_failure_ns) / 1e9
+            if elapsed_s < COOLDOWN_S:
+                return  # still in cooldown; don't count this success yet
         health.consecutive_failures = 0
         health.consecutive_successes += 1
 
