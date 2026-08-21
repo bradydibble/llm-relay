@@ -10,7 +10,11 @@ from .keys import compose_backend_key, compose_backend_url, resolve_model_id
 
 
 def _is_available(status: ModelStatus) -> bool:
-    return status in (ModelStatus.available, ModelStatus.degraded)
+    # degraded backends (L2 circuit open — wedged slot, repetition loop,
+    # GPU hang) are NOT available for routing. L0 (/v1/models) proves the
+    # process is listening, not that it can generate. A degraded backend
+    # will consume request capacity and hang. Exclude it.
+    return status == ModelStatus.available
 
 
 def batch_policy_for(sla_class: str | None) -> str:

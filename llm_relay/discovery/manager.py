@@ -239,7 +239,13 @@ class DiscoveryManager:
                 models = await client.fetch_models()
                 client.state.last_poll = datetime.now(timezone.utc).isoformat()
                 if models:
-                    client.state.status = EndpointStatus.healthy
+                    # Don't override L2-degraded status: the L0 poll proves the
+                    # process is listening, but L2 may have found a wedged
+                    # generation slot. Only promote from unavailable -> healthy,
+                    # not from degraded -> healthy. The L2 probe owns the
+                    # degraded -> healthy recovery transition.
+                    if client.state.status != EndpointStatus.degraded:
+                        client.state.status = EndpointStatus.healthy
                     client.state.models = models
                 else:
                     client.state.status = EndpointStatus.unavailable
