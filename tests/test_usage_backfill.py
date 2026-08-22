@@ -11,7 +11,9 @@ from __future__ import annotations
 import pytest
 
 from llm_relay.usage_backfill import (
+    apply_request_counts,
     backfill,
+    request_counts_from_prometheus,
     rows_from_kpi_record,
     rows_from_prometheus,
     synthetic_request_id,
@@ -114,3 +116,85 @@ def test_illegal_row_is_rejected_loudly_not_swallowed(tmp_path):
     bad["reasoning_tokens"] = 999  # exceeds output_tokens
     with pytest.raises(ValueError):
         backfill(conn, [bad])
+
+
+# --- request counts on synthetic daily rows ----------------------------------
+# A backfilled row is one daily aggregate per (day, principal, client, model),
+# so COUNT(*) reports 1 where the real day had thousands of calls. The real
+# count comes from Prometheus at backfill time and rides in the row.
+
+
+def test_request_counts_from_prometheus_parses_per_model_totals():
+    payload = {"data": {"result": [
+        {"metric": {"model": "glm-5.2"}, "value": [1787000000, "3181.4"]},
+        {"metric": {"model": "ornith-35b"}, "value": [1787000000, "12.6"]},
+        {"metric": {"model": "none"}, "value": [1787000000, "5"]},
+        {"metric": {}, "value": [1787000000, "9"]},
+    ]}}
+    counts = request_counts_from_prometheus(payload)
+    assert counts == {"glm-5.2": 3181, "ornith-35b": 13}  # rounded, not truncated
+
+
+def test_daily_count_splits_across_rows_in_proportion_to_tokens():
+    rows = rows_from_prometheus({"data": {"result": [
+        {"metric": {"principal": "brady", "client": "cc", "model": "glm-5.2",
+                    "direction": "prompt"}, "value": [1, "7500"]},
+        {"metric": {"principal": "jrodriguez", "client": "vscode",
+                    "model": "glm-5.2", "direction": "prompt"},
+         "value": [1, "2500"]},
+    ]}}, "2026-08-20")
+    applied = apply_request_counts(rows, {"glm-5.2": 101})
+    assert applied == 1  # one model's count was applied
+    by_principal = {r["principal"]: r["request_count"] for r in rows}
+    # 75% / 25% of 101 -> 75.75 / 25.25; floors are 75 and 25, and the leftover
+    # unit lands on the largest row so the day's total stays exactly 101.
+    assert by_principal == {"brady": 76, "jrodriguez": 25}
+    assert sum(by_principal.values()) == 101
+
+
+def test_a_model_prometheus_did_not_report_keeps_a_count_of_one():
+    """Inventing a number for a model the counter never saw would be worse than
+    an obvious 1: the 1 is visibly a floor, a guess is not."""
+    rows = rows_from_prometheus({"data": {"result": [
+        {"metric": {"principal": "brady", "client": "cc", "model": "glm-5.2",
+                    "direction": "prompt"}, "value": [1, "100"]},
+    ]}}, "2026-08-20")
+    assert apply_request_counts(rows, {"some-other-model": 50}) == 0
+    assert rows[0]["request_count"] == 1
+
+
+def test_backfill_persists_the_request_count_it_was_given(tmp_path):
+    """Built from a row shaped exactly as ``rows_from_prometheus`` emits it: if
+    request_count were missing from the insert column list the value would
+    silently revert to the column default and the fix would do nothing."""
+    conn = open_db(str(tmp_path / "u.db"))
+    rows = rows_from_prometheus({"data": {"result": [
+        {"metric": {"principal": "brady", "client": "cc", "model": "glm-5.2",
+                    "direction": "prompt"}, "value": [1, "1000"]},
+        {"metric": {"principal": "brady", "client": "cc", "model": "glm-5.2",
+                    "direction": "completion"}, "value": [1, "100"]},
+    ]}}, "2026-08-20")
+    apply_request_counts(rows, {"glm-5.2": 3181})
+    assert backfill(conn, rows) == 1
+    got = conn.execute(
+        "SELECT request_count, synthetic FROM requests"
+    ).fetchone()
+    assert got == (3181, 1)
+
+
+def test_synthetic_rows_start_at_one_request(tmp_path):
+    rows = rows_from_kpi_record(
+        {"date": "2026-07-01", "tokens": {"prompt": 5000, "completion": 300}}
+    )
+    assert rows[0]["request_count"] == 1
+
+
+def test_kpi_record_carries_its_own_fleet_request_total():
+    """The KPI JSONL already records the day's request total, so a fleet row has
+    no reason to sit at the floor of 1."""
+    rows = rows_from_kpi_record({
+        "date": "2026-07-01",
+        "tokens": {"prompt": 5000, "completion": 300},
+        "requests": {"total": 4212, "terminal": 6},
+    })
+    assert rows[0]["request_count"] == 4212

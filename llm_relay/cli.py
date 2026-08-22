@@ -224,8 +224,10 @@ def cmd_usage_backfill(args: argparse.Namespace) -> int:
     means a backfill row can never overwrite a live per-request row.
     """
     from .usage_backfill import (
+        apply_request_counts,
         backfill,
         day_range,
+        prometheus_day_request_counts,
         prometheus_day_rows,
         rows_from_kpi_file,
     )
@@ -258,6 +260,28 @@ def cmd_usage_backfill(args: argparse.Namespace) -> int:
                 # loudly instead of leaving one behind.
                 console.print(f"[red]prometheus {day} failed:[/red] {exc}")
                 return 1
+            # Request counts are a second query and a softer failure: without
+            # them each synthetic row stays at its floor of 1, which is wrong
+            # but visibly wrong. Losing the tokens would be worse, so a count
+            # gap is reported and the day is still written.
+            models = {str(r.get("model") or "") for r in rows}
+            try:
+                counts = prometheus_day_request_counts(args.prom_url, day)
+            except Exception as exc:
+                console.print(
+                    f"[yellow]{day}: per-model request counts unavailable "
+                    f"({exc}) — request_count left at 1 for "
+                    f"{len(models)} model(s)[/yellow]"
+                )
+            else:
+                applied = apply_request_counts(rows, counts)
+                missing = sorted(m for m in models - set(counts) if m)
+                if missing:
+                    console.print(
+                        f"[yellow]{day}: no request count for "
+                        f"{', '.join(missing)} — left at 1 "
+                        f"({applied} model(s) counted)[/yellow]"
+                    )
             batches.append((f"prom {day}", rows))
     if args.kpi_file:
         # Fleet-level KPI days must stop where the per-user Prometheus data

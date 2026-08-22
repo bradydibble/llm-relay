@@ -19,18 +19,41 @@ import sqlite3
 import threading
 import time
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _COLUMNS = (
     "request_id", "ts", "day", "principal", "client", "alias", "model",
     "provider", "outcome", "streamed", "duration_ms", "ttft_ms",
     "input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens",
-    "usage_source", "reasoning_source", "synthetic", "message_count",
-    "system_hash", "prefix_hash", "tool_count", "temperature", "max_tokens",
-    "confidentiality", "fell_back",
+    "usage_source", "reasoning_source", "synthetic", "request_count",
+    "message_count", "system_hash", "prefix_hash", "tool_count", "temperature",
+    "max_tokens", "confidentiality", "fell_back",
 )
 
 _REQUIRED = ("request_id", "ts", "day", "model", "usage_source")
+
+# Columns a writer may legitimately omit, and what to store when it does.
+#
+# The live path records one row per request and builds no ``request_count`` at
+# all. Binding that missing key straight through would offer NULL to a NOT NULL
+# column, and ``INSERT OR IGNORE`` ignores *every* constraint failure -- so the
+# relay would record nothing, silently, for every real request. Defaulting here
+# means the store defends itself against any writer, present or future, rather
+# than depending on each one remembering the column.
+_DEFAULTS = {"request_count": 1}
+
+
+def row_values(row: dict, columns: tuple = _COLUMNS) -> tuple:
+    """Bind ``row`` to ``columns``, filling omitted ones from :data:`_DEFAULTS`.
+
+    Shared with :mod:`llm_relay.usage_backfill` so live and backfill inserts
+    cannot disagree about what an absent column means.
+    """
+    out = []
+    for column in columns:
+        value = row.get(column)
+        out.append(_DEFAULTS.get(column) if value is None else value)
+    return tuple(out)
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS requests (
@@ -53,6 +76,13 @@ CREATE TABLE IF NOT EXISTS requests (
     usage_source      TEXT NOT NULL,
     reasoning_source  TEXT NOT NULL DEFAULT 'none',
     synthetic         INTEGER NOT NULL DEFAULT 0,
+    -- How many requests this row accounts for. A live row is exactly one, which
+    -- is the default; a synthetic backfill row is a whole day's aggregate and
+    -- carries the real count, so request totals sum request_count and never
+    -- COUNT(*). Deliberately no CHECK: proportional splitting can floor a small
+    -- share to 0, and a CHECK would make INSERT OR IGNORE drop that row without
+    -- a trace -- an undercount worse than the zero it was guarding against.
+    request_count     INTEGER NOT NULL DEFAULT 1,
     message_count     INTEGER,
     system_hash       TEXT,
     prefix_hash       TEXT,
@@ -72,11 +102,39 @@ CREATE INDEX IF NOT EXISTS requests_prefix    ON requests(prefix_hash);
 """
 
 
+# Columns added after v1 shipped, as (name, column definition).
+#
+# ``CREATE TABLE IF NOT EXISTS`` is a no-op on an existing table, so a database
+# created by an older schema never gains a new column from _DDL alone. Every
+# addition must be listed here too, must be additive, and -- being NOT NULL --
+# must carry a DEFAULT so SQLite can supply a value for the rows already on disk.
+_MIGRATIONS = (
+    ("request_count", "request_count INTEGER NOT NULL DEFAULT 1"),
+)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring an existing ``requests`` table up to the current column set.
+
+    ``ALTER TABLE ADD COLUMN`` raises when the column is already present, so
+    each step is gated on what the table actually has rather than on a version
+    number that a hand-edited or half-migrated file could misreport.
+    """
+    have = {r[1] for r in conn.execute("PRAGMA table_info(requests)").fetchall()}
+    for column, definition in _MIGRATIONS:
+        if column not in have:
+            conn.execute(f"ALTER TABLE requests ADD COLUMN {definition}")
+
+
 def open_db(path: str) -> sqlite3.Connection:
     """Open (creating if needed) the usage database with schema applied.
 
     WAL so a reader never blocks the writer. ``check_same_thread=False`` because
     the writer thread owns the connection while tests read from the main thread.
+
+    Safe to call against a database written by an older schema: missing columns
+    are added in place, which is how the live store on the gateway upgrades
+    without a dump-and-reload of the history it is the only copy of.
     """
     parent = os.path.dirname(path)
     if parent:
@@ -85,6 +143,7 @@ def open_db(path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(_DDL)
+    _migrate(conn)
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     return conn
 
@@ -150,7 +209,7 @@ class UsageStore:
             if (row.get("reasoning_tokens") or 0) > (row.get("output_tokens") or 0):
                 self.dropped += 1
                 continue
-            params.append(tuple(row.get(c) for c in _COLUMNS))
+            params.append(row_values(row))
         if not params:
             return
         try:

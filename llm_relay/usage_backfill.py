@@ -19,6 +19,9 @@ import sqlite3
 import urllib.parse
 import urllib.request
 
+from .usage_store import _COLUMNS as _STORE_COLUMNS
+from .usage_store import row_values
+
 SOURCE_PROM = "prom_backfill"
 SOURCE_KPI = "kpi_backfill"
 
@@ -28,6 +31,13 @@ SOURCE_KPI = "kpi_backfill"
 PROM_QUERY = (
     "sum by (principal, client, model, direction) "
     "(increase(llm_relay_tokens_total[1d]))"
+)
+
+# Per-model daily request totals. Only ``model`` is available at this grain --
+# the request counter is not labelled by principal -- so a model's daily total
+# is split across its (principal, client) rows in proportion to their tokens.
+PROM_REQUESTS_QUERY = (
+    'sum by (model) (increase(llm_relay_requests_total{outcome="success"}[1d]))'
 )
 
 # Old direction label -> standard name.
@@ -56,7 +66,12 @@ def _base_row(source: str, day: str, principal: str, client: str,
         "streamed": 0, "duration_ms": None, "ttft_ms": None,
         "input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0,
         "cache_read_tokens": 0, "usage_source": source,
-        "reasoning_source": "none", "synthetic": 1, "message_count": None,
+        "reasoning_source": "none", "synthetic": 1,
+        # One synthetic row stands for a whole day, so the count is the one
+        # number COUNT(*) can never recover. 1 until a real total is applied:
+        # a visible floor, never a guess.
+        "request_count": 1,
+        "message_count": None,
         "system_hash": None, "prefix_hash": None, "tool_count": None,
         "temperature": None, "max_tokens": None, "confidentiality": None,
         "fell_back": None,
@@ -91,6 +106,74 @@ def rows_from_prometheus(payload: dict, day: str) -> list[dict]:
     return list(merged.values())
 
 
+def request_counts_from_prometheus(payload: dict) -> dict[str, int]:
+    """Model -> daily request count from one ``sum by (model)`` instant query.
+
+    Rounded rather than truncated: ``increase()`` extrapolates, so a day of
+    3,181 calls can come back as 3180.6, and flooring that would bias every
+    historical day low.
+    """
+    counts: dict[str, int] = {}
+    for series in ((payload or {}).get("data") or {}).get("result") or []:
+        model = str((series.get("metric") or {}).get("model") or "")
+        if not model or model == "none":
+            continue  # 'none' is the pre-routing failure pseudo-model
+        try:
+            value = float(series.get("value", [None, "0"])[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        count = int(round(value))
+        if count <= 0:
+            continue
+        counts[model] = counts.get(model, 0) + count
+    return counts
+
+
+def apply_request_counts(rows: list[dict], counts: dict[str, int]) -> int:
+    """Spread each model's daily request total across that model's rows.
+
+    The request counter carries no principal label, so the only defensible
+    split is by the tokens each (principal, client) pair actually consumed --
+    that keeps the per-user request share consistent with the per-user token
+    share the same backfill wrote. Floors are proportional and the rounding
+    remainder lands on the largest row, so the model's daily total is exact.
+
+    A model Prometheus did not report keeps ``request_count = 1``. Returns the
+    number of models whose count was applied, so a caller can report the gap
+    instead of the numbers quietly being floors.
+
+    Known edge: if a model's daily total is smaller than its number of rows,
+    some rows floor to 0. That is preferred to inflating the day's exact total.
+    """
+    by_model: dict[str, list[dict]] = {}
+    for row in rows:
+        by_model.setdefault(str(row.get("model") or ""), []).append(row)
+
+    applied = 0
+    for model, model_rows in by_model.items():
+        total = int(counts.get(model) or 0)
+        if total <= 0:
+            continue
+        weights = [
+            max(0, int(r.get("input_tokens") or 0) + int(r.get("output_tokens") or 0))
+            for r in model_rows
+        ]
+        weight_total = sum(weights)
+        if weight_total <= 0:
+            # No tokens to weight by (shouldn't happen -- zero-token series are
+            # skipped upstream) so fall back to an even split.
+            weights = [1] * len(model_rows)
+            weight_total = len(model_rows)
+        allocated = [total * w // weight_total for w in weights]
+        # Ties go to the earliest row so a re-run allocates identically.
+        largest = max(range(len(model_rows)), key=lambda i: (weights[i], -i))
+        allocated[largest] += total - sum(allocated)
+        for row, count in zip(model_rows, allocated):
+            row["request_count"] = count
+        applied += 1
+    return applied
+
+
 def rows_from_kpi_record(record: dict) -> list[dict]:
     """Convert one KPI JSONL daily record into a single fleet-level row.
 
@@ -109,6 +192,13 @@ def rows_from_kpi_record(record: dict) -> list[dict]:
     row = _base_row(SOURCE_KPI, day, "", "", "fleet")
     row["input_tokens"] = inp
     row["output_tokens"] = out
+    # The KPI record already holds the day's fleet request total, so there is no
+    # reason to leave this row at a floor of 1. It is the *total*, not just the
+    # successes, while the row's outcome says 'success' -- the same known
+    # limitation every synthetic row carries.
+    requests = int(((record.get("requests") or {}).get("total")) or 0)
+    if requests > 0:
+        row["request_count"] = requests
     return [row]
 
 
@@ -160,29 +250,36 @@ def prometheus_instant_query(base_url: str, query: str, at: float,
     return payload
 
 
-def prometheus_day_rows(base_url: str, day: str, *, query: str = PROM_QUERY,
-                        timeout: float = 30.0) -> list[dict]:
-    """Rows for one whole UTC day.
-
-    The instant query is evaluated at 00:00 UTC of the *following* day so the
-    ``[1d]`` window covers exactly ``day``.
-    """
-    at = dt.datetime.combine(
+def _day_end_ts(day: str) -> float:
+    """00:00 UTC of the day *after* ``day`` -- the instant at which a ``[1d]``
+    range covers exactly ``day``."""
+    return dt.datetime.combine(
         dt.date.fromisoformat(day) + dt.timedelta(days=1),
         dt.time(0, 0), tzinfo=dt.timezone.utc,
     ).timestamp()
-    payload = prometheus_instant_query(base_url, query, at, timeout=timeout)
+
+
+def prometheus_day_rows(base_url: str, day: str, *, query: str = PROM_QUERY,
+                        timeout: float = 30.0) -> list[dict]:
+    """Rows for one whole UTC day."""
+    payload = prometheus_instant_query(
+        base_url, query, _day_end_ts(day), timeout=timeout)
     return rows_from_prometheus(payload, day)
 
 
-_INSERT_COLUMNS = (
-    "request_id", "ts", "day", "principal", "client", "alias", "model",
-    "provider", "outcome", "streamed", "duration_ms", "ttft_ms",
-    "input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens",
-    "usage_source", "reasoning_source", "synthetic", "message_count",
-    "system_hash", "prefix_hash", "tool_count", "temperature", "max_tokens",
-    "confidentiality", "fell_back",
-)
+def prometheus_day_request_counts(base_url: str, day: str, *,
+                                  query: str = PROM_REQUESTS_QUERY,
+                                  timeout: float = 30.0) -> dict[str, int]:
+    """Per-model request counts for one whole UTC day."""
+    payload = prometheus_instant_query(
+        base_url, query, _day_end_ts(day), timeout=timeout)
+    return request_counts_from_prometheus(payload)
+
+
+# The store's own column list, not a copy of it: a second tuple would let a new
+# column be added to the schema and silently omitted from every backfill insert,
+# where OR IGNORE plus a column default makes the loss invisible.
+_INSERT_COLUMNS = _STORE_COLUMNS
 
 
 def _row_is_legal(row: dict) -> bool:
@@ -216,6 +313,6 @@ def backfill(conn: sqlite3.Connection, rows: list[dict]) -> int:
                 f"illegal backfill row for {row.get('day')}/{row.get('model')}: "
                 f"reasoning_tokens exceeds output_tokens"
             )
-        cur = conn.execute(sql, tuple(row.get(c) for c in _INSERT_COLUMNS))
+        cur = conn.execute(sql, row_values(row, _INSERT_COLUMNS))
         inserted += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
     return inserted

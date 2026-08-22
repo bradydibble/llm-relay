@@ -180,3 +180,100 @@ def test_rollup_aggregates_by_day_principal_model(tmp_path):
         assert rows == [("2026-08-20", 300, 30, 2), ("2026-08-21", 5, 1, 1)]
     finally:
         store.close()
+
+
+# --- request_count: the additive column and its in-place migration -----------
+# Live rows are one request each; backfilled rows are daily aggregates covering
+# thousands. COUNT(*) cannot express both, so the count travels in the row.
+
+
+def _columns(conn) -> set[str]:
+    return {r[1] for r in conn.execute("PRAGMA table_info(requests)").fetchall()}
+
+
+def test_fresh_database_has_request_count_defaulting_to_one(tmp_path):
+    conn = open_db(str(tmp_path / "usage.db"))
+    assert "request_count" in _columns(conn)
+    conn.execute(
+        "INSERT INTO requests (request_id, ts, day, model, usage_source) "
+        "VALUES ('r', 1.0, '2026-08-20', 'm', 'upstream_final')"
+    )
+    got = conn.execute("SELECT request_count FROM requests").fetchone()[0]
+    assert got == 1
+
+
+def test_open_db_adds_request_count_to_a_pre_existing_database(tmp_path):
+    """The live database on llm-gateway-01 already holds ~500 rows written by
+    the pre-column schema. It must upgrade in place, keep every existing row
+    readable, and give those rows the one-request-per-row meaning they had."""
+    from llm_relay import usage_store
+
+    # Exactly today's schema minus the new column -- built by subtraction so it
+    # cannot drift away from what the deployed file actually contains.
+    legacy_ddl = "\n".join(
+        line for line in usage_store._DDL.splitlines()
+        if "request_count" not in line
+    )
+    assert "request_count" not in legacy_ddl
+
+    path = str(tmp_path / "legacy.db")
+    old = sqlite3.connect(path, isolation_level=None)
+    old.executescript(legacy_ddl)
+    old.execute(
+        "INSERT INTO requests (request_id, ts, day, principal, client, model, "
+        "outcome, input_tokens, output_tokens, usage_source) VALUES "
+        "('old-1', 1.0, '2026-08-19', 'brady', 'cc', 'glm-5.2', 'success', "
+        "700, 70, 'upstream_final')"
+    )
+    assert "request_count" not in _columns(old)
+    old.close()
+
+    conn = open_db(path)
+    assert "request_count" in _columns(conn)
+    got = conn.execute(
+        "SELECT input_tokens, request_count FROM requests WHERE request_id = 'old-1'"
+    ).fetchone()
+    assert got == (700, 1)  # pre-existing row intact, one request per row
+    conn.close()
+
+    # ALTER TABLE ADD COLUMN raises when the column is already there, so the
+    # migration must be a no-op the second, third, and thousandth time.
+    again = open_db(path)
+    assert again.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 1
+    again.close()
+
+
+def test_live_writer_row_without_request_count_is_still_recorded(tmp_path):
+    """``_row()`` carries exactly the keys instrumentation.py builds -- and it
+    does not build ``request_count``. If the writer bound that missing key to a
+    NOT NULL column, INSERT OR IGNORE would swallow the constraint failure and
+    the relay would record nothing at all, silently."""
+    row = _row(request_id="live-shaped")
+    assert "request_count" not in row  # guard: the production row really lacks it
+    store = UsageStore(str(tmp_path / "usage.db"))
+    try:
+        store.record(row)
+        store.flush()
+        assert store.dropped == 0
+        conn = open_db(str(tmp_path / "usage.db"))
+        got = conn.execute(
+            "SELECT input_tokens, request_count FROM requests "
+            "WHERE request_id = 'live-shaped'"
+        ).fetchone()
+        assert got == (120000, 1)
+    finally:
+        store.close()
+
+
+def test_writer_honours_an_explicit_request_count(tmp_path):
+    store = UsageStore(str(tmp_path / "usage.db"))
+    try:
+        store.record(_row(request_id="agg", request_count=3181))
+        store.flush()
+        conn = open_db(str(tmp_path / "usage.db"))
+        got = conn.execute(
+            "SELECT request_count FROM requests WHERE request_id = 'agg'"
+        ).fetchone()[0]
+        assert got == 3181
+    finally:
+        store.close()
