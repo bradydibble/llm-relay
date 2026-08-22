@@ -1,5 +1,15 @@
 # Handoff: LLM Relay Bug Fix Session (2026-08-21/22)
 
+> **RESOLVED 2026-08-22.** Release `27a7dd6` (the complete fix stack) went live
+> on llm-gateway-01 at 18:03 UTC and was verified against the live relay:
+> qwen3.6-35b reproducer 10/10 consecutive non-streaming passes (10.6–14.1s,
+> `finish_reason: stop`, no cap hits) plus a clean streaming pass (16s, 1775
+> chunks, `[DONE]`). ornith-35b turned out NOT to be the loop bug: llama-server
+> on llama-01 already defaults `repeat_penalty=1.1` and honors the relay's
+> max_tokens cap — it is simply slow (~120s for a ~1250-token reasoning answer),
+> so client timeouts under ~3 min read as hangs there. The "deployed vs pending"
+> section below is retained as history; it is no longer current.
+
 ## Objective
 
 Reproduce and fix the ciq-relay bug report: qwen3.6-35b and ornith-35b hang indefinitely on certain `/v1/chat/completions` requests. Expand test suite, improve health checks, get advising from Claude/ChatGPT.
@@ -36,9 +46,10 @@ Two separate bugs, both in the relay's non-streaming path:
 
 NOTE: Fable is fixing health.py in a PARALLEL SESSION. His commits may be interleaved. Check `git log --oneline` for his work before deploying.
 
-## What's deployed vs pending
+## What's deployed vs pending (HISTORICAL — superseded by the banner above)
 
 **Deployed (live on llm-gateway-01):** Through commit `730dd6c` (the streaming L2 probe fix). This was the last relay restart I did.
+*(2026-08-22 update: `27a7dd6` deployed 18:03 UTC — everything below shipped.)*
 
 **NOT deployed (committed and pushed, but NOT restarted):**
 - `02f2ab2` — in-band degeneracy detector + config-drift detector
