@@ -157,3 +157,112 @@ async def test_l2_skips_backends_with_no_models():
     with patch.object(probe, "_probe_one", new_callable=AsyncMock) as mock_probe:
         await probe._probe_all()
     mock_probe.assert_not_called()
+
+
+# --- traffic-evidence tests: probe starvation under long-context load must ---
+# --- not open the circuit while real completions are flowing (2026-08-21). ---
+
+def _failing_async_client():
+    """httpx.AsyncClient mock whose stream() always times out."""
+    mock_client = AsyncMock()
+    mock_client.stream = MagicMock(side_effect=httpx.ReadTimeout("timed out"))
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    return mock_client
+
+
+async def test_l2_probe_timeout_not_counted_when_traffic_fresh():
+    """A probe timeout while real requests are completing is probe starvation
+    (a 512k prefill hogs the scheduler past the probe deadline), not a wedge.
+    The circuit must stay closed however many probes starve."""
+    disc = _make_discovery()
+    ep = disc.clients["test:8080"]
+    probe = L2HealthProbe(disc, _make_config())
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        mock_client_cls.return_value = _failing_async_client()
+        for _ in range(FAILURES_TO_OPEN + 2):
+            ep.last_traffic_success_ns = time.time_ns()  # traffic keeps completing
+            await probe._probe_one("test:8080", ep)
+    assert ep.state.status == EndpointStatus.healthy
+    assert not probe._health["test:8080"].circuit_open
+
+
+async def test_l2_probe_timeout_counts_when_traffic_stale():
+    """Traffic evidence expires: with the last real success far in the past,
+    probe failures count and the circuit opens as before."""
+    disc = _make_discovery()
+    ep = disc.clients["test:8080"]
+    ep.last_traffic_success_ns = time.time_ns() - 600_000_000_000  # 10 min ago
+    probe = L2HealthProbe(disc, _make_config())
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        mock_client_cls.return_value = _failing_async_client()
+        await probe._probe_one("test:8080", ep)
+        await probe._probe_one("test:8080", ep)
+    assert ep.state.status == EndpointStatus.degraded
+    assert probe._health["test:8080"].circuit_open
+
+
+async def test_l2_fresh_traffic_resets_failure_streak():
+    """A busy-skipped probe resets the failure streak, so single failures in
+    separate busy windows never accumulate into a spurious open."""
+    disc = _make_discovery()
+    ep = disc.clients["test:8080"]
+    probe = L2HealthProbe(disc, _make_config())
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        mock_client_cls.return_value = _failing_async_client()
+        await probe._probe_one("test:8080", ep)  # no traffic marker -> counted
+        assert probe._health["test:8080"].consecutive_failures == 1
+        ep.last_traffic_success_ns = time.time_ns()
+        await probe._probe_one("test:8080", ep)  # busy -> skipped AND reset
+        assert probe._health["test:8080"].consecutive_failures == 0
+        ep.last_traffic_success_ns = None  # traffic stops
+        await probe._probe_one("test:8080", ep)  # counted (1)
+        assert ep.state.status == EndpointStatus.healthy
+        await probe._probe_one("test:8080", ep)  # counted (2) -> opens
+    assert ep.state.status == EndpointStatus.degraded
+
+
+async def test_router_forward_success_stamps_traffic_evidence():
+    """RequestRouter.forward_request records a completed 2xx on the endpoint,
+    which is what the L2 probe consults as liveness evidence."""
+    from llm_relay.routing.router import RequestRouter
+
+    disc = _make_discovery()
+    ep = disc.clients["test:8080"]
+    router = RequestRouter(None, disc)
+    resp = MagicMock()
+    resp.status_code = 200
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client_cls.return_value = mock_client
+        out = await router.forward_request(
+            "http://127.0.0.1:8080/v1", "test-model", {"messages": []},
+            backend_key="test:8080",
+        )
+    assert out is resp
+    assert ep.last_traffic_success_ns is not None
+
+
+async def test_router_forward_error_does_not_stamp():
+    """A 5xx upstream response is not liveness evidence."""
+    from llm_relay.routing.router import RequestRouter
+
+    disc = _make_discovery()
+    ep = disc.clients["test:8080"]
+    router = RequestRouter(None, disc)
+    resp = MagicMock()
+    resp.status_code = 502
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client_cls.return_value = mock_client
+        await router.forward_request(
+            "http://127.0.0.1:8080/v1", "test-model", {"messages": []},
+            backend_key="test:8080",
+        )
+    assert ep.last_traffic_success_ns is None

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -191,6 +192,15 @@ class RequestRouter:
             return None
         return compose_backend_url(provider.base_url, cfg.port, cfg.path)
 
+    def _note_traffic_success(self, backend_key: str | None) -> None:
+        """Stamp liveness evidence on the endpoint after a COMPLETED successful
+        real request. The L2 health probe reads this to tell a busy backend
+        (probe starved behind a long prefill; completions still flowing) from a
+        wedged one (nothing completes) — see health.TRAFFIC_FRESH_S."""
+        client = self.discovery.clients.get(backend_key or "")
+        if client is not None:
+            client.last_traffic_success_ns = time.time_ns()
+
     def _apply_filters(self, body: dict[str, Any], model_name: str) -> dict[str, Any]:
         """Strip/override request params per the model's configured filters
         (plan 5), before the request hits the upstream. Returns a new dict and
@@ -245,11 +255,16 @@ class RequestRouter:
         # backend_key="" / None → acquire_slot is a no-op (no semaphore registered).
         async with self.discovery.acquire_slot(backend_key or "", wait_timeout=slot_wait_timeout):
             async with httpx.AsyncClient(timeout=timeout) as client:
-                return await client.post(
+                resp = await client.post(
                     f"{backend_url}/{upstream_path}",
                     json=body,
                     headers=merged_headers,
                 )
+                # A fully-received 2xx body means the backend generated —
+                # liveness evidence for the L2 probe.
+                if 200 <= resp.status_code < 300:
+                    self._note_traffic_success(backend_key)
+                return resp
 
     async def stream_request(
         self,
@@ -341,6 +356,12 @@ class RequestRouter:
             try:
                 async for chunk in resp.aiter_raw():
                     yield chunk
+                # Stream drained to the end without error: the backend
+                # generated a full response — liveness evidence for the L2
+                # probe. An aborted/wedged stream exits via the finally
+                # without reaching this.
+                if 200 <= resp.status_code < 300:
+                    self._note_traffic_success(backend_key)
             finally:
                 await _cleanup()
 

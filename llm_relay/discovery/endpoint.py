@@ -45,6 +45,13 @@ class EndpointClient:
     # loop uses it to tell a legitimately busy backend from one whose counter is
     # stranded by a leaked slot (inflight_used > 0 but no dispatch in a while).
     last_dispatched_at: float | None = field(default=None, init=False)
+    # Wall-clock ns of the last COMPLETED successful real request through this
+    # backend (stamped by RequestRouter). The L2 health probe reads it as
+    # liveness evidence: a backend that finished a real completion moments ago
+    # is generating, so a starved probe must not count toward opening the
+    # circuit (long-context prefills can hold the scheduler past the probe
+    # deadline while completions keep flowing).
+    last_traffic_success_ns: int | None = field(default=None, init=False)
     # Cumulative observability counters (surfaced via DiscoveryCollector):
     # forced reconciles of a stuck counter, and detected backend resets that
     # wiped in-flight state.

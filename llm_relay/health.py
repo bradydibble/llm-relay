@@ -54,6 +54,17 @@ PROBE_MAX_TOKENS = 1
 FAILURES_TO_OPEN = 2   # consecutive failures before circuit opens
 RECOVERY_PROBES = 2    # consecutive successes before circuit closes
 COOLDOWN_S = 60.0      # min time between open -> half-open transition
+TRAFFIC_FRESH_S = 120.0
+# A real request that COMPLETED successfully this recently is proof the
+# backend is generating. A probe that times out inside that window starved
+# behind legitimate traffic (a 512k-context prefill can hold vLLM's scheduler
+# past PROBE_TIMEOUT), it did not catch a wedge — a wedged slot completes
+# nothing. Without this, heavy long-context load opened the circuit while
+# completions were flowing, 503ing every named-model request for minutes at a
+# time (2026-08-21 evening, gb200 + llama-01). Kept moderate so a genuine
+# wedge right after a burst of traffic still opens within
+# TRAFFIC_FRESH_S + 2 probe cycles (~3.5 min) — well inside a wedge's
+# multi-hundred-second hang.
 
 
 @dataclass
@@ -195,6 +206,21 @@ class L2HealthProbe:
         health = self._health.get(key)
         if not health:
             return
+        # Traffic evidence: a completed real request within TRAFFIC_FRESH_S
+        # proves the backend is generating — treat the probe as starved, not
+        # the backend as wedged. Also reset the streak so isolated starved
+        # probes in separate busy windows never accumulate into an open.
+        last_traffic_ns = getattr(client, "last_traffic_success_ns", None)
+        if last_traffic_ns and not health.circuit_open:
+            age_s = (time.time_ns() - last_traffic_ns) / 1e9
+            if age_s < TRAFFIC_FRESH_S:
+                health.consecutive_failures = 0
+                _log.info(
+                    "L2 probe failed for %s but a real request completed %.0fs "
+                    "ago — busy backend, not a wedge; failure not counted (%s)",
+                    key, age_s, exc,
+                )
+                return
         health.consecutive_failures += 1
         health.consecutive_successes = 0
         health.last_failure_ns = time.time_ns()
