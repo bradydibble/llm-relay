@@ -93,6 +93,33 @@ def _token_count(text: str) -> int | None:
         _TIKTOKEN_ENC = None
         return None
 
+
+def continuous_usage_enabled() -> bool:
+    """Whether to ask upstreams for usage on every streamed chunk.
+
+    vLLM supports ``stream_options.continuous_usage_stats``; with it, a stream
+    the client aborts still carries exact token counts. Off by default so it is
+    probed against the deployed backends before being relied on — see
+    LLM_RELAY_CONTINUOUS_USAGE in docs.
+    """
+    import os
+
+    return os.environ.get("LLM_RELAY_CONTINUOUS_USAGE", "").strip().lower() in ("1", "true", "yes")
+
+
+def apply_stream_usage_options(body: dict) -> None:
+    """Opt into upstream token usage for a streamed request, in place.
+
+    Standard OpenAI streaming omits usage entirely. Caller-supplied values win,
+    so a client that deliberately opted out stays opted out.
+    """
+    existing = body.get("stream_options") if isinstance(body.get("stream_options"), dict) else {}
+    opts: dict = {"include_usage": True}
+    if continuous_usage_enabled():
+        opts["continuous_usage_stats"] = True
+    body["stream_options"] = {**opts, **existing}
+
+
 # Substrings (lowercased) that mark an upstream "prompt exceeds context window"
 # rejection across the fleet's backends (llama.cpp `exceed_context_size_error`,
 # vLLM "maximum context length", generic proxies). Matched against the response
@@ -298,8 +325,7 @@ class RequestRouter:
         # OpenAI streaming omits usage; this opts back in so cross-provider captures
         # (Anthropic fallback, etc.) have token counts without relying on
         # llama-server's non-standard `timings` field. Preserve any user override.
-        existing_opts = body.get("stream_options") if isinstance(body.get("stream_options"), dict) else {}
-        body["stream_options"] = {"include_usage": True, **existing_opts}
+        apply_stream_usage_options(body)
         merged_headers = {"Content-Type": "application/json", **(headers or {})}
         bearer = _shared_upstream_bearer()
         if bearer and "Authorization" not in merged_headers:
