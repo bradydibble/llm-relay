@@ -216,6 +216,84 @@ def cmd_keys(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_usage_backfill(args: argparse.Namespace) -> int:
+    """Recover the token history Prometheus and the KPI store still hold.
+
+    Safe to re-run: synthetic request ids are deterministic, so a second pass
+    inserts nothing rather than doubling the totals, and ``INSERT OR IGNORE``
+    means a backfill row can never overwrite a live per-request row.
+    """
+    from .usage_backfill import (
+        backfill,
+        day_range,
+        prometheus_day_rows,
+        rows_from_kpi_file,
+    )
+    from .usage_store import open_db
+
+    console = Console()
+    db_path = args.usage_db or os.environ.get("LLM_RELAY_USAGE_DB", "").strip()
+    if not db_path and not args.dry_run:
+        console.print(
+            "[red]No usage database:[/red] pass --usage-db or set LLM_RELAY_USAGE_DB "
+            "(or use --dry-run to only count)."
+        )
+        return 1
+    if not args.prom_from and not args.kpi_file:
+        console.print(
+            "[red]Nothing to do:[/red] give --prom-from/--prom-to, --kpi-file, or both."
+        )
+        return 1
+    if args.prom_from and not args.prom_to:
+        console.print("[red]--prom-from requires --prom-to[/red]")
+        return 1
+
+    batches: list[tuple[str, list]] = []
+    if args.prom_from:
+        for day in day_range(args.prom_from, args.prom_to):
+            try:
+                rows = prometheus_day_rows(args.prom_url, day)
+            except Exception as exc:
+                # A skipped day is an invisible hole in the history, so stop
+                # loudly instead of leaving one behind.
+                console.print(f"[red]prometheus {day} failed:[/red] {exc}")
+                return 1
+            batches.append((f"prom {day}", rows))
+    if args.kpi_file:
+        # Fleet-level KPI days must stop where the per-user Prometheus data
+        # starts, or the same tokens get counted twice under two sources.
+        cutover = args.kpi_before or args.prom_from
+        if not cutover:
+            console.print("[red]--kpi-file needs --kpi-before (or --prom-from)[/red]")
+            return 1
+        rows = rows_from_kpi_file(args.kpi_file, before_day=cutover)
+        batches.append((f"kpi < {cutover}", rows))
+
+    conn = None if args.dry_run else open_db(db_path)
+    total_rows = 0
+    total_inserted = 0
+    try:
+        for label, rows in batches:
+            total_rows += len(rows)
+            if conn is None:
+                console.print(f"{label}: {len(rows)} row(s) [dim](dry run)[/dim]")
+                continue
+            inserted = backfill(conn, rows)
+            total_inserted += inserted
+            console.print(f"{label}: {len(rows)} row(s), {inserted} inserted")
+    finally:
+        if conn is not None:
+            conn.close()
+    if args.dry_run:
+        console.print(f"[bold]Total:[/bold] {total_rows} row(s), nothing written")
+    else:
+        console.print(
+            f"[bold]Total:[/bold] {total_rows} row(s), {total_inserted} inserted "
+            f"({total_rows - total_inserted} already present)"
+        )
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="llm-relay", description="LLM relay routing control plane")
     subparsers = parser.add_subparsers(dest="command")
@@ -251,6 +329,29 @@ def main() -> int:
     k_rev.add_argument("id", nargs="?")
     k_rev.add_argument("--hash", dest="hash_prefix", default=None)
 
+    p_backfill = subparsers.add_parser(
+        "usage-backfill", help="Recover historical token usage into the usage store"
+    )
+    p_backfill.add_argument(
+        "--usage-db", default=None,
+        help="SQLite usage database (default: $LLM_RELAY_USAGE_DB)",
+    )
+    p_backfill.add_argument(
+        "--prom-url", default="http://127.0.0.1:9090", help="Prometheus base URL"
+    )
+    p_backfill.add_argument("--prom-from", default=None, help="First day, YYYY-MM-DD")
+    p_backfill.add_argument("--prom-to", default=None, help="Last day, YYYY-MM-DD")
+    p_backfill.add_argument(
+        "--kpi-file", default=None, help="Portal KPI JSONL with fleet daily totals"
+    )
+    p_backfill.add_argument(
+        "--kpi-before", default=None,
+        help="Only KPI days strictly before this YYYY-MM-DD (the Prometheus cutover)",
+    )
+    p_backfill.add_argument(
+        "--dry-run", action="store_true", help="Print counts without writing"
+    )
+
     args = parser.parse_args()
     if args.command == "run":
         return cmd_run(args)
@@ -266,6 +367,8 @@ def main() -> int:
         return cmd_config(args)
     if args.command == "keys":
         return cmd_keys(args)
+    if args.command == "usage-backfill":
+        return cmd_usage_backfill(args)
     parser.print_help()
     return 1
 
