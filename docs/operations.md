@@ -220,3 +220,25 @@ The last two are *containment* signals, not normal operation. A steadily-rising
 `slot_reconciliations_total` means in-flight slots are leaking faster than the
 synchronous release path should allow — worth investigating. `backend_resets_total`
 just tracks how often a backend restarted/reloaded out from under the relay.
+
+## Usage persistence (environment switches)
+
+Prometheus is ops telemetry: aggregate, and lossy across restarts. Exact
+per-request token counts are persisted separately, in a SQLite store the relay
+owns. Every switch below is off unless set, so an unconfigured relay behaves
+exactly as it did before the store existed.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LLM_RELAY_USAGE_DB` | unset (off) | Path to the durable usage database. Unset disables usage persistence entirely. |
+| `LLM_RELAY_CONTINUOUS_USAGE` | off (`1`/`true`/`yes` enables) | Ask upstreams for usage on every streamed chunk (`stream_options.continuous_usage_stats`), which is what makes an aborted stream exact rather than estimated. Enable only after probing each live backend: a backend that rejects the field can fail the request, so treat any such provider as final-usage/frame-count only. |
+| `LLM_RELAY_PROMPT_DB` | unset (off) | Reserved for the prompt-content store — **not implemented yet**. Independent of the usage store when it lands. |
+
+The database path must sit in a directory the unit can write; on the gateway
+`ReadWritePaths=/srv/llm/state/relay` already covers it. Both switches are read
+at startup, so changing either needs a relay restart.
+
+To confirm rows are landing, ask the trusted loopback listener:
+`curl -s http://127.0.0.1:18090/admin/usage/health` (expect `enabled: true`, a
+rising row count, `dropped: 0`) and check the `llm_relay_usage_source_total`
+counter for the exact-vs-estimated mix.
