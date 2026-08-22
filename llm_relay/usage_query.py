@@ -47,6 +47,12 @@ def rollup(conn: sqlite3.Connection, start_day: str, end_day: str) -> list[dict]
     rows all carry ``outcome='success'`` because per-outcome history was not
     recoverable, so a backfilled day reports no failures rather than none having
     happened.
+
+    ``fallbacks`` counts the requests routed to something other than their first
+    choice. The ``fell_back`` column was already written per request and read by
+    nothing, which is the only reason a fallbacks query had to stay on
+    Prometheus. Backfill wrote NULL there, so it carries the same caveat as the
+    outcome map: a backfilled day reports zero, not "none happened".
     """
     placeholders = ", ".join("?" for _ in _EXACT)
     cur = conn.execute(
@@ -57,7 +63,8 @@ def rollup(conn: sqlite3.Connection, start_day: str, end_day: str) -> list[dict]
         f"SUM(CASE WHEN usage_source IN ({placeholders}) "
         "         THEN request_count ELSE 0 END), "
         f"SUM(CASE WHEN usage_source NOT IN ({placeholders}) "
-        "         AND usage_source != ? THEN request_count ELSE 0 END) "
+        "         AND usage_source != ? THEN request_count ELSE 0 END), "
+        "SUM(CASE WHEN fell_back = 1 THEN request_count ELSE 0 END) "
         "FROM requests WHERE day >= ? AND day <= ? "
         "GROUP BY day, principal, client, model, alias, outcome "
         "ORDER BY day, principal, model, client, alias",
@@ -78,6 +85,7 @@ def rollup(conn: sqlite3.Connection, start_day: str, end_day: str) -> list[dict]
                 "reasoning_tokens": 0, "cache_read_tokens": 0,
                 "exact_requests": 0, "estimated_requests": 0,
                 "successes": 0, "failures": 0, "outcomes": {},
+                "fallbacks": 0,
             }
             grouped[key] = row
         outcome = r[5] or ""
@@ -94,6 +102,7 @@ def rollup(conn: sqlite3.Connection, start_day: str, end_day: str) -> list[dict]
         row["cache_read_tokens"] += int(r[10] or 0)
         row["exact_requests"] += int(r[11] or 0)
         row["estimated_requests"] += int(r[12] or 0)
+        row["fallbacks"] += int(r[13] or 0)
     return list(grouped.values())
 
 

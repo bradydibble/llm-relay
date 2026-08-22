@@ -199,6 +199,40 @@ def test_rollup_outcomes_weight_by_request_count(tmp_path):
     assert row["exact_requests"] == 0
 
 
+def test_rollup_counts_fallbacks_from_the_fell_back_column(tmp_path):
+    """The last usage number Prometheus still answered. The column was already
+    written per request; nothing read it, so the collector had to keep a
+    ``llm_relay_fallbacks_total`` query alive purely for this one field."""
+    conn = open_db(str(tmp_path / "u.db"))
+    _live(conn, "a", fell_back=1)
+    _live(conn, "b", fell_back=0)
+    _live(conn, "c", fell_back=None)  # pre-column history stays uncounted
+    row = rollup(conn, "2026-08-20", "2026-08-20")[0]
+    assert row["requests"] == 3
+    assert row["fallbacks"] == 1
+
+
+def test_rollup_fallbacks_weight_by_request_count(tmp_path):
+    """Same unit as every other count in the row: an aggregate row stands for
+    its whole day, so COUNT(*) would report one fallback for thousands."""
+    conn = open_db(str(tmp_path / "u.db"))
+    _synthetic(conn, "s1", request_count=3181, fell_back=1)
+    row = rollup(conn, "2026-08-20", "2026-08-20")[0]
+    assert row["fallbacks"] == 3181
+
+
+def test_rollup_reports_no_fallbacks_on_a_backfilled_day(tmp_path):
+    """Backfill could not recover which requests fell back, so it wrote NULL.
+    A backfilled day therefore reports zero fallbacks rather than none having
+    happened -- the same caveat the outcome map carries, and the reason a
+    consumer must decide per day whether to trust it."""
+    conn = open_db(str(tmp_path / "u.db"))
+    _synthetic(conn, "s1", request_count=3181)
+    row = rollup(conn, "2026-08-20", "2026-08-20")[0]
+    assert row["requests"] == 3181
+    assert row["fallbacks"] == 0
+
+
 def test_summary_sums_request_count_too(tmp_path):
     conn = open_db(str(tmp_path / "u.db"))
     _synthetic(conn, "s1", request_count=3181)

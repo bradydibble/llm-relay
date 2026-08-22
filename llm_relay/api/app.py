@@ -1140,6 +1140,31 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
         finally:
             conn.close()
 
+    @app.get("/admin/usage/latency")
+    async def admin_usage_latency(request: Request, start: str = "", end: str = "") -> dict[str, Any]:
+        """Per-day exact latency and TTFT percentiles over real observations.
+
+        Exact nearest-rank values over the durations themselves, so the number
+        is one some request actually took -- strictly better than the bucketed
+        ``histogram_quantile`` estimate the WBR read before. Synthetic backfill
+        rows are excluded, so a wholly backfilled day is absent from ``rows``
+        rather than reported as zero: the caller must read that as "no samples"
+        and keep whatever it already had.
+        """
+        from ..usage_query import latency, valid_day
+        from ..usage_store import get_store, open_db
+
+        if not (valid_day(start) and valid_day(end)):
+            raise HTTPException(400, detail="start and end must be YYYY-MM-DD")
+        store = get_store()
+        if store is None:
+            return {"rows": [], "enabled": False}
+        conn = open_db(store.path)
+        try:
+            return {"rows": latency(conn, start, end), "enabled": True}
+        finally:
+            conn.close()
+
     @app.get("/admin/usage/summary")
     async def admin_usage_summary(request: Request) -> dict[str, Any]:
         """All-time per-principal totals plus true first/last activity."""
