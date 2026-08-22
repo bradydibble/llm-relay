@@ -292,23 +292,47 @@ def emit_chat_completion(
     # histogram and the span's TTFT attribute below. Backends that don't report
     # timings (e.g. vLLM) leave ttft_ns None — no fabricated value.
     if ttft_ns is None and isinstance(response_body, dict):
-        _pm = (response_body.get("timings") or {}).get("prompt_ms")
-        if isinstance(_pm, (int, float)) and _pm >= 0:
+        # isinstance, not `or {}`: a truthy non-dict (a backend returning
+        # "timings": "...") sails past `or {}` and then AttributeErrors on .get,
+        # out of the request path, turning a successful completion into a 500.
+        _timings = response_body.get("timings")
+        _pm = _timings.get("prompt_ms") if isinstance(_timings, dict) else None
+        if isinstance(_pm, (int, float)) and not isinstance(_pm, bool) and _pm >= 0:
             ttft_ns = int(_pm * 1e6)
     # Resolve the token counts ONCE, here, so Prometheus and the durable store
     # can never disagree about what a request cost.
-    from ..usage_math import resolve_usage
+    from ..usage_math import UsageCounts, resolve_usage
 
     eff_usage = usage if usage else None
-    counts = resolve_usage(
-        usage=eff_usage,
-        response_body=response_body,
-        streamed=streamed,
-        frame_count=int((eff_usage or {}).get("_frame_count") or 0),
-        content_text=response_text or "",
-        reasoning_text=str((eff_usage or {}).get("_reasoning_content") or ""),
-        saw_incremental=bool((eff_usage or {}).get("_saw_incremental")),
-    )
+
+    def _safe_int(value) -> int:
+        """int() on an untrusted value raises; telemetry must not."""
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            return 0
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    def _safe_text(value) -> str:
+        return value if isinstance(value, str) else ""
+
+    _eff = eff_usage if isinstance(eff_usage, dict) else {}
+    try:
+        counts = resolve_usage(
+            usage=eff_usage,
+            response_body=response_body,
+            streamed=streamed,
+            frame_count=_safe_int(_eff.get("_frame_count")),
+            content_text=_safe_text(response_text),
+            reasoning_text=_safe_text(_eff.get("_reasoning_content")),
+            saw_incremental=bool(_eff.get("_saw_incremental")),
+        )
+    except Exception:
+        # Belt and braces. This function's contract is that it never raises into
+        # a request; a telemetry miss costs one row, an exception costs the
+        # user's answer.
+        counts = UsageCounts()
 
     # Metrics first, independent of the OTLP tracer (Phoenix may be down).
     try:
