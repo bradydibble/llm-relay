@@ -48,6 +48,19 @@ DEFAULT_NON_STREAM_MAX_TOKENS = 8192
 # int64" forever). 1.1 matches Ollama's default and breaks the loop.
 DEFAULT_REPETITION_PENALTY = 1.1
 
+# Fields in models.yaml ``set_params`` that can weaken the safety defaults
+# applied at forward time.  When any appear in a model's ``set_params`` the
+# config loader emits a loud warning and ``_apply_filters`` re-enforces the
+# floor after applying ``set_params`` — defense in depth so config typos can't
+# silently re-enable unbounded generation or repetition loops.
+#   * ``max_tokens`` / ``max_completion_tokens``: a ceiling inflated here would
+#     undo the output-budget cap that prevents unbounded non-streaming generation.
+#   * ``repetition_penalty``: a value below 1.1 here would re-enable the
+#     repetition-loop hang.
+SAFETY_SENSITIVE_PARAMS = frozenset({
+    "max_tokens", "max_completion_tokens", "repetition_penalty",
+})
+
 # Prompt-size estimation is a heuristic (no server tokenizer). It must be a true
 # UPPER bound: under-counting routes a request to a backend too small to hold it
 # and the upstream hard-rejects at the boundary (the 2026-07-07 subagent incident:
@@ -331,6 +344,26 @@ class RequestRouter:
             return body
         out = {k: v for k, v in body.items() if k not in strip}
         out.update(setp)
+        # Defense-in-depth: re-enforce the repetition_penalty FLOOR after
+        # set_params so a config typo ({repetition_penalty: 1.0}) can't
+        # silently re-enable the repetition-loop hang.  The floor applied
+        # earlier in route_and_forward ran BEFORE this method (filters run
+        # inside forward_request/stream_request), so without this a set_params
+        # override would win.  The max_tokens CAP cannot be perfectly re-fit
+        # here (prompt_est is unavailable), but we cap to the model's
+        # context_window when known — catching the egregious case
+        # (max_tokens: 999999) while preserving legitimate low ceilings.
+        rp_floor = None
+        if config.policy.default_repetition_penalty is not None:
+            rp_floor = config.policy.default_repetition_penalty
+        if not rp_floor or rp_floor <= 0:
+            rp_floor = DEFAULT_REPETITION_PENALTY
+        out = _apply_repetition_penalty_default(out, default=rp_floor)
+        eff_mt = _effective_max_tokens(out)
+        if eff_mt is not None and cfg.context_window:
+            cap = cfg.context_window
+            if eff_mt > cap:
+                out = _sync_max_tokens_fields(out, cap)
         return out
 
     async def forward_request(
@@ -1128,6 +1161,31 @@ def _estimate_prompt_tokens(request_data: dict) -> int | None:
         return None
 
 
+def _effective_max_tokens(request_data: dict) -> int | None:
+    """Read the output-token ceiling from whichever field the client used.
+
+    OpenAI renamed ``max_tokens`` → ``max_completion_tokens`` (Nov 2024); many
+    SDKs now send the new name.  The relay caps both equivalently — a client
+    that sends ``max_completion_tokens=99000`` without ``max_tokens`` must not
+    sneak past the output budget.  When BOTH are present, the stricter (lower)
+    value governs, matching OpenAI's own validation behaviour.
+    """
+    mt = request_data.get("max_tokens")
+    mct = request_data.get("max_completion_tokens")
+    vals = [v for v in (mt, mct) if isinstance(v, (int, float)) and v > 0]
+    return int(min(vals)) if vals else None
+
+
+def _sync_max_tokens_fields(request_data: dict, value: int) -> dict:
+    """Write the clamped ceiling back to BOTH token-ceiling fields so the
+    upstream and any downstream proxy see one consistent number regardless of
+    which field name the client used."""
+    out = {**request_data, "max_tokens": value}
+    if "max_completion_tokens" in request_data:
+        out["max_completion_tokens"] = value
+    return out
+
+
 def _clamp_max_tokens(request_data: dict, prompt_est: int | None, window: int,
                       default: int | None = None) -> dict:
     """Fit a request's ``max_tokens`` to the chosen model: cap DOWN to the window
@@ -1154,8 +1212,8 @@ def _clamp_max_tokens(request_data: dict, prompt_est: int | None, window: int,
     shorter completion than asked (``finish_reason=length``): honest graceful
     degradation, far better than dead-ending the fallthrough in a 503.
     """
-    max_tokens = request_data.get("max_tokens")
-    has_client_ceiling = isinstance(max_tokens, int) and max_tokens > 0
+    max_tokens = _effective_max_tokens(request_data)
+    has_client_ceiling = max_tokens is not None and max_tokens > 0
     if not has_client_ceiling:
         # default=0 or default=None means "no default cap" — return unchanged.
         # Only a positive default applies a ceiling.
@@ -1164,10 +1222,17 @@ def _clamp_max_tokens(request_data: dict, prompt_est: int | None, window: int,
         max_tokens = default
     headroom = (window - prompt_est) if (prompt_est and window) else None
     if headroom is not None and max_tokens > headroom:
-        return {**request_data, "max_tokens": headroom}
-    if has_client_ceiling:
+        return _sync_max_tokens_fields(request_data, headroom)
+    if has_client_ceiling and "max_tokens" in request_data:
+        # Client used the standard field name and it fits — return the
+        # SAME object (callers exploit this identity to avoid copies).
         return request_data
-    return {**request_data, "max_tokens": max_tokens}
+    # Either we applied a default (has_client_ceiling is False) or the client
+    # used max_completion_tokens WITHOUT max_tokens. In both cases we write
+    # max_tokens back so the upstream sees the standard field regardless of
+    # which name the client used — many backends (older vLLM, llama.cpp) only
+    # read max_tokens and would ignore a bare max_completion_tokens.
+    return _sync_max_tokens_fields(request_data, max_tokens)
 
 
 def _apply_repetition_penalty_default(

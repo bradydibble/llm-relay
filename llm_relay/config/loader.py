@@ -214,6 +214,34 @@ class ConfigLoader:
                 set_params=cfg.get("set_params", {}) or {},
                 description=cfg.get("description"),
             )
+        self._warn_unsafe_set_params()
+
+    def _warn_unsafe_set_params(self) -> None:
+        """Warn loudly when a model's ``set_params`` contains fields that can
+        weaken the safety defaults applied at forward time.  Does NOT strip
+        them — the runtime re-enforces the floor in ``_apply_filters`` (see
+        router.py) — but the warning tells the operator WHY the value they wrote
+        won't behave the way they think it will.
+        """
+        from ..routing.router import SAFETY_SENSITIVE_PARAMS
+
+        for name, mcfg in self._models.models.items():
+            unsafe = SAFETY_SENSITIVE_PARAMS & set((mcfg.set_params or {}).keys())
+            if not unsafe:
+                continue
+            details = ", ".join(
+                f"{k}={mcfg.set_params[k]}" for k in sorted(unsafe)
+            )
+            logger.warning(
+                "model '%s': set_params contains safety-sensitive field(s) [%s]. "
+                "The relay enforces a repetition_penalty floor ≥ 1.1 and caps "
+                "max_tokens / max_completion_tokens to the model's context "
+                "window AT FORWARD TIME, AFTER set_params — so these values "
+                "will NOT reliably reach the upstream as written. Remove them "
+                "from set_params if you intended them as the operating "
+                "ceiling; set a non-default policy.default_max_tokens instead.",
+                name, details,
+            )
         self._derive_aliases_from_use_cases()
         self._derive_logical_models()
         self._derive_exclusivity()
