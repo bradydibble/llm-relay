@@ -221,6 +221,44 @@ def request_shape(request_body: dict | None) -> dict:
     }
 
 
+def completion_text(response_text: str | None, response_body: dict | None,
+                    usage: dict | None) -> tuple[str, str]:
+    """``(assistant_text, reasoning_text)`` for one completion, either shape.
+
+    The two response paths deliver the answer differently: the streaming path
+    hands over reassembled ``response_text`` plus ``usage["_reasoning_content"]``
+    (``app.py:1549``), while the non-streaming path hands over a parsed
+    ``response_body`` and ``response_text=None`` (``app.py:1585-1589``). Reading
+    only ``response_text`` would therefore archive every non-streamed request as
+    a prompt with no answer -- the majority of requests, silently half-captured.
+
+    Never raises: a malformed body yields empty strings.
+    """
+    reasoning = str((usage or {}).get("_reasoning_content") or "")
+    if response_text:
+        return response_text, reasoning
+    if not isinstance(response_body, dict):
+        return "", reasoning
+    parts: list[str] = []
+    for choice in response_body.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            parts.append(content)
+        elif isinstance(content, list):
+            # Multimodal output parts: keep the structure rather than lose it.
+            parts.append(json.dumps(content))
+        if not reasoning:
+            rc = message.get("reasoning_content")
+            if isinstance(rc, str) and rc:
+                reasoning = rc
+    return "\n".join(parts), reasoning
+
+
 def emit_chat_completion(
     *,
     request_body: dict,
@@ -292,6 +330,14 @@ def emit_chat_completion(
     except Exception as e:
         print(f"[llm-relay] metrics record failed (ignored): {e}", file=sys.stderr)
 
+    # One id per completion event, generated before either durable write, so a
+    # usage row can be joined to the prompt row describing the same request.
+    # Deliberately not inside the store blocks below: two uuid4() calls would
+    # produce two unrelated ids and silently break that join.
+    import uuid as _uuid
+
+    request_id = _uuid.uuid4().hex
+
     # Durable row. Best-effort: a storage problem must never surface here.
     try:
         from ..usage_store import get_store
@@ -299,12 +345,11 @@ def emit_chat_completion(
         store = get_store()
         if store is not None:
             import datetime as _dt
-            import uuid as _uuid
 
             ts = end_ns / 1_000_000_000
             shape = request_shape(request_body)
             store.record({
-                "request_id": _uuid.uuid4().hex,
+                "request_id": request_id,
                 "ts": ts,
                 "day": _dt.datetime.fromtimestamp(ts, _dt.timezone.utc).strftime("%Y-%m-%d"),
                 "principal": principal or "anonymous",
@@ -331,6 +376,44 @@ def emit_chat_completion(
                 "max_tokens": shape["max_tokens"],
                 "confidentiality": confidentiality,
                 "fell_back": 1 if fell_back else 0,
+            })
+    except Exception:
+        pass
+
+    # Prompt/completion content. Separate store, separate env flag, and the same
+    # best-effort contract: a capture problem must never surface in a request.
+    # ``LLM_RELAY_PROMPT_DB`` unset means get_store() returns None and nothing
+    # here touches the disk -- which is how this ships.
+    try:
+        from ..prompt_store import get_store as _get_prompt_store
+
+        pstore = _get_prompt_store()
+        if pstore is not None:
+            import datetime as _dt
+
+            _ts = end_ns / 1_000_000_000
+            _msgs = (request_body or {}).get("messages")
+            _msgs = _msgs if isinstance(_msgs, list) else []
+            _completion, _reasoning = completion_text(
+                response_text, response_body, usage)
+            pstore.record({
+                "request_id": request_id,
+                "ts": _ts,
+                "day": _dt.datetime.fromtimestamp(
+                    _ts, _dt.timezone.utc).strftime("%Y-%m-%d"),
+                "principal": principal or "anonymous",
+                "client": client or "unknown",
+                "model": model_resolved or "none",
+                # ``content`` is passed through untouched: it may be a list of
+                # multimodal parts, and the store's _as_text keeps the text
+                # parts while reducing an image or audio part to a marker.
+                # str()-ing it here would archive base64 payloads instead.
+                "messages": [
+                    {"role": str(m.get("role") or ""), "content": m.get("content")}
+                    for m in _msgs if isinstance(m, dict)
+                ],
+                "completion": _completion,
+                "reasoning": _reasoning,
             })
     except Exception:
         pass
