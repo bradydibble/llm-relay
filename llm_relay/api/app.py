@@ -947,8 +947,8 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
     def _owner_email(body: dict[str, Any]) -> str:
         email = str(body.get("owner_email") or "").strip().lower()
         local, separator, domain = email.partition("@")
-        if not local or separator != "@" or domain != "ciq.com":
-            raise HTTPException(400, detail="valid CIQ owner email required")
+        if not local or separator != "@" or not domain or "." not in domain:
+            raise HTTPException(400, detail="valid owner email required")
         return email
 
     def _owner_key_view(key_hash: str, record: dict[str, Any]) -> dict[str, Any]:

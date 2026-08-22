@@ -5,7 +5,7 @@ reports, per model, what actually works. It is not a unit test and does not run
 under pytest: it needs a real key and real backends, and it costs tokens.
 
 ```bash
-export CIQ_RELAY_KEY=llmr_...
+export LLM_RELAY_API_KEY=llmr_...
 python3 tests/conformance/conformance.py --all                  # every discovered model
 python3 tests/conformance/conformance.py --model main --model fast
 python3 tests/conformance/conformance.py --all --json > matrix.json

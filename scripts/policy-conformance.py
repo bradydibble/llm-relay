@@ -19,7 +19,7 @@ generate, and it skips (rather than fails) when a precondition isn't met.
 Usage:
     ./scripts/policy-conformance.py [--endpoint URL] [--api-key KEY] [--verbose]
 
-    ENDPOINT env var / --endpoint  default https://cairn-02.tail7d38e4.ts.net:8090/v1
+    ENDPOINT env var / --endpoint  default https://relay.example.invalid/v1
     LLM_RELAY_API_KEY / --api-key  omit for the keyless trusted listener
 
 Exit codes: 0 all checks passed (skips allowed), 1 a check FAILED, 2 could not run.
@@ -33,7 +33,7 @@ import sys
 import urllib.error
 import urllib.request
 
-DEFAULT_ENDPOINT = "https://cairn-02.tail7d38e4.ts.net:8090/v1"
+DEFAULT_ENDPOINT = "https://relay.example.invalid/v1"
 CONF_HEADER = "X-Llm-Relay-Confidentiality"
 
 PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
