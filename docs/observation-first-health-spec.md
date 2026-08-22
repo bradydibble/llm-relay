@@ -1,7 +1,7 @@
 # Observation-first health — spec
 
-**Status:** approved direction (Brady, 2026-08-22). Implement in the order in
-§6; each step ships independently.
+**Status:** approved direction (Brady, 2026-08-22). **Implemented 2026-08-22**
+— see §8 for what shipped and the two deliberate deviations.
 
 ## 1. Problem
 
@@ -225,6 +225,35 @@ mostly deletion; 4 is observability; 5 kills the redeploy windows.
 3. §3.2 probe demotion.
 4. §3.4 reason-coded refusals + metrics.
 5. §3.5 state persistence.
+
+## 8. Implementation notes (landed 2026-08-22, single change set)
+
+All five steps shipped together (tests: `tests/test_observation_first.py`,
+plus the pre-existing `test_l0_traffic_evidence.py` / `test_health_probe.py`
+guards). Two deliberate deviations from the letter of the spec:
+
+1. **§3.3 uses a live catalog check, not the request itself, as the probe.**
+   `RequestRouter._named_live_check` GETs the backend's `/v1/models` with a
+   3s connect timeout under the per-backend `optimistic_lock`; on success it
+   heals L0 state in place, re-runs selection, and the request flows through
+   the ONE normal dispatch path — the real request follows the check within
+   milliseconds and stamps real evidence itself. Rationale: dispatching the
+   user's request as the probe would have forked the streaming/non-streaming
+   dispatch loop into a second implementation; the live check preserves a
+   single dispatch path at the cost of one extra round trip on the (rare)
+   recovery edge. A live `/v1/models` hit never overrules an L2 `degraded`
+   verdict (invariant 5): listening and listing is not generating.
+2. **§3.4 reason vocabulary grew** to match what the live check can actually
+   distinguish: `refused | starting | timeout | not_loaded | degraded |
+   error | never_seen | check_in_flight`, carried in
+   `named_model.availability` alongside `checked_live` and
+   `last_traffic_success_age_s`. The dedicated refusal *metric* is deferred —
+   the payload and a structured log line landed; wiring a counter through
+   api/instrumentation is a small follow-up.
+
+§3.5 note: the state file lives beside the audit log
+(`dirname($LLM_RELAY_AUDIT_LOG)/backend-state.json`) unless
+`LLM_RELAY_STATE_DIR` overrides it, so no unit-file change was needed.
 
 ## 7. Prior art, for the reviewer who asks "why not just use X"
 

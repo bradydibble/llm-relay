@@ -3,16 +3,41 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import math
 import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from ..config.types import CircuitBreaker, EndpointState, EndpointStatus, ModelStatus, SaturationError
 from .endpoint import TRAFFIC_FRESH_S, EndpointClient, traffic_is_fresh
+
+# Backend-state persistence (observation-first-health-spec §3.5). Cold starts
+# used to create real 503 windows on every redeploy: a fresh process had no
+# catalog, no status, and no traffic evidence until its first poll cycle —
+# under load, exactly when polls starve. Priors newer than PRIORS_MAX_AGE_S
+# are adopted at register time as if the restart never happened; anything
+# older (or a missing/corrupt file) is ignored and boot behaves as before.
+STATE_FILE_VERSION = 1
+PRIORS_MAX_AGE_S = 600.0
+STATE_FLUSH_INTERVAL_S = 5.0
+
+
+def _backend_state_path() -> Path | None:
+    """Where backend state persists across restarts. Explicit env first; else
+    beside the audit log (the unit's one guaranteed-writable state dir); else
+    persistence is disabled (tests, bare local runs)."""
+    explicit = os.environ.get("LLM_RELAY_STATE_DIR")
+    if explicit:
+        return Path(explicit) / "backend-state.json"
+    audit = os.environ.get("LLM_RELAY_AUDIT_LOG")
+    if audit:
+        return Path(audit).parent / "backend-state.json"
+    return None
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +142,12 @@ class DiscoveryManager:
     # diverge widely.
     slot_reconcile_idle_seconds: float = field(default_factory=_default_reconcile_idle)
     _tasks: list[asyncio.Task] = field(default_factory=list)
+    # §3.5 persistence plumbing: priors loaded lazily once, flusher started on
+    # first backend registration, last-written body cached so an unchanged
+    # snapshot costs a string compare instead of a write.
+    _priors: dict | None = field(default=None, init=False)
+    _state_flusher_started: bool = field(default=False, init=False)
+    _last_state_written: str = field(default="", init=False)
 
     async def register_backend(
         self,
@@ -143,7 +174,96 @@ class DiscoveryManager:
         self.clients[key] = client
         for m in models_hint:
             self.model_to_client[m] = key
+        self._apply_prior(key, client)
+        if not self._state_flusher_started and _backend_state_path() is not None:
+            self._state_flusher_started = True
+            self._tasks.append(asyncio.create_task(self._flush_state_loop()))
         self._tasks.append(asyncio.create_task(self._poll_loop(client, poll_interval)))
+
+    def _load_priors(self) -> dict:
+        """Read the persisted backend state once per process. Advisory only:
+        any problem — missing, corrupt, wrong version, stale — yields {} and
+        boot proceeds exactly as it did before persistence existed."""
+        if self._priors is not None:
+            return self._priors
+        self._priors = {}
+        path = _backend_state_path()
+        if path is None:
+            return self._priors
+        try:
+            doc = json.loads(path.read_text())
+            if not isinstance(doc, dict) or doc.get("version") != STATE_FILE_VERSION:
+                return self._priors
+            saved_at = doc.get("saved_at_ns")
+            if not isinstance(saved_at, int):
+                return self._priors
+            age_s = (time.time_ns() - saved_at) / 1e9
+            if age_s < 0 or age_s > PRIORS_MAX_AGE_S:
+                return self._priors
+            backends = doc.get("backends")
+            if isinstance(backends, dict):
+                self._priors = backends
+        except Exception:
+            pass
+        return self._priors
+
+    def _apply_prior(self, key: str, client: EndpointClient) -> None:
+        entry = self._load_priors().get(key)
+        if not isinstance(entry, dict):
+            return
+        try:
+            status = EndpointStatus(entry.get("status", ""))
+            models = [m for m in entry.get("models") or [] if isinstance(m, str)]
+        except Exception:
+            return
+        client.state.status = status
+        client.state.models = models
+        ns = entry.get("last_traffic_success_ns")
+        if isinstance(ns, int) and 0 < ns <= time.time_ns():
+            client.last_traffic_success_ns = ns
+        for m in models:
+            self.model_to_client.setdefault(m, key)
+        logger.info(
+            "adopted persisted priors for backend %s: status=%s, %d model(s) — "
+            "restart continuity (spec §3.5)", key, status.value, len(models),
+        )
+
+    def _state_snapshot(self) -> dict:
+        return {
+            "version": STATE_FILE_VERSION,
+            "saved_at_ns": time.time_ns(),
+            "backends": {
+                key: {
+                    "status": c.state.status.value,
+                    "models": list(c.state.models),
+                    "last_traffic_success_ns": c.last_traffic_success_ns,
+                }
+                for key, c in self.clients.items()
+            },
+        }
+
+    async def _flush_state_loop(self) -> None:
+        """Debounced persistence: every STATE_FLUSH_INTERVAL_S, write the
+        snapshot iff its content changed (saved_at excluded from the compare).
+        Write-temp-then-rename so a half-written file can never be read as
+        state. Failures are logged at debug and never affect serving."""
+        path = _backend_state_path()
+        if path is None:
+            return
+        while True:
+            await asyncio.sleep(STATE_FLUSH_INTERVAL_S)
+            try:
+                snap = self._state_snapshot()
+                body = json.dumps(snap["backends"], sort_keys=True)
+                if body == self._last_state_written:
+                    continue
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+                tmp.write_text(json.dumps(snap, sort_keys=True))
+                tmp.replace(path)
+                self._last_state_written = body
+            except Exception as exc:
+                logger.debug("backend-state flush failed: %s", exc)
 
     async def acquire_slot_handle(self, key: str, wait_timeout: float) -> SlotHandle:
         """Acquire an in-flight slot for backend `key`, returning a SlotHandle.
@@ -235,6 +355,16 @@ class DiscoveryManager:
         was serving 200s at that moment. A genuinely dead backend completes
         nothing, so its evidence expires and it flips unavailable as before.
         """
+        # Probe demotion (spec §3.2): observation already answers what this
+        # poll would ask — the backend completed a real request moments ago
+        # and its catalog is known. Skipping the GET entirely also keeps the
+        # health plane from competing with real prefills for the thin shared
+        # pipe. A catalog change on a BUSY backend waits ≤TRAFFIC_FRESH_S of
+        # quiet (accepted in the spec); an empty catalog always polls, so a
+        # backend never gets stuck healthy-but-catalogless.
+        if traffic_is_fresh(client) and client.state.models:
+            client.state.last_poll = datetime.now(timezone.utc).isoformat()
+            return
         try:
             models = await client.fetch_models()
             client.state.last_poll = datetime.now(timezone.utc).isoformat()

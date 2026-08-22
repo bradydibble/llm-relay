@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from ..config.types import CircuitBreaker, EndpointState
+from ..config.types import CircuitBreaker, EndpointState, EndpointStatus
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,13 @@ def traffic_is_fresh(client) -> bool:
     if not last:
         return False
     return (time.time_ns() - last) / 1e9 < TRAFFIC_FRESH_S
+
+
+# Consecutive TRANSPORT failures of real requests before the backend is marked
+# unavailable by observation alone (observation-first-health-spec §3.1). One
+# reset can be a single dropped ssh channel; three in a row with no success
+# interleaved is a dead path — and it concludes so faster than any probe cycle.
+TRAFFIC_FAILURES_TO_MARK_DOWN = 3
 
 
 def _shared_upstream_bearer() -> str | None:
@@ -71,6 +78,16 @@ class EndpointClient:
     # circuit (long-context prefills can hold the scheduler past the probe
     # deadline while completions keep flowing).
     last_traffic_success_ns: int | None = field(default=None, init=False)
+    # Passive failure evidence (spec §3.1): transport failures of REAL requests,
+    # stamped by RequestRouter via note_traffic_failure(). Never touched by
+    # probes or polls, never advanced by 4xx or client aborts.
+    consecutive_traffic_failures: int = field(default=0, init=False)
+    last_traffic_failure_ns: int | None = field(default=None, init=False)
+    # Optimistic-dispatch bookkeeping (spec §3.3): at most one live availability
+    # check per backend at a time, so a dead backend costs one connect attempt
+    # per 503 storm rather than one per request.
+    optimistic_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    last_live_attempt_ns: int | None = field(default=None, init=False)
     # Cumulative observability counters (surfaced via DiscoveryCollector):
     # forced reconciles of a stuck counter, and detected backend resets that
     # wiped in-flight state.
@@ -82,6 +99,44 @@ class EndpointClient:
             self.state = EndpointState(provider=self.provider_name)
         if self.max_concurrent is not None and self.max_concurrent > 0:
             self.inflight_sem = asyncio.Semaphore(self.max_concurrent)
+
+    def note_traffic_success(self) -> None:
+        """A real request COMPLETED successfully — the strongest availability
+        signal there is (spec §3.1). One real 200 outranks every probe and
+        poll: failure evidence zeroes, the L0 breaker closes, and the backend
+        is promoted to healthy from ANY state. A wedged backend cannot reach
+        this method (it completes nothing), so wedge detection is untouched."""
+        self.last_traffic_success_ns = time.time_ns()
+        self.consecutive_traffic_failures = 0
+        if self.state.circuit_open:
+            self.reset_circuit()
+        if self.state.status != EndpointStatus.healthy:
+            logger.info(
+                "backend %s (%s) promoted to healthy by a completed real request",
+                self.provider_name, self.base_url,
+            )
+            self.state.status = EndpointStatus.healthy
+
+    def note_traffic_failure(self) -> None:
+        """A real request failed at the TRANSPORT level: connect refused or
+        timed out, reset mid-body, or a 502/503/504 minted by the backend
+        itself. Callers must NOT invoke this for 4xx responses, context-
+        overflow rejections, or client-side aborts — those prove nothing
+        about the backend (spec §3.1). TRAFFIC_FAILURES_TO_MARK_DOWN in a row
+        with no success interleaved takes the backend down immediately, ahead
+        of any probe cycle."""
+        self.consecutive_traffic_failures += 1
+        self.last_traffic_failure_ns = time.time_ns()
+        if (self.consecutive_traffic_failures >= TRAFFIC_FAILURES_TO_MARK_DOWN
+                and self.state.status != EndpointStatus.unavailable):
+            logger.warning(
+                "backend %s (%s) marked unavailable by %d consecutive real-request "
+                "transport failures — observation outranks probes",
+                self.provider_name, self.base_url, self.consecutive_traffic_failures,
+            )
+            self.state.status = EndpointStatus.unavailable
+            self.state.circuit_open = True
+            self.state.circuit_opened_at = time.monotonic()
 
     def _maybe_recover_circuit(self) -> None:
         if not self.state.circuit_open:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable
@@ -11,9 +12,11 @@ import httpx
 from fastapi import HTTPException
 
 from ..config.loader import ConfigLoader
-from ..config.types import Confidentiality, NoBackendAvailableError, Privacy, SaturationError
-from ..discovery.endpoint import _shared_upstream_bearer
+from ..config.types import Confidentiality, EndpointStatus, NoBackendAvailableError, Privacy, SaturationError
+from ..discovery.endpoint import _shared_upstream_bearer, traffic_is_fresh
 from ..discovery.manager import DiscoveryManager
+
+_rt_log = logging.getLogger("llm_relay.router")
 from .keys import compose_backend_key, compose_backend_url
 from .selector import ChainCandidate, ModelSelector, RoutingContext, batch_policy_for
 
@@ -220,13 +223,92 @@ class RequestRouter:
         return compose_backend_url(provider.base_url, cfg.port, cfg.path)
 
     def _note_traffic_success(self, backend_key: str | None) -> None:
-        """Stamp liveness evidence on the endpoint after a COMPLETED successful
-        real request. The L2 health probe reads this to tell a busy backend
-        (probe starved behind a long prefill; completions still flowing) from a
-        wedged one (nothing completes) — see health.TRAFFIC_FRESH_S."""
+        """Stamp liveness evidence after a COMPLETED successful real request.
+        Promotes the backend and closes breakers — one real 200 outranks every
+        probe (observation-first-health-spec §3.1)."""
         client = self.discovery.clients.get(backend_key or "")
         if client is not None:
-            client.last_traffic_success_ns = time.time_ns()
+            client.note_traffic_success()
+
+    def _note_traffic_failure(self, backend_key: str | None) -> None:
+        """Stamp a TRANSPORT-level failure of a real request (connect refused/
+        timeout, mid-body reset, or backend-minted 502/503/504). Never called
+        for 4xx or client aborts — see EndpointClient.note_traffic_failure."""
+        client = self.discovery.clients.get(backend_key or "")
+        if client is not None:
+            client.note_traffic_failure()
+
+    async def _named_live_check(self, named: str, client) -> tuple[bool, dict]:
+        """One live availability check for an explicitly named model whose
+        cached state says unavailable (spec §3.3): a 503 must reflect an
+        attempt made NOW, not a poll that starved half a minute ago.
+
+        Returns ``(recovered, availability)`` where ``availability`` is the
+        reason-coded record for the error payload (spec §3.4). On success the
+        endpoint state heals in place (status, catalog, breaker) so the caller
+        can re-select and dispatch through the one normal path — the live
+        check is followed within milliseconds by the real request, which then
+        stamps real traffic evidence. Caller holds client.optimistic_lock.
+        """
+        client.last_live_attempt_ns = time.time_ns()
+        avail: dict[str, Any] = {"checked_live": True, "reason": None}
+        headers = {"Accept": "application/json"}
+        bearer = _shared_upstream_bearer()
+        if bearer:
+            headers["Authorization"] = f"Bearer {bearer}"
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0)
+            ) as hc:
+                resp = await hc.get(
+                    f"{client.base_url}{client.health_endpoint}", headers=headers,
+                )
+            resp.raise_for_status()
+            data = resp.json()
+            ids = [m.get("id") for m in data.get("data", []) if isinstance(m, dict)]
+        except httpx.ConnectError:
+            # Nothing listening: dead — or booting. A backend that served real
+            # traffic within the last hour is far more likely mid-restart
+            # (gb200 takes ~20 min end to end) than decommissioned; the
+            # distinction is advisory, never load-bearing.
+            recent = client.last_traffic_success_ns and (
+                time.time_ns() - client.last_traffic_success_ns) / 1e9 < 3600
+            avail["reason"] = "starting" if recent else "refused"
+            if not traffic_is_fresh(client):
+                client._record_failure()
+            return False, avail
+        except httpx.TimeoutException:
+            avail["reason"] = "timeout"
+            if not traffic_is_fresh(client):
+                client._record_failure()
+            return False, avail
+        except Exception:
+            avail["reason"] = "error"
+            return False, avail
+
+        if named not in ids:
+            # The backend answered and the model genuinely is not loaded
+            # (an llm-mode swap, a different serve) — the truthful refusal.
+            avail["reason"] = "not_loaded"
+            return False, avail
+        if client.state.status == EndpointStatus.degraded:
+            # Listening and listing ≠ generating: L2 owns the wedge verdict
+            # and a live catalog hit must not overrule it (spec invariant 5).
+            avail["reason"] = "degraded"
+            return False, avail
+        # Alive and serving the model: heal L0 state in place, exactly as a
+        # successful poll would (the next poll refreshes max_lens etc.).
+        client.state.consecutive_failures = 0
+        if client.state.circuit_open:
+            client.reset_circuit()
+        client.consecutive_traffic_failures = 0
+        client.state.status = EndpointStatus.healthy
+        client.state.models = ids
+        _rt_log.info(
+            "named-model live check recovered %s on %s (%s) — cached state was stale",
+            named, client.provider_name, client.base_url,
+        )
+        return True, avail
 
     def _apply_filters(self, body: dict[str, Any], model_name: str) -> dict[str, Any]:
         """Strip/override request params per the model's configured filters
@@ -282,15 +364,25 @@ class RequestRouter:
         # backend_key="" / None → acquire_slot is a no-op (no semaphore registered).
         async with self.discovery.acquire_slot(backend_key or "", wait_timeout=slot_wait_timeout):
             async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(
-                    f"{backend_url}/{upstream_path}",
-                    json=body,
-                    headers=merged_headers,
-                )
+                try:
+                    resp = await client.post(
+                        f"{backend_url}/{upstream_path}",
+                        json=body,
+                        headers=merged_headers,
+                    )
+                except httpx.TransportError:
+                    # The request never got a well-formed answer — failure
+                    # evidence (spec §3.1). 4xx and overflow rejections come
+                    # back as responses, not exceptions, and are never stamped.
+                    self._note_traffic_failure(backend_key)
+                    raise
                 # A fully-received 2xx body means the backend generated —
-                # liveness evidence for the L2 probe.
+                # liveness evidence. A backend-minted 502/503/504 is transport
+                # failure evidence in a status-code costume.
                 if 200 <= resp.status_code < 300:
                     self._note_traffic_success(backend_key)
+                elif resp.status_code in (502, 503, 504):
+                    self._note_traffic_failure(backend_key)
                 return resp
 
     async def stream_request(
@@ -350,10 +442,15 @@ class RequestRouter:
                 headers=merged_headers,
             )
             resp = await client.send(req, stream=True)
-        except BaseException:
+        except BaseException as exc:
+            if isinstance(exc, httpx.TransportError):
+                self._note_traffic_failure(backend_key)
             handle.release()
             await client.aclose()
             raise
+        if resp.status_code in (502, 503, 504):
+            # Backend-minted transport failure, pre-first-byte (spec §3.1).
+            self._note_traffic_failure(backend_key)
 
         cleaned = False
 
@@ -388,6 +485,13 @@ class RequestRouter:
                 # without reaching this.
                 if 200 <= resp.status_code < 300:
                     self._note_traffic_success(backend_key)
+            except httpx.TransportError:
+                # Upstream died mid-stream — failure evidence. A CLIENT abort
+                # arrives as GeneratorExit/CancelledError instead and is
+                # deliberately not stamped: we chose to stop reading, which
+                # says nothing about the backend (spec §3.1).
+                self._note_traffic_failure(backend_key)
+                raise
             finally:
                 await _cleanup()
 
@@ -519,32 +623,66 @@ class RequestRouter:
             # the expected remedy, and batch callers rely on that backpressure.
             named = self.selector.explicit_target(ctx)
             if named is not None:
-                detail["error"] = f"Requested model '{named}' is not available"
-                detail["named_model"] = {
-                    "model": named,
-                    "status": self.selector.discovery.get_model_state(named).value,
-                    "provider": self.config.models.models[named].provider,
-                    "remedy": (
-                        f"'{named}' was requested by exact name and is not currently "
-                        "serving. The relay does not substitute a different model for "
-                        "an explicitly named one. Bring the backend up, or request a "
-                        "category alias (e.g. 'main') to route over whatever is live."
-                    ),
-                }
-                raise HTTPException(
-                    status_code=503,
-                    detail=detail,
-                    headers={"X-Llm-Relay-Error": "named_model_unavailable"},
-                )
+                # Never refuse a named model from cached state (spec §3.3):
+                # one live check, guarded so a dead backend costs one connect
+                # per 503 storm, not one per request. On recovery, re-select
+                # and fall through to the ONE normal dispatch path below —
+                # the real request follows the check within milliseconds.
+                availability: dict[str, Any] = {"checked_live": False, "reason": None}
+                key = self.discovery.model_to_client.get(named)
+                client = self.discovery.clients.get(key) if key else None
+                if client is None:
+                    availability["reason"] = "never_seen"
+                elif client.optimistic_lock.locked():
+                    availability["reason"] = "check_in_flight"
+                    if client.last_live_attempt_ns:
+                        availability["last_live_attempt_age_s"] = round(
+                            (time.time_ns() - client.last_live_attempt_ns) / 1e9, 1)
+                else:
+                    async with client.optimistic_lock:
+                        recovered, availability = await self._named_live_check(named, client)
+                    if recovered:
+                        # Reset the decision record so it tells the story of
+                        # the post-recovery selection, not the stale one.
+                        ctx.candidates = []
+                        ctx.filtered = []
+                        ctx.ranked = []
+                        candidates = self.selector.select_chain(ctx)
+                if not candidates:
+                    if client is not None and client.last_traffic_success_ns:
+                        availability["last_traffic_success_age_s"] = round(
+                            (time.time_ns() - client.last_traffic_success_ns) / 1e9, 1)
+                    detail["error"] = f"Requested model '{named}' is not available"
+                    detail["named_model"] = {
+                        "model": named,
+                        "status": self.selector.discovery.get_model_state(named).value,
+                        "provider": self.config.models.models[named].provider,
+                        "availability": availability,
+                        "remedy": (
+                            f"'{named}' was requested by exact name and is not currently "
+                            "serving. The relay does not substitute a different model for "
+                            "an explicitly named one. Bring the backend up, or request a "
+                            "category alias (e.g. 'main') to route over whatever is live."
+                        ),
+                    }
+                    raise HTTPException(
+                        status_code=503,
+                        detail=detail,
+                        headers={"X-Llm-Relay-Error": "named_model_unavailable"},
+                    )
             # Not a context shortfall: if the constraints WOULD be met by a
             # configured model that's merely down/paused right now (a discovery
             # blip or a maintenance pause), the empty chain is a TRANSIENT
             # availability gap — answer with Retry-After backpressure so batch
             # callers wait and retry, instead of a terminal "No model matches
             # constraints". A genuine mismatch (nothing can ever match) stays terminal.
-            if self.selector.is_transient_no_candidate(ctx):
-                raise NoBackendAvailableError(retry_after_seconds=NO_BACKEND_RETRY_AFTER)
-            raise HTTPException(status_code=503, detail=detail)
+            # Guarded on `named is None`: a named request either raised its own
+            # terminal 503 above or RECOVERED via the live check (candidates is
+            # now non-empty and dispatch below must run).
+            if named is None:
+                if self.selector.is_transient_no_candidate(ctx):
+                    raise NoBackendAvailableError(retry_after_seconds=NO_BACKEND_RETRY_AFTER)
+                raise HTTPException(status_code=503, detail=detail)
 
         # "connection_error" in retry_on means network exceptions; HTTP codes
         # are matched as strings against str(resp.status_code).

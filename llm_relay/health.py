@@ -119,6 +119,14 @@ class L2HealthProbe:
             # Only probe backends that actually serve models
             if not client.state.models:
                 continue
+            # Probe demotion (spec §3.2): a backend that completed a real
+            # request within TRAFFIC_FRESH_S has proven it can generate — the
+            # very thing this probe tests. Not sending the probe at all also
+            # stops it competing with real prefills for the shared pipe.
+            # Idle backends keep the full probe cadence, which is where wedge
+            # detection genuinely needs it.
+            if traffic_is_fresh(client):
+                continue
             tasks.append(self._probe_one(key, client))
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
