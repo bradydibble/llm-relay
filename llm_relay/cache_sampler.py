@@ -375,6 +375,22 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
+def tables_exist(conn: sqlite3.Connection) -> bool:
+    """Whether this module's tables have been created in *conn*.
+
+    A reader has to ask. These tables are created by ``ensure_schema`` -- i.e.
+    by the sampler -- and NOT by ``usage_store.open_db``, so a usage store that
+    has never been sampled holds request rows and no ``cache_daily`` at all.
+    That is the state of every fresh deployment. Creating the table from a read
+    path would be a write side effect on a caller whose only honest answer is
+    "nothing has been sampled here yet".
+    """
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cache_daily'"
+    ).fetchone()
+    return row is not None
+
+
 def open_cache_db(path: str) -> sqlite3.Connection:
     """Open the usage database with both the request schema and this one.
 

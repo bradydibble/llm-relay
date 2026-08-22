@@ -1197,6 +1197,49 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
         finally:
             conn.close()
 
+    @app.get("/admin/usage/cache")
+    async def admin_usage_cache(request: Request, start: str = "", end: str = "") -> dict[str, Any]:
+        """Per (day, model) prefix-cache reuse, plus a per-model window summary.
+
+        Token-weighted, and in the same convention as every other number this
+        API returns: ``input_tokens`` INCLUDES what came from cache, and
+        ``cache_read_tokens`` is the of-which subset that avoided prefill --
+        OpenAI/OpenRouter's shape, not Anthropic's additive line items. A
+        consumer that adds cache reads to input tokens double-counts.
+
+        ``reported`` false means the backend exposes no ``vllm:prefix_cache_*``
+        series at all, so reuse for that model is UNKNOWN and ``hit_rate`` is
+        None. A reported model that genuinely reused nothing gets a real 0.0.
+        Both states exist in production on the same day and neither may
+        collapse into the other -- conflating them is the bug class this whole
+        lane exists to end.
+
+        The cache tables belong to ``cache_sampler``, not to
+        ``usage_store.open_db``, so a store the sampler has never touched has no
+        ``cache_daily``. That answers ``sampled: false`` with empty results
+        rather than raising ``no such table`` -- the state of every fresh
+        deployment, and of every day before sampling began.
+        """
+        from ..cache_sampler import cache_by_model, cache_rollup, tables_exist
+        from ..usage_query import valid_day
+        from ..usage_store import get_store, open_db
+
+        if not (valid_day(start) and valid_day(end)):
+            raise HTTPException(400, detail="start and end must be YYYY-MM-DD")
+        store = get_store()
+        if store is None:
+            return {"rows": [], "by_model": [], "enabled": False}
+        conn = open_db(store.path)
+        try:
+            if not tables_exist(conn):
+                return {"rows": [], "by_model": [], "enabled": True,
+                        "sampled": False}
+            return {"rows": cache_rollup(conn, start, end),
+                    "by_model": cache_by_model(conn, start, end),
+                    "enabled": True, "sampled": True}
+        finally:
+            conn.close()
+
     # --- Prompt library (admin scope AND a presented admin key). --------------
     # The most sensitive surface in the relay: a searchable archive of
     # coworkers' conversations, retained indefinitely. Authorization is layered
