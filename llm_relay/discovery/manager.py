@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..config.types import CircuitBreaker, EndpointState, EndpointStatus, ModelStatus, SaturationError
-from .endpoint import EndpointClient
+from .endpoint import TRAFFIC_FRESH_S, EndpointClient, traffic_is_fresh
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +223,43 @@ class DiscoveryManager:
             stuck, client.provider_name, client.base_url, self.slot_reconcile_idle_seconds,
         )
 
+    async def _poll_client_once(self, client: EndpointClient) -> None:
+        """One L0 poll: fetch /v1/models and update the endpoint's state.
+
+        Extracted from ``_poll_loop`` so the starved-poll rule is testable
+        without driving the infinite loop. The rule: an empty or failed poll
+        while real completions are flowing (``traffic_is_fresh``) keeps the
+        PREVIOUS status and catalog — stale-but-live beats absent. Before
+        this, one starved 5s poll flipped a busy backend to unavailable and
+        wiped its models, 503ing every named-model request for a machine that
+        was serving 200s at that moment. A genuinely dead backend completes
+        nothing, so its evidence expires and it flips unavailable as before.
+        """
+        try:
+            models = await client.fetch_models()
+            client.state.last_poll = datetime.now(timezone.utc).isoformat()
+            if models:
+                # Don't override L2-degraded status: the L0 poll proves the
+                # process is listening, but L2 may have found a wedged
+                # generation slot. Only promote from unavailable -> healthy,
+                # not from degraded -> healthy. The L2 probe owns the
+                # degraded -> healthy recovery transition.
+                if client.state.status != EndpointStatus.degraded:
+                    client.state.status = EndpointStatus.healthy
+                client.state.models = models
+            elif traffic_is_fresh(client) and client.state.models:
+                logger.info(
+                    "L0 poll starved on %s (%s) but a real request completed "
+                    "within %.0fs — keeping the previous catalog",
+                    client.provider_name, client.base_url, TRAFFIC_FRESH_S,
+                )
+            else:
+                client.state.status = EndpointStatus.unavailable
+                client.state.models = []
+        except Exception:
+            if not (traffic_is_fresh(client) and client.state.models):
+                client.state.status = EndpointStatus.unavailable
+
     async def _poll_loop(self, client: EndpointClient, interval: int) -> None:
         # Observability only: warn once a backend has been continuously
         # unavailable for >= _default_unavailable_alert_seconds(), and again on
@@ -235,23 +272,7 @@ class DiscoveryManager:
         unavailable_streak = 0
         alerted = False
         while True:
-            try:
-                models = await client.fetch_models()
-                client.state.last_poll = datetime.now(timezone.utc).isoformat()
-                if models:
-                    # Don't override L2-degraded status: the L0 poll proves the
-                    # process is listening, but L2 may have found a wedged
-                    # generation slot. Only promote from unavailable -> healthy,
-                    # not from degraded -> healthy. The L2 probe owns the
-                    # degraded -> healthy recovery transition.
-                    if client.state.status != EndpointStatus.degraded:
-                        client.state.status = EndpointStatus.healthy
-                    client.state.models = models
-                else:
-                    client.state.status = EndpointStatus.unavailable
-                    client.state.models = []
-            except Exception:
-                client.state.status = EndpointStatus.unavailable
+            await self._poll_client_once(client)
             # Prolonged-unreachability alert (fires once per outage, plus a
             # recovery line). Tracked in loop-local state so no shared field or
             # routing state is touched.

@@ -13,6 +13,25 @@ from ..config.types import CircuitBreaker, EndpointState
 
 logger = logging.getLogger(__name__)
 
+TRAFFIC_FRESH_S = 120.0
+# A real request that COMPLETED successfully this recently is proof the backend
+# is serving. Health probes and the L0 /v1/models poll share one saturated pipe
+# with multi-MB long-context uploads, so they starve exactly when the backend
+# is busiest — before this guard, starved polls marked gb200 unavailable and
+# 503'd every named-model request while it was returning 200s (2026-08-21/22).
+# Kept moderate so a genuinely dead backend — which completes nothing — loses
+# its evidence and trips the breakers within TRAFFIC_FRESH_S + a poll cycle or
+# two, well inside a wedge's multi-hundred-second hang.
+
+
+def traffic_is_fresh(client) -> bool:
+    """True when a real request completed successfully on this backend within
+    TRAFFIC_FRESH_S (stamped by RequestRouter as ``last_traffic_success_ns``)."""
+    last = getattr(client, "last_traffic_success_ns", None)
+    if not last:
+        return False
+    return (time.time_ns() - last) / 1e9 < TRAFFIC_FRESH_S
+
 
 def _shared_upstream_bearer() -> str | None:
     """Single Authorization bearer for all upstream probes.
@@ -129,7 +148,12 @@ class EndpointClient:
                     self._on_backend_reset(model_set_changed=model_set_changed)
                 return models
         except Exception:
-            self._record_failure()
+            # A starved poll is not a dead backend: with a real completion
+            # this fresh, the 5s GET lost a bandwidth race against live
+            # traffic, so it must not advance the L0 breaker. The manager
+            # keeps the previous catalog for the same reason (_poll_client_once).
+            if not traffic_is_fresh(self):
+                self._record_failure()
             return []
 
     def _record_failure(self) -> None:
