@@ -1119,6 +1119,59 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
         _audit("key_scopes", hash_prefix=hash_prefix, scopes=scopes, by=_acting(request))
         return {"hash_prefix": hash_prefix, "scopes": scopes}
 
+    # --- Usage read API (admin scope enforced by the middleware). -------------
+    # One aggregation path serves every downstream consumer the portal has, so
+    # the numbers on the admin cost tab, a user's own usage page, and the WBR
+    # collector cannot disagree the way four separate Prometheus queries did.
+    @app.get("/admin/usage/rollup")
+    async def admin_usage_rollup(request: Request, start: str = "", end: str = "") -> dict[str, Any]:
+        """Per (day, principal, client, model) token totals in a date window."""
+        from ..usage_query import rollup, valid_day
+        from ..usage_store import get_store, open_db
+
+        if not (valid_day(start) and valid_day(end)):
+            raise HTTPException(400, detail="start and end must be YYYY-MM-DD")
+        store = get_store()
+        if store is None:
+            return {"rows": [], "enabled": False}
+        conn = open_db(store.path)
+        try:
+            return {"rows": rollup(conn, start, end), "enabled": True}
+        finally:
+            conn.close()
+
+    @app.get("/admin/usage/summary")
+    async def admin_usage_summary(request: Request) -> dict[str, Any]:
+        """All-time per-principal totals plus true first/last activity."""
+        from ..usage_query import summary
+        from ..usage_store import get_store, open_db
+
+        store = get_store()
+        if store is None:
+            return {"by_principal": {}, "enabled": False}
+        conn = open_db(store.path)
+        try:
+            return {**summary(conn), "enabled": True}
+        finally:
+            conn.close()
+
+    @app.get("/admin/usage/health")
+    async def admin_usage_health(request: Request) -> dict[str, Any]:
+        """Store growth and shed-load count: a silently dropping writer is the
+        one failure this store exists to make visible."""
+        from ..usage_query import store_health
+        from ..usage_store import get_store, open_db
+
+        store = get_store()
+        if store is None:
+            return {"enabled": False, "rows": 0, "bytes": 0, "days": 0}
+        conn = open_db(store.path)
+        try:
+            return {**store_health(conn, store.path), "enabled": True,
+                    "dropped": store.dropped}
+        finally:
+            conn.close()
+
     @app.get("/routing-table")
     async def routing_table(request: Request) -> dict[str, list[str]]:
         return dict(request.app.state.config.policy.fallback.graph)
