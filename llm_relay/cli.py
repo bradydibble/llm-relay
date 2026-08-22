@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 
 from rich.console import Console
 from rich.table import Table
@@ -431,6 +432,198 @@ def cmd_cache_sample(args: argparse.Namespace) -> int:
     return 0
 
 
+def _prompt_db_path(args: argparse.Namespace) -> str:
+    return (getattr(args, "db", None) or os.environ.get("LLM_RELAY_PROMPT_DB", "")).strip()
+
+
+def _parse_day(raw: str):
+    """A YYYY-MM-DD day, or None if it is not one."""
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _prune_preview(conn, cutoff: str) -> dict:
+    """What a prune at ``cutoff`` would delete, without writing anything.
+
+    Mirrors ``prompt_store.prune``'s rule exactly: a request goes when its day
+    is before the cutoff, and a stored message goes only when NO surviving
+    request still references it -- content addressing means one message can be
+    shared by thousands of requests, and a shared system prompt must not vanish
+    because the oldest conversation using it aged out. Already-orphaned rows are
+    counted here because prune deletes those too.
+
+    Lives in the CLI rather than the store so the preview path is read-only by
+    construction; a test pins the two to the same counts on one fixture.
+    """
+    requests = conn.execute(
+        "SELECT COUNT(*) FROM prompt_requests WHERE day < ?", (cutoff,)
+    ).fetchone()[0]
+    messages = conn.execute(
+        "SELECT COUNT(*) FROM messages m WHERE NOT EXISTS ("
+        " SELECT 1 FROM request_messages rm"
+        " JOIN prompt_requests pr ON pr.request_id = rm.request_id"
+        " WHERE rm.message_id = m.id AND pr.day >= ?)",
+        (cutoff,),
+    ).fetchone()[0]
+    return {"requests": int(requests), "messages": int(messages)}
+
+
+def cmd_prompts_prune(args: argparse.Namespace) -> int:
+    """Delete captured prompt content older than a cutoff day.
+
+    Retention is indefinite by decision, so this does NOTHING unless a cutoff
+    is named: either ``--older-than YYYY-MM-DD``, or
+    ``LLM_RELAY_PROMPT_RETENTION_DAYS`` set to a positive number of days. Unset
+    -- or 0 -- means keep forever, and that is the behavior with no
+    configuration at all. The prune path ships so the retention choice stays
+    revisitable on evidence, not so it quietly starts deleting.
+    """
+    from .audit import audit
+    from .prompt_store import open_db, prune
+
+    console = Console()
+    cutoff = (getattr(args, "older_than", None) or "").strip()
+    if cutoff:
+        if _parse_day(cutoff) is None:
+            console.print(
+                f"[red]Invalid --older-than:[/red] {cutoff!r} is not a YYYY-MM-DD date"
+            )
+            return 1
+    else:
+        raw = os.environ.get("LLM_RELAY_PROMPT_RETENTION_DAYS", "").strip()
+        if not raw:
+            console.print(
+                "Retention is indefinite (LLM_RELAY_PROMPT_RETENTION_DAYS unset): "
+                "nothing pruned. Pass --older-than YYYY-MM-DD to prune anyway."
+            )
+            return 0
+        try:
+            days = int(raw)
+        except ValueError:
+            console.print(
+                f"[red]Invalid LLM_RELAY_PROMPT_RETENTION_DAYS:[/red] {raw!r} is not "
+                "a whole number of days"
+            )
+            return 1
+        if days < 0:
+            # Not silently treated as "keep forever": a negative window is a
+            # typo, and a typo that deletes nothing while looking configured is
+            # how a retention policy quietly stops existing.
+            console.print(
+                f"[red]Invalid LLM_RELAY_PROMPT_RETENTION_DAYS:[/red] {days} days is "
+                "negative; use 0 (or unset) to keep forever"
+            )
+            return 1
+        if days == 0:
+            console.print(
+                "Retention is indefinite (LLM_RELAY_PROMPT_RETENTION_DAYS=0): "
+                "nothing pruned. Pass --older-than YYYY-MM-DD to prune anyway."
+            )
+            return 0
+        cutoff = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+        console.print(f"[dim]retention {days} day(s) -> cutoff {cutoff}[/dim]")
+
+    path = _prompt_db_path(args)
+    if not path:
+        console.print(
+            "[red]No prompt database:[/red] pass --db PATH or set LLM_RELAY_PROMPT_DB"
+        )
+        return 1
+    if not os.path.exists(path):
+        # Never create a store as a side effect of pruning one.
+        console.print(f"No prompt store at {path}: nothing to prune.")
+        return 0
+
+    conn = open_db(path)
+    try:
+        if args.dry_run:
+            counts = _prune_preview(conn, cutoff)
+            console.print(
+                f"[bold]dry run, cutoff {cutoff}:[/bold] would delete "
+                f"{counts['requests']} request(s) and {counts['messages']} stored "
+                "message(s); nothing written"
+            )
+            return 0
+        result = prune(conn, cutoff)
+    finally:
+        conn.close()
+
+    audit(
+        "prompt_prune", cutoff=cutoff, by="cli",
+        requests_deleted=result["requests_deleted"],
+        messages_deleted=result["messages_deleted"],
+        index_stale=result["index_stale"],
+    )
+    console.print(
+        f"[bold]cutoff {cutoff}:[/bold] deleted {result['requests_deleted']} "
+        f"request(s) and {result['messages_deleted']} stored message(s)"
+    )
+    if result["index_stale"]:
+        console.print(
+            f"[yellow]{result['index_stale']} search-index row(s) could not be "
+            "removed[/yellow] (unreadable blob); they resolve to no content."
+        )
+    return 0
+
+
+def cmd_prompts_stats(args: argparse.Namespace) -> int:
+    """Print prompt-store size, row counts and the dedup ratio.
+
+    The dedup ratio is the headline number, not a curiosity: it is links per
+    stored message -- how many times the fleet resent a message already stored
+    -- so it measures the prompt-cache opportunity directly on real traffic,
+    on a fleet whose agents resend whole conversations every turn.
+    """
+    from .prompt_store import open_db, stats
+
+    console = Console()
+    path = _prompt_db_path(args)
+    if not path:
+        console.print(
+            "[red]No prompt database:[/red] pass --db PATH or set LLM_RELAY_PROMPT_DB"
+        )
+        return 1
+    if not os.path.exists(path):
+        console.print(f"No prompt store at {path}: nothing captured yet.")
+        return 0
+
+    conn = open_db(path)
+    try:
+        s = stats(conn, path)
+    finally:
+        conn.close()
+
+    table = Table(title="Prompt store")
+    table.add_column("Measure", style="cyan")
+    table.add_column("Value", justify="right")
+    table.add_row("Requests", f"{s['requests']:,}")
+    table.add_row("Stored messages", f"{s['stored_messages']:,}")
+    table.add_row("Message links", f"{s['message_links']:,}")
+    table.add_row("Dedup ratio", f"{s['dedup_ratio']:.2f}x")
+    table.add_row("On disk", f"{s['bytes']:,} bytes")
+    table.add_row("Content before compression", f"{s['uncompressed_bytes']:,} bytes")
+    table.add_row("Distinct days", f"{s['distinct_days']:,}")
+    table.add_row("Codec", str(s["codec"]))
+    console.print(table)
+    console.print(
+        "Dedup ratio = links per stored message = the prompt-cache opportunity."
+    )
+    return 0
+
+
+def cmd_prompts(args: argparse.Namespace) -> int:
+    console = Console()
+    action = getattr(args, "prompts_action", None)
+    if action == "prune":
+        return cmd_prompts_prune(args)
+    if action == "stats":
+        return cmd_prompts_stats(args)
+    console.print("Usage: llm-relay prompts {prune,stats} --help")
+    return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="llm-relay", description="LLM relay routing control plane")
     subparsers = parser.add_subparsers(dest="command")
@@ -513,6 +706,36 @@ def main() -> int:
         help="Print what each backend reports without writing or moving cursors",
     )
 
+    p_prompts = subparsers.add_parser(
+        "prompts", help="Inspect and prune the captured prompt store"
+    )
+    prompts_sub = p_prompts.add_subparsers(dest="prompts_action")
+    pp_prune = prompts_sub.add_parser(
+        "prune",
+        help="Delete prompt content older than a cutoff day (default: nothing, "
+             "retention is indefinite)",
+    )
+    pp_prune.add_argument(
+        "--db", default=None,
+        help="SQLite prompt database (default: $LLM_RELAY_PROMPT_DB)",
+    )
+    pp_prune.add_argument(
+        "--older-than", default=None, metavar="YYYY-MM-DD",
+        help="Delete requests before this day. Without it, the cutoff comes from "
+             "LLM_RELAY_PROMPT_RETENTION_DAYS; unset or 0 means keep forever",
+    )
+    pp_prune.add_argument(
+        "--dry-run", action="store_true",
+        help="Report what would be deleted without writing",
+    )
+    pp_stats = prompts_sub.add_parser(
+        "stats", help="Print store size, row counts and the dedup ratio"
+    )
+    pp_stats.add_argument(
+        "--db", default=None,
+        help="SQLite prompt database (default: $LLM_RELAY_PROMPT_DB)",
+    )
+
     args = parser.parse_args()
     if args.command == "run":
         return cmd_run(args)
@@ -532,6 +755,8 @@ def main() -> int:
         return cmd_usage_backfill(args)
     if args.command == "cache-sample":
         return cmd_cache_sample(args)
+    if args.command == "prompts":
+        return cmd_prompts(args)
     parser.print_help()
     return 1
 

@@ -406,8 +406,85 @@ class DiscoveryCollector:
         yield resets
 
 
+class PromptStoreCollector:
+    """Pull-based gauges for prompt-store growth, read at scrape time.
+
+    These two series are *operational telemetry, not accounting*. Prompt
+    retention is indefinite by decision, so growth has to be observable rather
+    than discovered by a full disk -- that puts store size and stored-message
+    count in the same category as process uptime. Anything used to COMPUTE COST
+    (tokens, dollars, per-principal attribution) does NOT belong in a gauge: it
+    lives in the usage database and is queried from there. Do not "correct"
+    these two into usage_store because usage moved off Prometheus.
+
+    Pull-based like :class:`DiscoveryCollector`: nothing is maintained on the
+    capture write path, so a scrape cannot perturb the store. The database is
+    opened read-only, and only when it already exists -- a scrape never creates
+    a store, and unset ``LLM_RELAY_PROMPT_DB`` (capture off) reports nothing.
+    """
+
+    def _families(self) -> tuple[GaugeMetricFamily, GaugeMetricFamily]:
+        return (
+            GaugeMetricFamily(
+                "llm_relay_prompt_store_bytes",
+                "On-disk size of the prompt store including WAL sidecars, in bytes.",
+            ),
+            GaugeMetricFamily(
+                "llm_relay_prompt_store_messages",
+                "Distinct messages stored (content-addressed: resends do not inflate it).",
+            ),
+        )
+
+    def describe(self) -> Iterable[GaugeMetricFamily]:
+        # Registration asks describe() when present, so registering this
+        # collector never touches the filesystem or the database.
+        return self._families()
+
+    def collect(self) -> Iterable[GaugeMetricFamily]:
+        size, messages = self._families()
+        path = os.environ.get("LLM_RELAY_PROMPT_DB", "").strip()
+        if not path or not os.path.exists(path):
+            # Capture off, or nothing captured yet. The families are still
+            # yielded so the series stay documented in the exposition.
+            yield size
+            yield messages
+            return
+        # Bytes come from the filesystem rather than a query, so disk growth
+        # stays visible even if the read-only open below cannot proceed (a WAL
+        # database with no live writer has no -shm sidecar to attach).
+        on_disk = 0
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                on_disk += os.path.getsize(path + suffix)
+            except OSError:
+                pass
+        size.add_metric([], float(on_disk))
+        try:
+            # Imported lazily: the prompt store is optional, and a scrape must
+            # not be the reason this module grows an import.
+            import sqlite3
+            from pathlib import Path
+
+            from . import prompt_store
+
+            conn = sqlite3.connect(
+                Path(os.path.abspath(path)).as_uri() + "?mode=ro", uri=True)
+            try:
+                messages.add_metric(
+                    [], float(prompt_store.stats(conn, path)["stored_messages"]))
+            finally:
+                conn.close()
+        except Exception:
+            # Best-effort, like the capture path itself: a scrape must never
+            # fail because of the prompt store.
+            pass
+        yield size
+        yield messages
+
+
 _METRICS: RelayMetrics | None = None
 _DISCOVERY_COLLECTOR: DiscoveryCollector | None = None
+_PROMPT_STORE_COLLECTOR: PromptStoreCollector | None = None
 
 
 def get_metrics() -> RelayMetrics:
@@ -440,6 +517,28 @@ def register_discovery_collector(discovery: Any) -> DiscoveryCollector:
     _DISCOVERY_COLLECTOR = DiscoveryCollector(discovery)
     RELAY_REGISTRY.register(_DISCOVERY_COLLECTOR)
     return _DISCOVERY_COLLECTOR
+
+
+def register_prompt_store_collector() -> PromptStoreCollector:
+    """Register (or replace) the prompt-store growth gauges on RELAY_REGISTRY.
+
+    Registered at import rather than from ``create_app()`` because, unlike
+    DiscoveryCollector, this collector binds to no live object: it resolves
+    ``LLM_RELAY_PROMPT_DB`` at scrape time, so it costs nothing and reports
+    nothing until content capture is switched on. Idempotent, so re-importing
+    or re-registering cannot raise a duplicate-series error."""
+    global _PROMPT_STORE_COLLECTOR
+    if _PROMPT_STORE_COLLECTOR is not None:
+        try:
+            RELAY_REGISTRY.unregister(_PROMPT_STORE_COLLECTOR)
+        except Exception:
+            pass
+    _PROMPT_STORE_COLLECTOR = PromptStoreCollector()
+    RELAY_REGISTRY.register(_PROMPT_STORE_COLLECTOR)
+    return _PROMPT_STORE_COLLECTOR
+
+
+register_prompt_store_collector()
 
 
 def render_exposition(registry: CollectorRegistry | None = None) -> tuple[bytes, str]:
