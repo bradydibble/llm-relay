@@ -318,6 +318,119 @@ def cmd_usage_backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cache_sample(args: argparse.Namespace) -> int:
+    """Sample each backend's prefix-cache counters into the usage database.
+
+    Meant to run periodically (a timer, every few minutes). The counters are
+    cumulative from backend process start, so a per-day number only exists as a
+    delta against the persisted cursor: run #1 seeds baselines and attributes
+    nothing, and a re-run of an unchanged counter adds nothing.
+
+    Fleet-level per (day, model) only. Per-request cache attribution comes from
+    ``prompt_tokens_details.cached_tokens`` on the request path instead, and the
+    two are not expected to agree -- see ``cache_sampler`` for why.
+    """
+    from .cache_sampler import (
+        Backend,
+        backends_from_config,
+        cache_rollup,
+        fetch_metrics,
+        open_cache_db,
+        parse_prefix_cache_metrics,
+        sample_backends,
+        utc_day,
+    )
+
+    console = Console()
+    if args.backend:
+        # Explicit targets, for a backend the relay does not (yet) route to.
+        backends = [
+            Backend(key=url, provider="cli", base_url=url.rstrip("/"))
+            for url in args.backend
+        ]
+    else:
+        try:
+            backends = backends_from_config(_load_config())
+        except Exception as exc:
+            console.print(f"[red]Cannot load config:[/red] {exc}")
+            return 1
+    if not backends:
+        console.print("[red]No backends:[/red] pass --backend URL or configure a provider")
+        return 1
+
+    day = args.day or utc_day()
+    if args.dry_run:
+        # Show what each backend reports without touching the database, so the
+        # scrape can be verified before it starts moving cursors.
+        table = Table(title=f"Prefix cache (dry run, {day})")
+        for column in ("Backend", "Model", "Queried", "Hits", "Rate"):
+            table.add_column(column)
+        for backend in backends:
+            try:
+                reading = parse_prefix_cache_metrics(
+                    fetch_metrics(backend.base_url, timeout=args.timeout)
+                )
+            except Exception as exc:
+                table.add_row(backend.key, "[red]unreachable[/red]", "-", "-", str(exc))
+                continue
+            if not reading.reported:
+                table.add_row(backend.key, "[dim]not reported[/dim]", "-", "-", "-")
+                continue
+            for model, counters in reading.by_model.items():
+                rate = (f"{counters.hits / counters.queried:.1%}"
+                        if counters.queried else "-")
+                table.add_row(backend.key, model or "(unlabelled)",
+                              str(counters.queried), str(counters.hits), rate)
+        console.print(table)
+        return 0
+
+    db_path = args.usage_db or os.environ.get("LLM_RELAY_USAGE_DB", "").strip()
+    if not db_path:
+        console.print(
+            "[red]No usage database:[/red] pass --usage-db or set LLM_RELAY_USAGE_DB "
+            "(or use --dry-run to only read)."
+        )
+        return 1
+
+    conn = open_cache_db(db_path)
+    try:
+        result = sample_backends(conn, backends, day=day, timeout=args.timeout)
+        rows = cache_rollup(conn, day, day)
+    finally:
+        conn.close()
+
+    console.print(
+        f"[bold]{day}:[/bold] {result.counted} counted, {result.baselined} baselined, "
+        f"{result.unchanged} unchanged, {result.resets} reset(s), "
+        f"{result.rejected} rejected"
+    )
+    if result.unreachable:
+        console.print(f"[yellow]unreachable:[/yellow] {', '.join(result.unreachable)}")
+    if result.not_reported:
+        # Not the same as zero reuse: these backends expose no prefix-cache
+        # series (not vLLM, or caching off, or the metric renamed).
+        console.print(f"[dim]no prefix-cache metrics:[/dim] {', '.join(result.not_reported)}")
+    if result.unattributed:
+        console.print(
+            f"[yellow]unlabelled metrics on a multi-model backend:[/yellow] "
+            f"{', '.join(result.unattributed)}"
+        )
+    table = Table(title=f"Prefix cache reuse ({day})")
+    table.add_column("Model", style="cyan")
+    table.add_column("Queried", justify="right")
+    table.add_column("Cache read", justify="right")
+    table.add_column("Hit rate", justify="right")
+    for row in rows:
+        table.add_row(
+            row["model"], f"{row['queried_tokens']:,}",
+            f"{row['cache_read_tokens']:,}",
+            f"{row['hit_rate']:.1%}" if row["hit_rate"] is not None
+            else ("[dim]not reported[/dim]" if not row["reported"] else "-"),
+        )
+    console.print(table)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="llm-relay", description="LLM relay routing control plane")
     subparsers = parser.add_subparsers(dest="command")
@@ -376,6 +489,30 @@ def main() -> int:
         "--dry-run", action="store_true", help="Print counts without writing"
     )
 
+    p_cache = subparsers.add_parser(
+        "cache-sample",
+        help="Sample backend prefix-cache counters into the usage store",
+    )
+    p_cache.add_argument(
+        "--usage-db", default=None,
+        help="SQLite usage database (default: $LLM_RELAY_USAGE_DB)",
+    )
+    p_cache.add_argument(
+        "--backend", action="append", default=[], metavar="URL",
+        help="Backend root URL to scrape, repeatable. Default: every enabled "
+             "provider/port in the loaded config (addresses are never hardcoded)",
+    )
+    p_cache.add_argument(
+        "--day", default=None, help="Attribute deltas to this day (default: today UTC)"
+    )
+    p_cache.add_argument(
+        "--timeout", type=float, default=5.0, help="Per-backend scrape timeout, seconds"
+    )
+    p_cache.add_argument(
+        "--dry-run", action="store_true",
+        help="Print what each backend reports without writing or moving cursors",
+    )
+
     args = parser.parse_args()
     if args.command == "run":
         return cmd_run(args)
@@ -393,6 +530,8 @@ def main() -> int:
         return cmd_keys(args)
     if args.command == "usage-backfill":
         return cmd_usage_backfill(args)
+    if args.command == "cache-sample":
+        return cmd_cache_sample(args)
     parser.print_help()
     return 1
 
