@@ -18,7 +18,7 @@ import sys
 import urllib.error
 import urllib.request
 
-DEFAULT_BASE = os.environ.get("CIQ_RELAY_URL", "https://llm.internal.ciq.com/v1")
+DEFAULT_BASE = os.environ.get("LLM_RELAY_URL", "https://relay.example.invalid/v1")
 TIMEOUT = int(os.environ.get("CONFORMANCE_TIMEOUT", "240"))
 
 WEATHER_TOOL = [{
@@ -400,9 +400,9 @@ def main() -> int:
                     help="models on these nodes need the non_confidential declaration")
     args = ap.parse_args()
 
-    key = os.environ.get("CIQ_RELAY_KEY") or os.environ.get("LLM_RELAY_API_KEY") or ""
+    key = os.environ.get("LLM_RELAY_API_KEY") or ""
     if not key:
-        print("set CIQ_RELAY_KEY", file=sys.stderr)
+        print("set LLM_RELAY_API_KEY", file=sys.stderr)
         return 2
 
     nodes = tuple(n.strip() for n in args.third_party_nodes.split(",") if n.strip())

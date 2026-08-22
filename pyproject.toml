@@ -5,9 +5,7 @@ description = "Lightweight LLM routing control plane for homelab + cloud backend
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-authors = [
-    { name = "Brady Dibble" },
-]
+authors = []
 keywords = ["llm", "routing", "openai", "fastapi", "homelab", "control-plane"]
 classifiers = [
     "Development Status :: 4 - Beta",
