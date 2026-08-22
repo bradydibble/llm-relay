@@ -129,10 +129,18 @@ def reassemble_sse(raw: bytes) -> tuple[str, dict]:
     `delta.reasoning_content` (Qwen-style chain-of-thought). The returned
     text concatenates content only; reasoning is folded into usage under
     a `_reasoning_content` key so the caller can surface it separately.
+
+    Also reports `_frame_count` (how many delta frames carried content or
+    reasoning) and `_saw_incremental` (usage arrived on a chunk that also
+    carried a delta, i.e. vLLM ``continuous_usage_stats``). Both exist so an
+    aborted stream — which never receives the terminal usage chunk — can still
+    be counted instead of silently recorded as zero tokens.
     """
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
     usage: dict = {}
+    frame_count = 0
+    saw_incremental = False
     for line in raw.decode("utf-8", errors="replace").splitlines():
         s = line.strip()
         if not s.startswith("data:"):
@@ -152,7 +160,12 @@ def reassemble_sse(raw: bytes) -> tuple[str, dict]:
             rc = delta.get("reasoning_content")
             if rc:
                 reasoning_parts.append(rc)
+            if c or rc:
+                frame_count += 1
         if j.get("usage"):
+            if j.get("choices"):
+                # Usage alongside a content delta = continuous_usage_stats.
+                saw_incremental = True
             usage = j["usage"]
         # llama.cpp emits non-standard `timings` on the final chunk with token counts;
         # use them as a fallback when standard `usage` isn't present (stream w/o include_usage).
@@ -165,7 +178,47 @@ def reassemble_sse(raw: bytes) -> tuple[str, dict]:
         usage["total_tokens"] = usage["completion_tokens"] + usage["prompt_tokens"]
     if reasoning_parts:
         usage["_reasoning_content"] = "".join(reasoning_parts)
+    usage["_frame_count"] = frame_count
+    usage["_saw_incremental"] = saw_incremental
     return "".join(content_parts), usage
+
+
+def request_shape(request_body: dict | None) -> dict:
+    """Structural fingerprint of a request — counts and hashes, never content.
+
+    ``prefix_hash`` covers every message except the last, so a conversation
+    resent turn after turn is recognisable across requests. That is what makes
+    prompt-cache opportunity measurable without storing any text.
+    """
+    import hashlib
+
+    body = request_body if isinstance(request_body, dict) else {}
+    messages = body.get("messages")
+    messages = messages if isinstance(messages, list) else []
+
+    def _digest(parts) -> str:
+        h = hashlib.sha256()
+        for p in parts:
+            h.update(repr(p).encode("utf-8", "replace"))
+            h.update(b"\x00")
+        return h.hexdigest()[:32]
+
+    system_parts = [m.get("content") for m in messages
+                    if isinstance(m, dict) and m.get("role") == "system"]
+    prefix_parts = [(m.get("role"), m.get("content")) for m in messages[:-1]
+                    if isinstance(m, dict)]
+    tools = body.get("tools")
+
+    temperature = body.get("temperature")
+    max_tokens = body.get("max_tokens")
+    return {
+        "message_count": len(messages),
+        "system_hash": _digest(system_parts) if system_parts else None,
+        "prefix_hash": _digest(prefix_parts) if prefix_parts else None,
+        "tool_count": len(tools) if isinstance(tools, list) else 0,
+        "temperature": float(temperature) if isinstance(temperature, (int, float)) else None,
+        "max_tokens": int(max_tokens) if isinstance(max_tokens, int) else None,
+    }
 
 
 def emit_chat_completion(
@@ -187,6 +240,7 @@ def emit_chat_completion(
     fell_back: bool = False,
     ttft_ns: int | None = None,
     principal: str | None = None,
+    confidentiality: str | None = None,
 ) -> None:
     """Emit telemetry for one chat completion: Prometheus metrics (always) and,
     when LLM_RELAY_TELEMETRY is enabled, an OpenInference span. Best-effort;
@@ -203,6 +257,21 @@ def emit_chat_completion(
         _pm = (response_body.get("timings") or {}).get("prompt_ms")
         if isinstance(_pm, (int, float)) and _pm >= 0:
             ttft_ns = int(_pm * 1e6)
+    # Resolve the token counts ONCE, here, so Prometheus and the durable store
+    # can never disagree about what a request cost.
+    from ..usage_math import resolve_usage
+
+    eff_usage = usage if usage else None
+    counts = resolve_usage(
+        usage=eff_usage,
+        response_body=response_body,
+        streamed=streamed,
+        frame_count=int((eff_usage or {}).get("_frame_count") or 0),
+        content_text=response_text or "",
+        reasoning_text=str((eff_usage or {}).get("_reasoning_content") or ""),
+        saw_incremental=bool((eff_usage or {}).get("_saw_incremental")),
+    )
+
     # Metrics first, independent of the OTLP tracer (Phoenix may be down).
     try:
         duration_s = max(0.0, (end_ns - start_ns) / 1e9)
@@ -218,9 +287,53 @@ def emit_chat_completion(
             fell_back=fell_back,
             ttft_s=(ttft_ns / 1e9) if ttft_ns is not None else None,
             principal=principal,
+            counts=counts,
         )
     except Exception as e:
         print(f"[llm-relay] metrics record failed (ignored): {e}", file=sys.stderr)
+
+    # Durable row. Best-effort: a storage problem must never surface here.
+    try:
+        from ..usage_store import get_store
+
+        store = get_store()
+        if store is not None:
+            import datetime as _dt
+            import uuid as _uuid
+
+            ts = end_ns / 1_000_000_000
+            shape = request_shape(request_body)
+            store.record({
+                "request_id": _uuid.uuid4().hex,
+                "ts": ts,
+                "day": _dt.datetime.fromtimestamp(ts, _dt.timezone.utc).strftime("%Y-%m-%d"),
+                "principal": principal or "anonymous",
+                "client": client or "unknown",
+                "alias": (request_body or {}).get("model"),
+                "model": model_resolved or "none",
+                "provider": provider_name or "",
+                "outcome": outcome,
+                "streamed": 1 if streamed else 0,
+                "duration_ms": int((end_ns - start_ns) / 1_000_000),
+                "ttft_ms": int(ttft_ns / 1_000_000) if ttft_ns else None,
+                "input_tokens": counts.input_tokens,
+                "output_tokens": counts.output_tokens,
+                "reasoning_tokens": counts.reasoning_tokens,
+                "cache_read_tokens": counts.cache_read_tokens,
+                "usage_source": counts.usage_source,
+                "reasoning_source": counts.reasoning_source,
+                "synthetic": 0,
+                "message_count": shape["message_count"],
+                "system_hash": shape["system_hash"],
+                "prefix_hash": shape["prefix_hash"],
+                "tool_count": shape["tool_count"],
+                "temperature": shape["temperature"],
+                "max_tokens": shape["max_tokens"],
+                "confidentiality": confidentiality,
+                "fell_back": 1 if fell_back else 0,
+            })
+    except Exception:
+        pass
 
     tracer = _init_tracer()
     if tracer is None:

@@ -228,18 +228,6 @@ def _safe(label: str | None) -> str:
     return label if label else "none"
 
 
-def _extract_usage(usage: dict | None, response_body: dict | None) -> dict:
-    """Token usage lives in the streaming-reassembled ``usage`` dict OR, for
-    non-streaming responses, in ``response_body["usage"]``. Handle both."""
-    if usage:
-        return usage
-    if isinstance(response_body, dict):
-        u = response_body.get("usage")
-        if isinstance(u, dict):
-            return u
-    return {}
-
-
 class RelayMetrics:
     """Holds the request/token/fallback/duration collectors against a registry.
 

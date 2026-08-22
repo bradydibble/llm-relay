@@ -1196,6 +1196,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=429, streamed=is_stream, error="shed: low urgency under contention",
                 outcome="shed", client=client, principal=principal_id,
+                confidentiality=hint_headers.get("X-Llm-Relay-Confidentiality"),
             )
             raise HTTPException(
                 status_code=429,
@@ -1254,6 +1255,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                                 outcome="backend_error",
                                 client=client,
                                 principal=principal_id,
+                                confidentiality=hint_headers.get("X-Llm-Relay-Confidentiality"),
                             )
                             yield json.dumps(_err).encode()
                             return
@@ -1298,6 +1300,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                                 _res.selected_model,
                                 (_res.decision or {}).get("ranked") or [],
                             ),
+                            confidentiality=hint_headers.get("X-Llm-Relay-Confidentiality"),
                         )
                         if isinstance(_content, dict):
                             yield json.dumps(_content).encode()
@@ -1319,6 +1322,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=400, streamed=is_stream, error=str(e),
                 outcome="context_length_exceeded", client=client, principal=principal_id,
+                confidentiality=hint_headers.get("X-Llm-Relay-Confidentiality"),
             )
             return JSONResponse(
                 status_code=400, content=e.body,
@@ -1331,6 +1335,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=429, streamed=is_stream, error=str(e),
                 outcome="saturated", client=client, principal=principal_id,
+                confidentiality=hint_headers.get("X-Llm-Relay-Confidentiality"),
             )
             return _backpressure_response(
                 429, "backend_saturated", str(e), e.retry_after_seconds,
@@ -1346,6 +1351,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=503, streamed=is_stream, error=str(e),
                 outcome="no_backend", client=client, principal=principal_id,
+                confidentiality=hint_headers.get("X-Llm-Relay-Confidentiality"),
             )
             return _backpressure_response(
                 503, "no_backend_available", str(e), e.retry_after_seconds,
@@ -1357,6 +1363,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=502, streamed=is_stream, error=f"Backend network error: {e}",
                 outcome="network_error", client=client, principal=principal_id,
+                confidentiality=hint_headers.get("X-Llm-Relay-Confidentiality"),
             )
             raise HTTPException(502, detail=f"Backend network error: {e}")
         except HTTPException:
@@ -1368,6 +1375,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=503, streamed=is_stream, error="No model matches constraints",
                 outcome="no_candidate", client=client, principal=principal_id,
+                confidentiality=hint_headers.get("X-Llm-Relay-Confidentiality"),
             )
             raise
         except Exception as e:
@@ -1377,6 +1385,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=502, streamed=is_stream, error=f"Backend error: {e}",
                 outcome="backend_error", client=client, principal=principal_id,
+                confidentiality=hint_headers.get("X-Llm-Relay-Confidentiality"),
             )
             raise HTTPException(502, detail=f"Backend error: {e}")
 
@@ -1492,6 +1501,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                         client=client, principal=principal_id,
                         fell_back=did_fall_back(result.selected_model, (result.decision or {}).get("ranked") or []),
                         ttft_ns=ttft_ns,
+                        confidentiality=hint_headers.get("X-Llm-Relay-Confidentiality"),
                     )
 
             # cleanup frees the in-flight slot and closes the upstream
@@ -1530,6 +1540,7 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
             outcome="success" if upstream.status_code < 400 else "upstream_error",
             client=client, principal=principal_id,
             fell_back=did_fall_back(result.selected_model, (result.decision or {}).get("ranked") or []),
+            confidentiality=hint_headers.get("X-Llm-Relay-Confidentiality"),
         )
         return JSONResponse(status_code=upstream.status_code, content=content, headers=relay_headers)
 
