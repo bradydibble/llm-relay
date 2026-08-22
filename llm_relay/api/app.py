@@ -1172,6 +1172,129 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
         finally:
             conn.close()
 
+    # --- Prompt library (admin scope AND a presented admin key). --------------
+    # The most sensitive surface in the relay: a searchable archive of
+    # coworkers' conversations, retained indefinitely. Authorization is layered
+    # rather than assumed from any one check, and every interaction is audited.
+    def _require_real_admin_key(request: Request) -> str:
+        """Prompt content requires a presented admin key, not the trusted-listener
+        bypass.
+
+        That bypass grants admin+cloud+third_party to any request arriving on a
+        trusted loopback port with no key at all -- acceptable for operational
+        state, not for conversation content. Caddy exposes only the
+        key-enforcing listener, so this closes an on-box gap rather than an
+        internet-facing one; the portal is unaffected because it already calls
+        the auth listener with its service key.
+
+        The scope re-check is deliberate belt-and-braces. The middleware's
+        ``_admin_gated`` path prefix already covers ``/admin/*``, but this
+        function is the thing a reader of a prompt route will look at, so it
+        states its own precondition instead of inheriting it silently.
+        """
+        source = getattr(request.state, "auth_source", None)
+        principal = getattr(request.state, "principal", None)
+        caller = getattr(principal, "id", "?")
+        scopes = list(getattr(principal, "scopes", []) or [])
+        if source != "api_key" or "admin" not in scopes:
+            _audit("prompt_access_denied", by=caller, auth_source=str(source),
+                   path=request.url.path)
+            raise HTTPException(
+                403,
+                detail="prompt content requires an admin API key "
+                       "(the trusted listener is not sufficient)",
+            )
+        return caller
+
+    @app.get("/admin/prompts/search")
+    async def admin_prompts_search(
+        request: Request,
+        q: str = "",
+        principal: str = "",
+        client: str = "",
+        model: str = "",
+        role: str = "",
+        start: str = "",
+        end: str = "",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Full-text search over captured messages. Audited, query text included.
+
+        The audit event fires whether or not capture is configured: switching
+        capture off must not silently switch off the record of who went looking.
+        """
+        from ..prompt_store import get_store, open_db, search
+
+        caller = _require_real_admin_key(request)
+        # An unbounded limit on a content route is an exfiltration convenience.
+        limit = max(1, min(int(limit), 200))
+        store = get_store()
+        if store is None:
+            _audit("prompt_search", by=caller, query=q, principal=principal,
+                   model=model, results=0, enabled=False)
+            return {"enabled": False, "query": q, "hits": [], "count": 0,
+                    "limit": limit}
+        conn = open_db(store.path)
+        try:
+            # ``search`` sanitises the FTS expression itself, so an unusable
+            # query yields no rows rather than a 500 on an admin route.
+            hits = search(
+                conn, q, principal=principal or None, client=client or None,
+                model=model or None, role=role or None,
+                start_day=start or None, end_day=end or None, limit=limit,
+            )
+        finally:
+            conn.close()
+        _audit("prompt_search", by=caller, query=q, principal=principal,
+               model=model, results=len(hits), enabled=True)
+        return {"enabled": True, "query": q, "hits": hits, "count": len(hits),
+                "limit": limit}
+
+    @app.get("/admin/prompts/request/{request_id}")
+    async def admin_prompts_request(request_id: str, request: Request) -> dict[str, Any]:
+        """One conversation in full. The audited content read."""
+        from ..prompt_store import get_store, open_db, read_request
+
+        caller = _require_real_admin_key(request)
+        store = get_store()
+        if store is None:
+            _audit("prompt_read", by=caller, request_id=request_id,
+                   found=False, enabled=False)
+            return {"enabled": False, "request_id": request_id,
+                    "found": False, "messages": []}
+        conn = open_db(store.path)
+        try:
+            out = read_request(conn, request_id)
+        finally:
+            conn.close()
+        _audit("prompt_read", by=caller, request_id=request_id,
+               found=bool(out.get("found")), enabled=True)
+        return {**out, "enabled": True}
+
+    @app.get("/admin/prompts/stats")
+    async def admin_prompts_stats(request: Request) -> dict[str, Any]:
+        """Row counts, dedup ratio and on-disk size. Metadata only, no content.
+
+        Gated and audited like the content routes anyway: growth of an
+        indefinitely-retained archive is itself something to watch, and one
+        consistent gate is easier to reason about than two.
+        """
+        from ..prompt_store import get_store, open_db, stats
+
+        caller = _require_real_admin_key(request)
+        store = get_store()
+        if store is None:
+            _audit("prompt_stats", by=caller, enabled=False)
+            return {"enabled": False, "stored_messages": 0, "message_links": 0,
+                    "requests": 0, "bytes": 0}
+        conn = open_db(store.path)
+        try:
+            out = stats(conn, store.path)
+        finally:
+            conn.close()
+        _audit("prompt_stats", by=caller, enabled=True)
+        return {**out, "enabled": True, "dropped": store.dropped}
+
     @app.get("/routing-table")
     async def routing_table(request: Request) -> dict[str, list[str]]:
         return dict(request.app.state.config.policy.fallback.graph)

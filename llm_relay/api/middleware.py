@@ -22,6 +22,15 @@ Trust model (see also the README security model):
   them: that binding IS the access control for these scopes.
 - Every other listener enforces a key, and the ``admin`` scope gates
   ``/admin/*`` and ``/logs*`` (fleet-wide operator surfaces).
+
+``scope["state"]["auth_source"]`` records *how* a caller got in --
+``auth_disabled``, ``trusted_listener`` or ``api_key`` -- so a route can decline
+the listener bypass. The prompt-library routes do exactly that: the bypass
+grants admin to any on-box process with no key at all, which is acceptable for
+operational state and not for coworkers' conversation content. Scopes answer
+"what may this caller do"; this answers "did anyone actually prove who they
+are". Absent means the request took the exempt-path branch, which proves
+nothing, so treat a missing value as untrusted rather than defaulting it.
 """
 from __future__ import annotations
 
@@ -49,10 +58,12 @@ class AuthMiddleware:
         state = scope.setdefault("state", {})
         if not cfg.enabled:
             state["principal"] = Principal(id="anonymous")
+            state["auth_source"] = "auth_disabled"
             await self.app(scope, receive, send)
             return
         server = scope.get("server") or (None, None)
         if server[1] in cfg.trusted_ports:
+            state["auth_source"] = "trusted_listener"
             state["principal"] = Principal(
                 id=cfg.trusted_principal,
                 priority_weight=1.0,
@@ -96,6 +107,7 @@ class AuthMiddleware:
             )
             await response(scope, receive, send)
             return
+        state["auth_source"] = "api_key"
         state["principal"] = principal
         await self.app(scope, receive, send)
 
