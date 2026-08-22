@@ -587,11 +587,16 @@ class RequestRouter:
                         )
                     continue
                 try:
-                    fwd = _clamp_max_tokens(request_data, prompt_est, candidate.context_window)
-                    # Apply repetition_penalty default to streaming path too.
-                    # A streaming repetition loop still produces garbage for hours
-                    # and consumes GPU capacity — streaming is a response framing
-                    # choice, not a reason to skip generation safety defaults.
+                    # Apply BOTH defaults to streaming path. max_tokens is
+                    # needed here too: without it, a streaming repetition loop
+                    # (even with rep_pen=1.1, which reduces but doesn't guarantee
+                    # termination) can run for 245K tokens — hours of streamed
+                    # garbage consuming a backend slot. A streaming output
+                    # budget guarantees termination.
+                    _cfg_default = self.config.policy.default_max_tokens
+                    _default_mt = _cfg_default if _cfg_default is not None else DEFAULT_NON_STREAM_MAX_TOKENS
+                    fwd = _clamp_max_tokens(request_data, prompt_est, candidate.context_window,
+                                            default=_default_mt)
                     _cfg_rp = self.config.policy.default_repetition_penalty
                     _default_rp = _cfg_rp if _cfg_rp is not None else DEFAULT_REPETITION_PENALTY
                     fwd = _apply_repetition_penalty_default(fwd, default=_default_rp)
@@ -1030,7 +1035,8 @@ def _clamp_max_tokens(request_data: dict, prompt_est: int | None, window: int,
 def _apply_repetition_penalty_default(
     request_data: dict, default: float | None = None
 ) -> dict:
-    """Apply a default ``repetition_penalty`` when the client set none.
+    """Apply a ``repetition_penalty`` floor when the client set none or a
+    lower value.
 
     vLLM's default is 1.0 (no penalty); Ollama's is 1.1. Without a penalty,
     certain prompts trigger repetition loops where the model generates the
@@ -1038,13 +1044,19 @@ def _apply_repetition_penalty_default(
     diff-marker C declaration caused the model to repeat "int64 vs int64"
     forever). 1.1 matches Ollama's default and breaks the loop.
 
-    Only applies when the client set NO ``repetition_penalty``; a client-set
-    value is always forwarded unchanged. Returns the same object when no
-    change is needed; otherwise a shallow copy.
+    This is a SAFETY FLOOR, not just a default: a client that explicitly
+    sends repetition_penalty=1.0 (or null) gets clamped up to the floor.
+    Clients that send a higher value (e.g. 1.2) are forwarded unchanged.
+    This prevents clients that serialize 1.0 as their default from
+    bypassing the protection (ChatGPT gpt-5.6 advised: 'many clients
+    serialize defaults such as 1.0; a presence-only default may protect
+    fewer requests than expected').
+
+    Returns the same object when no change is needed; otherwise a shallow copy.
     """
     if not default or default <= 0:
         return request_data
     existing = request_data.get("repetition_penalty")
-    if existing is not None:
-        return request_data
-    return {**request_data, "repetition_penalty": default}
+    if existing is None or not isinstance(existing, (int, float)) or existing < default:
+        return {**request_data, "repetition_penalty": default}
+    return request_data

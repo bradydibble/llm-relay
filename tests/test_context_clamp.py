@@ -397,8 +397,8 @@ async def test_stream_no_max_tokens_gets_no_default(tmp_path, monkeypatch):
         stream=True,
     )
     assert upstream.status_code == 200
-    assert captured["max_tokens"] is None, \
-        "streaming without max_tokens must NOT get a default — client controls duration"
+    assert captured["max_tokens"] == DEFAULT_NON_STREAM_MAX_TOKENS, \
+        "streaming without max_tokens MUST get the default — prevents unbounded streaming loops"
     assert captured["repetition_penalty"] == DEFAULT_REPETITION_PENALTY, \
         "streaming without repetition_penalty MUST get the default — prevents repetition loops"
 
@@ -514,12 +514,29 @@ def test_repetition_penalty_applied_when_unset():
     assert out["repetition_penalty"] == 1.1
 
 
-def test_repetition_penalty_not_overriding_client_value():
-    """A client-set repetition_penalty is NEVER overridden — the default only
-    applies when the client set nothing."""
+def test_repetition_penalty_not_overriding_client_higher_value():
+    """A client-set repetition_penalty HIGHER than the floor is preserved —
+    we only clamp UP, never down."""
     src = {"repetition_penalty": 1.3, "messages": []}
     out = _apply_repetition_penalty_default(src, default=1.1)
+    assert out is src  # unchanged — client value above floor respected
     assert out["repetition_penalty"] == 1.3
+
+
+def test_repetition_penalty_clamps_explicit_low_value():
+    """A client that explicitly sends repetition_penalty=1.0 (no penalty) gets
+    clamped UP to the floor (1.1). This prevents clients that serialize 1.0
+    as their default from bypassing the protection."""
+    src = {"repetition_penalty": 1.0, "messages": []}
+    out = _apply_repetition_penalty_default(src, default=1.1)
+    assert out["repetition_penalty"] == 1.1, "explicit 1.0 must be clamped up to the floor"
+
+
+def test_repetition_penalty_handles_null():
+    """null repetition_penalty is treated as missing — the floor applies."""
+    src = {"repetition_penalty": None, "messages": []}
+    out = _apply_repetition_penalty_default(src, default=1.1)
+    assert out["repetition_penalty"] == 1.1
 
 
 def test_repetition_penalty_disabled_when_zero():
