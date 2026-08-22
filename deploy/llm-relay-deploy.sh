@@ -107,7 +107,12 @@ case "${1:-main}" in
     exit 0
     ;;
 --rollback)
-    PREV=$(cat /srv/llm/current/.${REPO}.prev 2>/dev/null) || die "no previous release recorded"
+    PREV_FILE=/srv/llm/current/.${REPO}.prev
+    # -f follows symlinks, so a .prev left as a symlink to a directory by a
+    # hand-rolled deploy fails here with a clear message instead of a confusing
+    # "Is a directory" out of cat.
+    [[ -f "$PREV_FILE" ]] || die "no previous release recorded (expected a regular file at $PREV_FILE)"
+    PREV=$(cat "$PREV_FILE") || die "cannot read $PREV_FILE"
     [[ -d "$PREV" ]] || die "previous release $PREV is gone"
     echo "deploy: rolling back to $PREV"
     point_at "$PREV"
@@ -174,6 +179,11 @@ fi
 # TO, so a later explicit --rollback restarts that release rather than stepping
 # a second release back.
 if [[ -n "$PREV" ]]; then
+    # rm -f first: a hand-rolled deploy on this box had left .prev as a SYMLINK
+    # to a release directory, and tee then fails with "Is a directory" (it
+    # follows the link). rm -f removes the link itself, never the target, and is
+    # a no-op when .prev is the regular file we expect.
+    as_owner rm -f "/srv/llm/current/.${REPO}.prev"
     echo "$PREV" | as_owner tee "/srv/llm/current/.${REPO}.prev" >/dev/null
 fi
 
