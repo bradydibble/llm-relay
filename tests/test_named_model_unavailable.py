@@ -71,6 +71,19 @@ async def test_named_dead_model_is_terminal_and_names_itself(tmp_path):
     assert "does not substitute" in detail["named_model"]["remedy"]
 
 
+async def test_named_refusal_payload_carries_availability(tmp_path):
+    """The refusal is reason-coded (observation-first-health-spec §3.4): a
+    model with no registered backend is 'never_seen' and no live check ran.
+    The API layer turns this payload into the named_unavailable_<reason>
+    metric outcome, so the shape here is load-bearing for observability."""
+    router = _app(tmp_path, live=["other-model"]).state.router
+    with pytest.raises(HTTPException) as exc:
+        await router.route_and_forward(_body("pinned-model"))
+    avail = exc.value.detail["named_model"]["availability"]
+    assert avail["reason"] == "never_seen"
+    assert avail["checked_live"] is False
+
+
 async def test_named_dead_model_carries_no_retry_after(tmp_path):
     """It must be an HTTPException, not NoBackendAvailableError — the latter is
     what the API layer turns into a Retry-After."""

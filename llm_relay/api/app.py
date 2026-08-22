@@ -1567,15 +1567,33 @@ def create_app(config_dir: str | Path | None = None) -> FastAPI:
                 confidentiality=hint_headers.get("X-Llm-Relay-Confidentiality"),
             )
             raise HTTPException(502, detail=f"Backend network error: {e}")
-        except HTTPException:
+        except HTTPException as http_exc:
             # route_and_forward raises HTTPException for no-candidates 503.
-            # Emit telemetry then re-raise.
+            # A NAMED-model refusal records as its own reason-coded outcome
+            # (observation-first-health-spec §3.4) with the model it actually
+            # refused — before this, it was lumped into no_candidate with
+            # model=None, which is exactly how a fifth of fleet requests hid
+            # inside the WBR's "context rejects" bucket. Reasons are a small
+            # closed set, so metric cardinality stays bounded.
+            named_model = None
+            named_reason = ""
+            named_provider = None
+            if isinstance(http_exc.detail, dict):
+                nm = http_exc.detail.get("named_model")
+                if isinstance(nm, dict):
+                    named_model = nm.get("model")
+                    named_provider = nm.get("provider")
+                    avail = nm.get("availability")
+                    if isinstance(avail, dict) and avail.get("reason"):
+                        named_reason = str(avail["reason"])
             emit_chat_completion(
                 request_body=body, response_body=None, response_text=None, usage=None,
-                model_resolved=None, provider_name=None,
+                model_resolved=named_model, provider_name=named_provider,
                 user_agent=user_agent, start_ns=start_ns, end_ns=time.time_ns(),
                 status_code=503, streamed=is_stream, error="No model matches constraints",
-                outcome="no_candidate", client=client, principal=principal_id,
+                outcome=(f"named_unavailable_{named_reason or 'unknown'}"
+                         if named_model else "no_candidate"),
+                client=client, principal=principal_id,
                 confidentiality=hint_headers.get("X-Llm-Relay-Confidentiality"),
             )
             raise
