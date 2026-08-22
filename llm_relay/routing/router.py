@@ -588,6 +588,13 @@ class RequestRouter:
                     continue
                 try:
                     fwd = _clamp_max_tokens(request_data, prompt_est, candidate.context_window)
+                    # Apply repetition_penalty default to streaming path too.
+                    # A streaming repetition loop still produces garbage for hours
+                    # and consumes GPU capacity — streaming is a response framing
+                    # choice, not a reason to skip generation safety defaults.
+                    _cfg_rp = self.config.policy.default_repetition_penalty
+                    _default_rp = _cfg_rp if _cfg_rp is not None else DEFAULT_REPETITION_PENALTY
+                    fwd = _apply_repetition_penalty_default(fwd, default=_default_rp)
                     upstream, body_iter, cleanup = await self.stream_request(
                         candidate.backend_url, candidate.model, fwd,
                         headers=headers,

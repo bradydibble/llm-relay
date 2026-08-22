@@ -385,6 +385,7 @@ async def test_stream_no_max_tokens_gets_no_default(tmp_path, monkeypatch):
 
     async def _fake_stream(backend_url, model_name, request_data, *args, **kwargs):
         captured["max_tokens"] = request_data.get("max_tokens")
+        captured["repetition_penalty"] = request_data.get("repetition_penalty")
         return httpx.Response(200, content=b""), _fake_body_iter(), _fake_cleanup
 
     monkeypatch.setattr(router, "stream_request", _fake_stream)
@@ -398,6 +399,8 @@ async def test_stream_no_max_tokens_gets_no_default(tmp_path, monkeypatch):
     assert upstream.status_code == 200
     assert captured["max_tokens"] is None, \
         "streaming without max_tokens must NOT get a default — client controls duration"
+    assert captured["repetition_penalty"] == DEFAULT_REPETITION_PENALTY, \
+        "streaming without repetition_penalty MUST get the default — prevents repetition loops"
 
 
 async def test_policy_default_max_tokens_override(tmp_path, monkeypatch):
