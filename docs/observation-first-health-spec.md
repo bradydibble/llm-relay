@@ -247,9 +247,11 @@ guards). Two deliberate deviations from the letter of the spec:
    distinguish: `refused | starting | timeout | not_loaded | degraded |
    error | never_seen | check_in_flight`, carried in
    `named_model.availability` alongside `checked_live` and
-   `last_traffic_success_age_s`. The dedicated refusal *metric* is deferred —
-   the payload and a structured log line landed; wiring a counter through
-   api/instrumentation is a small follow-up.
+   `last_traffic_success_age_s`. The metric landed as
+   `llm_relay_requests_total{outcome="named_unavailable_<reason>"}` with the
+   refused model and provider (b7da7df) — closing the mislabel that hid
+   named refusals inside `no_candidate`/`model=None` (and, downstream, inside
+   the WBR's "context rejects").
 
 §3.5 note: the state file lives beside the audit log
 (`dirname($LLM_RELAY_AUDIT_LOG)/backend-state.json`) unless
