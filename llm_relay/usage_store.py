@@ -138,8 +138,26 @@ def open_db(path: str) -> sqlite3.Connection:
     """
     parent = os.path.dirname(path)
     if parent:
-        os.makedirs(parent, exist_ok=True)
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(parent, 0o700)
+        except OSError:
+            pass
+    # 0600 / 0700, explicitly. Nothing in the shipped units sets UMask, so the
+    # service default (0022) would create these 0644 -- and this file holds
+    # per-user token history (and, in prompts.db, coworkers' actual
+    # conversations). Production is currently saved only by a hand-set mode on
+    # the parent directory, which is not something this code can rely on: the
+    # DB path is deliberately relocatable. auth.py already does this for its
+    # key-hash file. Applied on every open so an existing loose file is tightened
+    # rather than left as found.
     conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        # A store we cannot tighten is still better than no store; the unit's
+        # UMask and the parent mode remain as defence.
+        pass
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(_DDL)
