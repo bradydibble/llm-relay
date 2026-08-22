@@ -134,11 +134,25 @@ def resolve_usage(*, usage: dict | None, response_body: dict | None,
         output_tokens, eff, content_text, reasoning_text
     )
 
+    # Prefix-cache reuse, from either place a backend may report it.
+    #
+    # `usage.prompt_tokens_details.cached_tokens` is the OpenAI-standard field;
+    # llama.cpp's non-standard `timings.cache_n` carries the same number. Reading
+    # only the latter measured llama.cpp and nothing else. Verified 2026-08-22: a
+    # repeated prompt on ornith-35b came back with 2021 of 2025 prompt tokens
+    # cached in BOTH fields, while the vLLM backends reported neither — so a zero
+    # here means "not reported", which is not the same as "no reuse happened".
     cache_read = 0
-    if isinstance(response_body, dict):
+    details = eff.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        cache_read = _int(details.get("cached_tokens"))
+    if not cache_read and isinstance(response_body, dict):
         timings = response_body.get("timings")
         if isinstance(timings, dict):
             cache_read = _int(timings.get("cache_n"))
+    # Reuse cannot exceed the prompt it was reused from.
+    if input_tokens:
+        cache_read = min(cache_read, input_tokens)
 
     return UsageCounts(
         input_tokens=input_tokens,

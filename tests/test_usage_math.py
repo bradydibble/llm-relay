@@ -171,3 +171,55 @@ def test_estimate_tokens_is_monotonic_and_nonzero_for_text():
     assert estimate_tokens("") == 0
     assert estimate_tokens("a short line") > 0
     assert estimate_tokens("a" * 1000) > estimate_tokens("a" * 10)
+
+
+def test_cache_read_from_openai_standard_field():
+    # The OpenAI-standard location. Reading only llama.cpp's timings.cache_n
+    # measured one backend family and silently reported 0 for the rest.
+    r = resolve_usage(
+        usage={"prompt_tokens": 2025, "completion_tokens": 4,
+               "prompt_tokens_details": {"cached_tokens": 2021}},
+        response_body=None,
+        streamed=False,
+    )
+    assert r.cache_read_tokens == 2021
+
+
+def test_cache_read_falls_back_to_llamacpp_timings():
+    r = resolve_usage(
+        usage={"prompt_tokens": 500, "completion_tokens": 20},
+        response_body={"timings": {"cache_n": 480}},
+        streamed=False,
+    )
+    assert r.cache_read_tokens == 480
+
+
+def test_cache_read_prefers_the_standard_field_over_timings():
+    r = resolve_usage(
+        usage={"prompt_tokens": 500, "completion_tokens": 20,
+               "prompt_tokens_details": {"cached_tokens": 300}},
+        response_body={"timings": {"cache_n": 480}},
+        streamed=False,
+    )
+    assert r.cache_read_tokens == 300
+
+
+def test_cache_read_never_exceeds_the_prompt_it_reused():
+    r = resolve_usage(
+        usage={"prompt_tokens": 100, "completion_tokens": 5,
+               "prompt_tokens_details": {"cached_tokens": 99999}},
+        response_body=None,
+        streamed=False,
+    )
+    assert r.cache_read_tokens == 100
+
+
+def test_absent_cache_reporting_is_zero_not_an_error():
+    # vLLM reports neither field; zero here means "not reported", which is NOT
+    # evidence that no reuse occurred.
+    r = resolve_usage(
+        usage={"prompt_tokens": 2027, "completion_tokens": 4},
+        response_body=None,
+        streamed=False,
+    )
+    assert r.cache_read_tokens == 0
