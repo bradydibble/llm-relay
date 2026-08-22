@@ -78,7 +78,7 @@ async def test_successful_request_records_request_and_completion_tokens(tmp_path
                   "outcome": "success", "client": "claude-code",
                   "principal": "anonymous"}
     tok_labels = {"provider": "local-llm", "model": "model-a",
-                  "direction": "completion", "client": "claude-code",
+                  "direction": "output", "client": "claude-code",
                   "principal": "anonymous"}
     before_req = _val("llm_relay_requests_total", req_labels)
     before_tok = _val("llm_relay_tokens_total", tok_labels)

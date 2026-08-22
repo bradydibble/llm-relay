@@ -146,12 +146,12 @@ def test_counts_prompt_and_completion_tokens_from_streaming_usage():
     )
     prompt = rm.registry.get_sample_value(
         "llm_relay_tokens_total",
-        {"provider": "prov-a", "model": "m", "direction": "prompt", "client": "unknown",
+        {"provider": "prov-a", "model": "m", "direction": "input", "client": "unknown",
          "principal": "anonymous"},
     )
     completion = rm.registry.get_sample_value(
         "llm_relay_tokens_total",
-        {"provider": "prov-a", "model": "m", "direction": "completion", "client": "unknown",
+        {"provider": "prov-a", "model": "m", "direction": "output", "client": "unknown",
          "principal": "anonymous"},
     )
     assert prompt == 100.0
@@ -170,7 +170,7 @@ def test_non_streaming_tokens_extracted_from_response_body_usage():
     )
     completion = rm.registry.get_sample_value(
         "llm_relay_tokens_total",
-        {"provider": "prov-a", "model": "m", "direction": "completion", "client": "unknown",
+        {"provider": "prov-a", "model": "m", "direction": "output", "client": "unknown",
          "principal": "anonymous"},
     )
     assert completion == 12.0

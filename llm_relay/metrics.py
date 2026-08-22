@@ -23,6 +23,8 @@ from typing import Any, Iterable
 from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, CollectorRegistry, Counter, Histogram, disable_created_metrics, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
+from .usage_math import SOURCE_NONE, UsageCounts, resolve_usage
+
 # Always-honored client labels (cap-exempt): never displaced by the cardinality
 # cap below, even past the dynamic limit. The repo ships only the generic default
 # here; real deployments add their own via LLM_RELAY_KNOWN_CLIENTS (see
@@ -255,8 +257,20 @@ class RelayMetrics:
         )
         self.tokens = Counter(
             "llm_relay_tokens",
-            "Prompt/completion tokens routed by the relay.",
+            "Input/output tokens routed by the relay. Output INCLUDES reasoning.",
             ["provider", "model", "direction", "client", "principal"],
+            registry=self.registry,
+        )
+        self.reasoning_tokens = Counter(
+            "llm_relay_reasoning_tokens",
+            "Reasoning (thinking) tokens — an of-which subset of output tokens.",
+            ["provider", "model", "client", "principal"],
+            registry=self.registry,
+        )
+        self.usage_source = Counter(
+            "llm_relay_usage_source",
+            "How each request's token counts were obtained (exact vs estimated).",
+            ["source"],
             registry=self.registry,
         )
         self.fallbacks = Counter(
@@ -307,6 +321,7 @@ class RelayMetrics:
         fell_back: bool,
         ttft_s: float | None = None,
         principal: str | None = None,
+        counts: "UsageCounts | None" = None,
     ) -> None:
         if not metrics_enabled():
             return
@@ -316,12 +331,23 @@ class RelayMetrics:
         pri = _sanitize_client(principal) if principal else "anonymous"
         self.requests.labels(provider=prov, model=mdl, alias=ali, outcome=outcome, client=cli, principal=pri).inc()
 
-        eff = _extract_usage(usage, response_body)
-        pt, ct = eff.get("prompt_tokens"), eff.get("completion_tokens")
-        if pt:
-            self.tokens.labels(provider=prov, model=mdl, direction="prompt", client=cli, principal=pri).inc(int(pt))
-        if ct:
-            self.tokens.labels(provider=prov, model=mdl, direction="completion", client=cli, principal=pri).inc(int(ct))
+        # Counts come from usage_math so the metrics and the durable store can
+        # never disagree. `counts` is passed by the instrumentation layer; the
+        # fallback keeps direct callers (and older tests) working.
+        if counts is None:
+            counts = resolve_usage(usage=usage, response_body=response_body,
+                                   streamed=False)
+        if counts.input_tokens:
+            self.tokens.labels(provider=prov, model=mdl, direction="input",
+                               client=cli, principal=pri).inc(counts.input_tokens)
+        if counts.output_tokens:
+            self.tokens.labels(provider=prov, model=mdl, direction="output",
+                               client=cli, principal=pri).inc(counts.output_tokens)
+        if counts.reasoning_tokens:
+            self.reasoning_tokens.labels(provider=prov, model=mdl,
+                                         client=cli, principal=pri).inc(counts.reasoning_tokens)
+        if counts.usage_source != SOURCE_NONE:
+            self.usage_source.labels(source=counts.usage_source).inc()
 
         # Prefix-cache reuse: extract cache_n from llama.cpp timings if present.
         cache_n = (response_body or {}).get("timings", {}).get("cache_n", 0)
